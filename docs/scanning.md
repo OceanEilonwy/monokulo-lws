@@ -53,11 +53,13 @@ A server has few `R`s and many `a`s. The kernel turns around:
   returns tag hits only; the CPU then does one scalar multiplication per
   hit, 1 in 256 outputs per account.
 
-Everything else carries over as it is: the process-wide GPU behind a mutex,
-`warm_up` with the self-test vectors (now run per account key as
-`check_wallet` does), the 20–30 s shader compile with its pipeline cache,
-`Mode::{Gpu, Auto, Cpu}`, and retiring the GPU on any failure with the
-remaining jobs going to the CPU.
+Everything else carries over as it is: `warm_up` with the self-test vectors
+(now run per account key as `check_wallet` does), the 20–30 s shader
+compile with its pipeline cache, `Mode::{Gpu, Auto, Cpu}`, and retiring the
+GPU on any failure with the remaining jobs going to the CPU. The one
+structural change is splitting the process-wide `Gpu` into a shared
+`Device` and per-caller `Arena`s, so several lanes use the GPU at once
+(Lanes, below).
 
 ## The change in monokulo-lws
 
@@ -108,9 +110,21 @@ has caught up. The design is lanes:
   if anything is queued, a new run starts. Catch-up lanes are below the
   reorg window by construction until they merge, so they don't check
   hashes.
-- **Shared**: one daemon connection, the live lane's requests first; one
-  GPU behind the existing mutex, batches interleaving (a catch-up lane fills
-  32,768-item batches, the live lane gets a turn every block).
+- **Shared**: one daemon connection, the live lane's requests first. One
+  GPU device, but an *arena* per lane. Today `fob-scanner` keeps one device
+  and one arena (the 39 MB state buffer, the output buffer, a command buffer
+  and a fence) behind one mutex held for a whole batch, so two lanes would
+  take turns at batch granularity and the GPU would idle while the lock
+  holder uploads or finishes. The split: a `Device` (instance, logical
+  device, queues, pipeline and its cache, self-test state), one per
+  process, and an `Arena` per lane, about 43 MB each (state, output, input,
+  command buffer, fence). The lock shrinks to the microseconds around
+  `vkQueueSubmit`, which Vulkan needs per queue; where the GPU exposes
+  several compute queues, arenas take their own, round-robin, and nothing is
+  locked at all. Each lane records, submits and waits its own fence, and
+  keeps its own CPU pipelining (finish batch *n* while the GPU does *n*+1).
+  A live-lane batch lands at most one catch-up batch behind. Fob keeps one
+  device, one arena, unchanged.
 - **Nothing new in the database**: an account's `scan_height` says which
   lane it is in. Clients see `scanned_height` below `blockchain_height`
   until the merge; Fob's chip reads "Server scanning from 2019".
@@ -125,6 +139,8 @@ Configurable, all with `monokulo-lws serve`:
 | `--catch-up-in-flight N` | 2 | Catch-up requests in flight at once; the live lane's request always goes first. |
 | `--catch-up-scan gpu\|cpu\|auto` | as `--scan` | Which engine catch-up lanes use; `cpu` keeps the GPU for the live lane on a machine where the GPU is slow to share. |
 | `--scan-interval SECS` | 10 | How often the live lane looks at the node once caught up (as today). |
+| `--gpu-arenas N` | lanes + 1 | GPU arenas (about 43 MB each): one for the live lane and one per catch-up lane, so lanes never wait on each other's batch. |
+| `--gpu-memory-mb MB` | | A cap instead: arenas = MB ÷ 43, at least 1. |
 
 With several lanes, a new catch-up account opens a lane if one is free;
 otherwise, with `follow`, it joins the running lane whose cursor is nearest
