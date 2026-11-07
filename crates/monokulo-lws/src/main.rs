@@ -10,6 +10,7 @@ mod db;
 mod decoys;
 mod error;
 mod rest;
+mod lanes;
 mod scanner;
 
 use std::net::SocketAddr;
@@ -25,7 +26,7 @@ use tokio::sync::Mutex;
 use crate::daemon::Daemon;
 use crate::db::{Db, NewAccount, Status};
 use crate::rest::{App, Config, Policy};
-use crate::scanner::{ScanConfig, Scanner};
+use crate::scanner::{LaneConfig, ScanConfig, Scanner};
 
 #[derive(Parser)]
 #[command(name = "monokulo-lws", version, about)]
@@ -42,6 +43,23 @@ enum Command {
     Admin {
         #[command(subcommand)]
         command: AdminCommand,
+    },
+    /// For development: replay a scan-bench fixture (monokulo-8ar's
+    /// prototypes/fixtures) through the scanner for synthetic accounts, and
+    /// print blocks a second.
+    Replay {
+        fixture: PathBuf,
+        /// Account counts to try, comma-separated.
+        #[arg(long, value_delimiter = ',', default_value = "1,10,100,1000")]
+        accounts: Vec<usize>,
+        /// Minors 0..N of major 0 watched for every account.
+        #[arg(long, default_value_t = 200)]
+        lookahead: u32,
+        /// Blocks a step, as a catch-up lane takes them.
+        #[arg(long, default_value_t = 100)]
+        blocks: usize,
+        #[arg(long, env = "LWS_CACHE_DIR")]
+        cache_dir: Option<PathBuf>,
     },
 }
 
@@ -83,7 +101,34 @@ struct ServeArgs {
     /// Refuse to start if the node is on another network.
     #[arg(long, value_parser = parse_network)]
     network: Option<Network>,
+    /// Catch-up lanes that may run at once, for accounts with history; 0 is
+    /// one loop from the lowest height any account stands at.
+    #[arg(long, default_value_t = 1)]
+    catch_up_lanes: usize,
+    /// Whether a queued account joins a running lane whose cursor passes its
+    /// start height, or waits for a lane of its own.
+    #[arg(long, value_enum, default_value = "follow")]
+    catch_up_join: lanes::Join,
+    /// Blocks a catch-up lane asks the node for at a time.
+    #[arg(long, default_value_t = 100)]
+    catch_up_blocks: u64,
+    /// Catch-up requests in flight at once; the live lane's never waits for them.
+    #[arg(long, default_value_t = 2)]
+    catch_up_in_flight: usize,
+    /// GPU arenas, about 43 MB each: the live lane's and one per catch-up lane
+    /// unless given.
+    #[arg(long)]
+    gpu_arenas: Option<usize>,
+    /// A cap on GPU memory instead: arenas = MB / 43, at least 1.
+    #[arg(long)]
+    gpu_memory_mb: Option<u64>,
+    /// Where the GPU's compiled shader is kept (the first compile takes 20-30 s).
+    #[arg(long, env = "LWS_CACHE_DIR")]
+    cache_dir: Option<PathBuf>,
 }
+
+/// About what one GPU arena takes.
+const ARENA_MB: u64 = 43;
 
 #[derive(Subcommand)]
 enum AdminCommand {
@@ -131,6 +176,13 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(args) => serve(args).await,
         Command::Admin { command } => admin(command),
+        Command::Replay { fixture, accounts, lookahead, blocks, cache_dir } => {
+            if let Some(dir) = cache_dir {
+                std::fs::create_dir_all(&dir)?;
+                monokulo_8ar::set_cache_dir(dir);
+            }
+            tokio::task::block_in_place(|| scanner::replay(&fixture, &accounts, lookahead, blocks.max(1)))
+        }
     }
 }
 
@@ -146,10 +198,28 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
     tracing::info!("node {} on {} at height {} ({})", args.daemon, crypto::network_name(network), info.height, info.version);
 
+    // The GPU starts in the background; until it's ready (or if it can't be
+    // used) every block is scanned with monero-oxide.
+    if let Some(dir) = &args.cache_dir {
+        std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
+        monokulo_8ar::set_cache_dir(dir.clone());
+    }
+    monokulo_8ar::warm_up();
+    let mut arenas = args.gpu_arenas.unwrap_or(args.catch_up_lanes + 1);
+    if let Some(mb) = args.gpu_memory_mb {
+        arenas = arenas.min((mb / ARENA_MB) as usize);
+    }
+    let lanes = LaneConfig {
+        lanes: args.catch_up_lanes,
+        join: args.catch_up_join,
+        blocks: args.catch_up_blocks.max(1),
+        in_flight: args.catch_up_in_flight.max(1),
+        arenas: arenas.max(1),
+    };
     let scanner = Scanner::new(
         db.clone(),
         daemon.clone(),
-        ScanConfig { network, lookahead: args.lookahead, interval: Duration::from_secs(args.scan_interval.max(1)) },
+        ScanConfig { network, lookahead: args.lookahead, interval: Duration::from_secs(args.scan_interval.max(1)), lanes },
     );
     let app = Arc::new(App {
         db,
@@ -192,6 +262,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     if let Some(t) = admin_task {
         t.abort();
     }
+    // Not out of the process with the GPU's warm-up still in the driver.
+    monokulo_8ar::settle(Duration::from_secs(60));
     Ok(())
 }
 

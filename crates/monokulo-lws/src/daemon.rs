@@ -264,13 +264,23 @@ impl Daemon {
     }
 
     /// Up to `count` blocks from `start` (at least 1: monerod ignores a zero
-    /// start height), with their pruned transactions and each block's first
-    /// RingCT output index. The node may send fewer than asked.
-    pub async fn blocks(&self, start: u64, count: u64) -> Result<Vec<ScannableBlock>> {
+    /// start height), with their pruned transactions and each transaction's
+    /// first RingCT output index. The node may send fewer than asked.
+    pub async fn blocks(&self, start: u64, count: u64) -> Result<Vec<Fetched>> {
         let start = start.max(1);
         let response = self.post("get_blocks.bin", request(start, count), false, MAX_BLOCKS_RESPONSE).await?;
         parse(&response)
     }
+}
+
+/// A block as the scanner takes it: what monero-oxide's `Scanner` reads,
+/// and the global index of each transaction's first RingCT output (the miner
+/// transaction first, then the block's others in order; `None` for one with
+/// no RingCT outputs), for stand-in blocks of one transaction.
+#[derive(Clone, Debug)]
+pub struct Fetched {
+    pub block: ScannableBlock,
+    pub first_indexes: Vec<Option<u64>>,
 }
 
 pub fn hex32(s: &str) -> Option<[u8; 32]> {
@@ -307,7 +317,7 @@ fn request(start: u64, count: u64) -> Vec<u8> {
     request
 }
 
-fn parse(response: &[u8]) -> Result<Vec<ScannableBlock>> {
+fn parse(response: &[u8]) -> Result<Vec<Fetched>> {
     let mut epee = Epee::new(response).map_err(epee_err)?;
     let mut fields = epee.entry().map_err(epee_err)?.fields().map_err(epee_err)?;
     let mut blocks = vec![];
@@ -390,23 +400,23 @@ fn parse(response: &[u8]) -> Result<Vec<ScannableBlock>> {
     }
 
     // Output indexes come flattened, miner transaction first in each block;
-    // keep the first index of a RingCT output per block.
+    // keep the first index of a RingCT output per transaction, and the
+    // block's first.
     let mut indexes = output_indexes.as_slice();
     let mut res = Vec::with_capacity(blocks.len());
     for (block, transactions) in blocks {
-        let mut first_ringct = None;
         let miner: Transaction<Pruned> = block.miner_transaction().clone().into();
+        let mut first_indexes = Vec::with_capacity(transactions.len() + 1);
         for tx in std::iter::once(&miner).chain(&transactions) {
             let outputs = tx.prefix().outputs.len();
             if indexes.len() < outputs {
                 return Err(invalid("get_blocks.bin left out output indexes"));
             }
-            if !matches!(tx, Transaction::V1 { .. }) && outputs != 0 {
-                first_ringct = first_ringct.or(Some(indexes[0]));
-            }
+            first_indexes.push((!matches!(tx, Transaction::V1 { .. }) && outputs != 0).then(|| indexes[0]));
             indexes = &indexes[outputs..];
         }
-        res.push(ScannableBlock { block, transactions, output_index_for_first_ringct_output: first_ringct });
+        let first_ringct = first_indexes.iter().flatten().next().copied();
+        res.push(Fetched { block: ScannableBlock { block, transactions, output_index_for_first_ringct_output: first_ringct }, first_indexes });
     }
     if !indexes.is_empty() {
         return Err(invalid("get_blocks.bin sent more output indexes than outputs"));

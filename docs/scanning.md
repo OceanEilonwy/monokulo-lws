@@ -3,8 +3,8 @@
 How monokulo-lws will scan when it has hundreds of accounts: with
 `monokulo-8ar`, the prefilter lifted out of Fob's `fob-scanner`, one GPU
 pass for every account, and monero-oxide only for
-the transactions that are really someone's. Status: design; the first
-version scans each block once per account with monero-oxide alone.
+the transactions that are really someone's. Status: built (monokulo-8ar
+`1de7768`), all but phase B; see "What is built" at the end.
 
 ## What monokulo-8ar does
 
@@ -37,17 +37,19 @@ Fob (decisions 350, 351): 5,000 mainnet blocks for one wallet in 0.29 s on
 an RX 6800 XT; 39 MB of GPU state per batch; a
 batch costs at least 3.7 ms, so batches smaller than 32,768 don't pay.
 
-The kernel today takes one view key per dispatch, as push constants. Every
-work item multiplies a different `R` by the same `a`.
+Before the keyring the kernel took one view key per dispatch, as push
+constants, and every work item multiplied a different `R` by the same `a`.
 
 ## The change in monokulo-8ar: a keyring
 
 A server has few `R`s and many `a`s. The kernel turns around:
 
 - `Keyring::add(pair, view) -> AccountId`, `Keyring::watch(id, pair,
-  subaddress)`, `Keyring::flag_many(blocks, threads, gpu_allowed) -> Vec<Hit
-  { account, block, tx }>`. `Prefilter` (one key, one bool per block) stays
-  as a keyring of one.
+  subaddress)`, `Keyring::flag_many(blocks, threads, min_keys) ->
+  Option<Vec<Hit { account, block, tx }>>` (`tx` 0 the miner transaction, 1
+  on the others, `Hit::WHOLE_BLOCK` a block to read whole; `None` as for
+  `flag`: no usable GPU, too few keys, or a failure). `Prefilter` (one key,
+  one bool per block) stays as a keyring of one.
 - A storage buffer of account digits, 64 bytes an account, replaces the
   push-constant digits. Push constants carry `tx_count` and `first_item`;
   work item `i` takes `R[(first_item + i) mod tx_count]` and the digits of
@@ -88,10 +90,11 @@ structural change is splitting the process-wide `Gpu` into a shared
    over every account: one lookup per ring member, not one per account.
    Outputs found in the batch are added as they come.
 6. The pool: a stand-in block through the same keyring.
-7. Fallbacks: a block `fob-scanner` won't vouch for (v1 transactions, no
-   RingCT outputs, a hard fork it doesn't know) is scanned the old way for
-   every account; outputs without a view tag (before August 2022) skip the
-   tag and take the full derivation.
+7. Fallbacks: a block the prefilter won't vouch for (a hard fork it
+   doesn't know, transactions missing) is a `Hit::WHOLE_BLOCK` for every
+   account and read whole; v1 transactions and blocks without RingCT
+   outputs hold nothing the `Scanner` would find either; outputs without a
+   view tag (before August 2022) skip the tag and take the full derivation.
 
 Command line: nothing to choose. The GPU is used when it is usable (and a
 batch has at least 512 keys), else every block goes to monero-oxide, and
@@ -176,6 +179,53 @@ also what Fob's `fob-scanner` builds on) as a git dependency pinned to a
 revision until the crate is on crates.io. Fob's `scan.rs` (reader threads,
 the monero-oxide fan-out) stays Fob's.
 
+## What is built
+
+- **monokulo-8ar** (`1de7768`): the keyring, the digits buffer and the push
+  constants `tx_count`, `first_item`, `count`, `digit_at`, `op`; the grid
+  taken a slab at a time with the cores finishing slab *n* while the GPU
+  does *n*+1; each item checked against its own account's spend keys. The
+  `Device`/`Arena` split: one `gpu::Device` (instance, logical device, up to
+  four compute queues, pipelines and cache) and a `gpu::Arena` per caller
+  (buffers, command buffer, fence, descriptor pool); an arena locks a queue
+  only around `vkQueueSubmit`, and arenas take queues round-robin. The
+  crate-level `Arena` handle is what a keyring is given; `Prefilter`,
+  `Keyring::new` and `check_wallet` share one, so Fob is unchanged. The
+  startup vectors add every view key at once over the same keys. Tests: *n*
+  copies of one key (1, 3, 50) flag what one key flags, each account in a
+  mixed keyring has only its own hits, two keyrings in two arenas at once on
+  the GPU.
+- **monokulo-lws**: per-transaction first output indexes from the reader;
+  the keyring per lane, cached until an account or a subaddress range
+  changes; `flag_many`; per hit, the `Scanner` for that account on a
+  stand-in block of that one transaction (a miner hit: the real miner
+  transaction alone; a whole-block hit: the block); candidate spends through
+  one map of every lane account's outputs; the pool through the live
+  keyring; the lanes, with every option in the table above; `/daemon_status`
+  gives `scanner_engine` and `catch_up_lanes` (each lane's cursor).
+- Choices the code made: a batch goes to the GPU from 512 *derivations*
+  (keys × accounts), `min_keys` = 512 ÷ accounts, so the live lane's
+  one-block batches use the GPU once there are about nine accounts. The live
+  lane's cursor starts at the highest scan height of any active account; an
+  account below it is queued for a catch-up lane. A lane that reaches the
+  live cursor waits for the live lane to take its accounts in at the start
+  of its next step; if the live lane moved on meanwhile, the lane catches up
+  the difference first. With no account of its own the live lane only keeps
+  its cursor at the tip. A joining account (`follow`) is in the lane's
+  keyring at once and skipped in blocks below its height, which comes to
+  the same thing as joining when the cursor passes it. A keyring is rebuilt
+  whole when its accounts change (about 7 s for 1,000 accounts with a
+  lookahead of 200).
+- Measured (RX 6800 XT, Ryzen 9 5950X): about 2.65 million derivations a
+  second at any account count. monokulo-8ar's `scan_speed --keys N` on the
+  2,000-block fixture: 44,300, 4,660, 466 and 46 blocks/s for 1, 10, 100
+  and 1,000 keys. `monokulo-lws replay` of the same blocks through the
+  scanner, 100 blocks a step: 9,960, 3,400, 461 and 47 blocks/s. So the
+  budget's first line, 1,000 accounts and a day of mainnet, is about 15 s.
+
+Still planned: phase B (the view-tag Keccak, and returning only tag hits,
+on the GPU); incremental keyring updates.
+
 ## Order of work
 
 1. `monokulo-8ar`: the keyring API, the digits buffer and the two push
@@ -184,4 +234,6 @@ the monero-oxide fan-out) stays Fob's.
 2. `monokulo-lws`: per-transaction output indices from the reader,
    `flag_many`, stand-in blocks per hit, the global spend map; the
    benchmark above.
-3. View-tag Keccak on the GPU.
+3. View-tag Keccak on the GPU (phase B, not built).
+
+Steps 1 and 2 are built.

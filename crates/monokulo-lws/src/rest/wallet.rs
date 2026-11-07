@@ -440,5 +440,12 @@ pub async fn daemon_status(State(app): State<Arc<App>>) -> Reply<serde_json::Val
         "scanner_height": status.scanner_height,
         "scanner_error": status.last_error,
         "scanner_seconds_ago": status.last_step.map(|t| t.elapsed().as_secs()),
+        // What finds the outputs: the GPU's prefilter, or monero-oxide alone and why.
+        "scanner_engine": match monokulo_8ar::engine() {
+            monokulo_8ar::Engine::Gpu { name } => json!({ "gpu": true, "name": name }),
+            monokulo_8ar::Engine::Cpu { reason } => json!({ "gpu": false, "reason": format!("{reason:?}") }),
+        },
+        "live_lane_height": status.scanner_height,
+        "catch_up_lanes": status.lanes,
     })))
 }

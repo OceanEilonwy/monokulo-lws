@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 lws-api = { path = "../lws-api" }
+# The prefilter: a keyring of every account, one GPU pass a batch.
+monokulo-8ar = { git = "https://github.com/OceanEilonwy/monokulo-8ar", rev = "1de7768" }
 monero-wallet = "0.2"
 monero-epee = "0.2"
 curve25519-dalek = "4"
