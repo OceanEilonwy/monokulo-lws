@@ -50,10 +50,6 @@ const KEEP_HASHES: u64 = 200;
 pub const SPENDABLE_AGE: u64 = 10;
 /// A mined reward waits longer.
 pub const COINBASE_AGE: u64 = 60;
-/// The fewest derivations (keys × accounts) worth a GPU batch: below about
-/// this a batch's fixed cost (3.7 ms on an RX 6800 XT, 46 mJ on a phone's GPU)
-/// is more than the `Scanner` takes. Fob's threshold for one account.
-const MIN_ITEMS: usize = 512;
 
 /// What the REST side reads about the scanner.
 #[derive(Clone, Debug, Default)]
@@ -549,7 +545,7 @@ impl Scanner {
         ring?;
         let ring = slot.as_mut().expect("just made");
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let hits = ring.keyring.flag_many(&batch.blocks, threads, MIN_ITEMS.div_ceil(accounts.len().max(1)));
+        let hits = ring.keyring.flag_many(&batch.blocks, threads, 0);
         self.db.write(|tx| record_batch(&ScanWriter::new(tx), ring, self.config.lookahead, accounts, batch, start, hits.as_deref(), live))
     }
 
@@ -598,7 +594,7 @@ impl Scanner {
             let ring = slot.as_mut().expect("just made");
             let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
             // The accounts that may be paid, or every account unfiltered.
-            let paid: Vec<&Account> = match ring.keyring.flag_many(std::slice::from_ref(&block), threads, MIN_ITEMS.div_ceil(accounts.len().max(1))) {
+            let paid: Vec<&Account> = match ring.keyring.flag_many(std::slice::from_ref(&block), threads, 0) {
                 Some(hits) => {
                     let ids: BTreeSet<i64> = hits.iter().map(|h| ring.account(h)).collect();
                     accounts.iter().filter(|a| ids.contains(&a.id)).collect()
@@ -1069,7 +1065,7 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
             let start = 3_797_000 + (at * step) as u64;
             let batch = Batch { blocks: part.to_vec(), first_indexes: first_indexes[at * step..at * step + part.len()].to_vec() };
             let t = Instant::now();
-            let found = ring.keyring.flag_many(&batch.blocks, threads, MIN_ITEMS.div_ceil(count.max(1)));
+            let found = ring.keyring.flag_many(&batch.blocks, threads, 0);
             flagging += t.elapsed().as_secs_f64();
             match &found {
                 Some(h) => {

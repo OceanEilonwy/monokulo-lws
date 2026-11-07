@@ -122,8 +122,9 @@ compares.
   to monero-oxide's `Scanner`, for that account alone, in a stand-in block
   holding just that transaction with its own first output index, so global
   indices stay right. A block the prefilter can't vouch for is read whole.
-  Without a usable GPU, or for a batch under 512 derivations, each block is
-  scanned once per account with the `Scanner`, as monero-lws does.
+  Without a usable GPU, each block is scanned once per account with the
+  `Scanner`, as monero-lws does. With one, every batch goes to it, however
+  small.
 - Accounts are scanned in lanes: the live lane follows the tip with every
   caught-up account (and looks at the pool and keeps block hashes); an
   account with history (a restore, an import, a rescan) is caught up in a

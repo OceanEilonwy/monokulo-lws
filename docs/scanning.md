@@ -26,10 +26,10 @@ the transactions that are really someone's. Status: built (monokulo-8ar
 
 It is GPU-only. There is no CPU prefilter (its own field code was the
 riskiest code to maintain and never the bottleneck: fetching is). Where no
-usable Vulkan GPU is there, or a batch is under the threshold (512 keys,
-about nine blocks, below which a GPU batch's fixed 3.7 ms and 46 mJ don't
-pay), `flag` answers `None` and the caller scans every block with
-monero-oxide. Any Vulkan GPU does, integrated ones included; Apple goes
+usable Vulkan GPU is there, `flag` answers `None` and the caller scans
+every block with monero-oxide. There is no batch size below which the GPU
+is skipped (Fob's decision 363: a few milliseconds a batch was not worth a
+second path); every batch goes to it when it is there. Any Vulkan GPU does, integrated ones included; Apple goes
 through MoltenVK.
 
 Fob then runs monero-oxide's `Scanner` on flagged blocks only. Measured in
@@ -96,9 +96,9 @@ structural change is splitting the process-wide `Gpu` into a shared
    outputs hold nothing the `Scanner` would find either; outputs without a
    view tag (before August 2022) skip the tag and take the full derivation.
 
-Command line: nothing to choose. The GPU is used when it is usable (and a
-batch has at least 512 keys), else every block goes to monero-oxide, and
-`/daemon_status` says which. `--cache-dir` holds the pipeline cache.
+Command line: nothing to choose. The GPU is used when it is usable, for
+every batch, else every block goes to monero-oxide, and `/daemon_status`
+says which. `--cache-dir` holds the pipeline cache.
 
 ## Lanes: a wallet joining with history
 
@@ -203,10 +203,9 @@ the monero-oxide fan-out) stays Fob's.
   one map of every lane account's outputs; the pool through the live
   keyring; the lanes, with every option in the table above; `/daemon_status`
   gives `scanner_engine` and `catch_up_lanes` (each lane's cursor).
-- Choices the code made: a batch goes to the GPU from 512 *derivations*
-  (keys × accounts), `min_keys` = 512 ÷ accounts, so the live lane's
-  one-block batches use the GPU once there are about nine accounts. The live
-  lane's cursor starts at the highest scan height of any active account; an
+- Choices the code made: every batch goes to the GPU when it is usable,
+  the live lane's one-block batches included (no threshold, as Fob's
+  decision 363). The live lane's cursor starts at the highest scan height of any active account; an
   account below it is queued for a catch-up lane. A lane that reaches the
   live cursor waits for the live lane to take its accounts in at the start
   of its next step; if the live lane moved on meanwhile, the lane catches up
