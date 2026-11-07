@@ -85,6 +85,52 @@ remaining jobs going to the CPU.
 Command line: `--scan gpu|cpu|auto` (default auto: the GPU from 512 keys a
 batch, as Fob's policy), `--cache-dir` for the pipeline cache.
 
+## Lanes: a wallet joining with history
+
+A wallet made at the tip costs nothing: `Keyring::add` appends 64 bytes of
+digits, and the account rides the next batch. A wallet with history (a
+restore, `/import_wallet_request`, an admin `rescan`) starts far below the
+tip, and the first version's loop handles that badly: a step starts at the
+lowest height any account stands at, so one import from 2019 drags
+fetching back to 2019 and every other account sees no new block until it
+has caught up. The design is lanes:
+
+- **The live lane**: the keyring of every caught-up account. Follows the
+  tip block by block, looks at the mempool, keeps the 200 block hashes and
+  handles reorgs. Its batches are small (about 57 keys × accounts a block),
+  so it is never starved.
+- **Catch-up lanes**: each one fetches from the lowest start height of the
+  accounts queued for it, with its own keyring of only those accounts. An
+  account whose start height is above a running lane's cursor joins that
+  lane's keyring when the cursor passes it (`follow`); one below the cursor
+  waits for the next run (`wait`). When a lane's cursor reaches the live
+  lane's height, its accounts move into the live keyring and the lane ends;
+  if anything is queued, a new run starts. Catch-up lanes are below the
+  reorg window by construction until they merge, so they don't check
+  hashes.
+- **Shared**: one daemon connection, the live lane's requests first; one
+  GPU behind the existing mutex, batches interleaving (a catch-up lane fills
+  32,768-item batches, the live lane gets a turn every block).
+- **Nothing new in the database**: an account's `scan_height` says which
+  lane it is in. Clients see `scanned_height` below `blockchain_height`
+  until the merge; Fob's chip reads "Server scanning from 2019".
+
+Configurable, all with `monokulo-lws serve`:
+
+| Option | Default | What |
+|---|---|---|
+| `--catch-up-lanes N` | 1 | Catch-up lanes that may run at once. `0` is the first version's one loop from the lowest height (fine for a handful of wallets, no GPU needed). |
+| `--catch-up-join follow\|wait` | `follow` | Whether a queued account joins a running lane when its cursor passes the account's start height, or always waits for the next run. |
+| `--catch-up-blocks N` | 100 | Blocks a catch-up lane asks the daemon for at a time. |
+| `--catch-up-in-flight N` | 2 | Catch-up requests in flight at once; the live lane's request always goes first. |
+| `--catch-up-scan gpu\|cpu\|auto` | as `--scan` | Which engine catch-up lanes use; `cpu` keeps the GPU for the live lane on a machine where the GPU is slow to share. |
+| `--scan-interval SECS` | 10 | How often the live lane looks at the node once caught up (as today). |
+
+With several lanes, a new catch-up account opens a lane if one is free;
+otherwise, with `follow`, it joins the running lane whose cursor is nearest
+below its start height; otherwise it waits. The same shape as monero-lws's
+"split synced threads" scanning.
+
 ## Budget
 
 From about a million derivations a second on a desktop GPU (decision 350),

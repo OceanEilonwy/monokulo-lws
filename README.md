@@ -46,6 +46,11 @@ Options that matter:
 | `--access-control-origin ORIGIN` | | A browser origin allowed to call the API; repeat, or `*`. |
 | `--network main\|stage\|test` | | Refuse to start if the node is on another network. |
 
+Planned, with the fob-scanner engine (`docs/scanning.md`): `--scan
+gpu|cpu|auto`, `--cache-dir`, and the catch-up lanes a wallet with history
+scans in (`--catch-up-lanes`, `--catch-up-join follow|wait`,
+`--catch-up-blocks`, `--catch-up-in-flight`, `--catch-up-scan`).
+
 Every option is also an environment variable (`LWS_DAEMON`, `LWS_DB`,
 `LWS_LISTEN`, `LWS_ADMIN_LISTEN`).
 
