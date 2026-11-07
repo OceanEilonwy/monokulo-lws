@@ -14,19 +14,27 @@ version scans each block once per account with monero-oxide alone.
    about 57 a mainnet block;
 2. computes `D = 8·a·R` for each, on the GPU (Vulkan, a GLSL compute shader
    in three stages: decompress `R` and build a 1R..8R table; sixteen window
-   passes over the view key's 64 signed base-16 digits; a final ×8) in
-   batches of 32,768 keys, or on CPU threads with its own radix-2^51 field
-   code; the CPU finishes batch *n* while the GPU does *n*+1;
-3. compresses the points with one field inversion per 64;
-4. for each output of each transaction: if it has a view tag, checks
-   `Keccak("view_tag" ‖ D ‖ i)[0]`, which 1 in 256 pass; then checks the
-   real condition, `P − H_s(D ‖ i)·G` is one of the spend keys it watches
-   (the primary one and every registered subaddress);
-5. flags the block on the first hit.
+   passes over the view key's 64 signed base-16 digits; a final ×8, then
+   the point compressed on the GPU) in batches of 32,768 keys; the CPU
+   finishes batch *n* while the GPU does *n*+1;
+3. for each output of each transaction, with curve25519-dalek on the CPU:
+   if it has a view tag, checks `Keccak("view_tag" ‖ D ‖ i)[0]`, which 1 in
+   256 pass; then checks the real condition, `P − H_s(D ‖ i)·G` is one of
+   the spend keys it watches (the primary one and every registered
+   subaddress);
+4. flags the block on the first hit.
+
+It is GPU-only. There is no CPU prefilter (its own field code was the
+riskiest code to maintain and never the bottleneck: fetching is). Where no
+usable Vulkan GPU is there, or a batch is under the threshold (512 keys,
+about nine blocks, below which a GPU batch's fixed 3.7 ms and 46 mJ don't
+pay), `flag` answers `None` and the caller scans every block with
+monero-oxide. Any Vulkan GPU does, integrated ones included; Apple goes
+through MoltenVK.
 
 Fob then runs monero-oxide's `Scanner` on flagged blocks only. Measured in
 Fob (decisions 350, 351): 5,000 mainnet blocks for one wallet in 0.29 s on
-an RX 6800 XT, 0.89 s on 16 CPU threads; 39 MB of GPU state per batch; a
+an RX 6800 XT; 39 MB of GPU state per batch; a
 batch costs at least 3.7 ms, so batches smaller than 32,768 don't pay.
 
 The kernel today takes one view key per dispatch, as push constants. Every
@@ -56,8 +64,8 @@ A server has few `R`s and many `a`s. The kernel turns around:
 
 Everything else carries over as it is: `warm_up` with the self-test vectors
 (now run per account key as `check_wallet` does), the 20–30 s shader
-compile with its pipeline cache, `Mode::{Gpu, Auto, Cpu}`, and retiring the
-GPU on any failure with the remaining jobs going to the CPU. The one
+compile with its pipeline cache, and retiring the GPU on any failure, after
+which the caller scans with monero-oxide. The one
 structural change is splitting the process-wide `Gpu` into a shared
 `Device` and per-caller `Arena`s, so several lanes use the GPU at once
 (Lanes, below).
@@ -85,8 +93,9 @@ structural change is splitting the process-wide `Gpu` into a shared
    every account; outputs without a view tag (before August 2022) skip the
    tag and take the full derivation.
 
-Command line: `--scan gpu|cpu|auto` (default auto: the GPU from 512 keys a
-batch, as Fob's policy), `--cache-dir` for the pipeline cache.
+Command line: nothing to choose. The GPU is used when it is usable (and a
+batch has at least 512 keys), else every block goes to monero-oxide, and
+`/daemon_status` says which. `--cache-dir` holds the pipeline cache.
 
 ## Lanes: a wallet joining with history
 
@@ -138,7 +147,6 @@ Configurable, all with `monokulo-lws serve`:
 | `--catch-up-join follow\|wait` | `follow` | Whether a queued account joins a running lane when its cursor passes the account's start height, or always waits for the next run. |
 | `--catch-up-blocks N` | 100 | Blocks a catch-up lane asks the daemon for at a time. |
 | `--catch-up-in-flight N` | 2 | Catch-up requests in flight at once; the live lane's request always goes first. |
-| `--catch-up-scan gpu\|cpu\|auto` | as `--scan` | Which engine catch-up lanes use; `cpu` keeps the GPU for the live lane on a machine where the GPU is slow to share. |
 | `--scan-interval SECS` | 10 | How often the live lane looks at the node once caught up (as today). |
 | `--gpu-arenas N` | lanes + 1 | GPU arenas (about 43 MB each): one for the live lane and one per catch-up lane, so lanes never wait on each other's batch. |
 | `--gpu-memory-mb MB` | | A cap instead: arenas = MB ÷ 43, at least 1. |
