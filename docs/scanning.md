@@ -28,7 +28,7 @@ It is GPU-only. There is no CPU prefilter (its own field code was the
 riskiest code to maintain and never the bottleneck: fetching is). Where no
 usable Vulkan GPU is there, `flag` answers `None` and the caller scans
 every block with monero-oxide. There is no batch size below which the GPU
-is skipped (Fob's decision 363: a few milliseconds a batch was not worth a
+is skipped (Fob's decision 370: a few milliseconds a batch was not worth a
 second path); every batch goes to it when it is there. Any Vulkan GPU does, integrated ones included; Apple goes
 through MoltenVK.
 
@@ -205,7 +205,7 @@ the monero-oxide fan-out) stays Fob's.
   gives `scanner_engine` and `catch_up_lanes` (each lane's cursor).
 - Choices the code made: every batch goes to the GPU when it is usable,
   the live lane's one-block batches included (no threshold, as Fob's
-  decision 363). The live lane's cursor starts at the highest scan height of any active account; an
+  decision 370). The live lane's cursor starts at the highest scan height of any active account; an
   account below it is queued for a catch-up lane. A lane that reaches the
   live cursor waits for the live lane to take its accounts in at the start
   of its next step; if the live lane moved on meanwhile, the lane catches up
