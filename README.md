@@ -46,7 +46,7 @@ Options that matter:
 | `--access-control-origin ORIGIN` | | A browser origin allowed to call the API; repeat, or `*`. |
 | `--network main\|stage\|test` | | Refuse to start if the node is on another network. |
 
-Planned, with the fob-scanner engine (`docs/scanning.md`): `--scan
+Planned, with the monokulo-8ar engine (`docs/scanning.md`): `--scan
 gpu|cpu|auto`, `--cache-dir`, and the catch-up lanes a wallet with history
 scans in (`--catch-up-lanes`, `--catch-up-join follow|wait`,
 `--catch-up-blocks`, `--catch-up-in-flight`, `--catch-up-scan`).
@@ -124,7 +124,7 @@ compares.
 - Storage is one SQLite file in WAL mode.
 
 Cost today is accounts × blocks: fine for a shop, a family or a few dozen
-wallets. The planned engine for more is Fob's `fob-scanner`: one GPU pass
+wallets. The planned engine for more is `monokulo-8ar`, the prefilter lifted out of Fob: one GPU pass
 computes `8·a·R` for every (account, transaction key) pair, 32,768 at a
 time, and only real hits reach monero-oxide. See `docs/scanning.md`.
 

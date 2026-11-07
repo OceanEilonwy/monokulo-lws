@@ -1,13 +1,14 @@
 # Scanning for many accounts at once
 
-How monokulo-lws will scan when it has hundreds of accounts: with Fob's
-`fob-scanner`, one GPU pass for every account, and monero-oxide only for
+How monokulo-lws will scan when it has hundreds of accounts: with
+`monokulo-8ar`, the prefilter lifted out of Fob's `fob-scanner`, one GPU
+pass for every account, and monero-oxide only for
 the transactions that are really someone's. Status: design; the first
 version scans each block once per account with monero-oxide alone.
 
-## What fob-scanner does
+## What monokulo-8ar does
 
-`fob-scanner` is a prefilter, not a scanner. For a batch of blocks it:
+`monokulo-8ar` is a prefilter, not a scanner. For a batch of blocks it:
 
 1. collects one job per transaction public key (and per additional key),
    about 57 a mainnet block;
@@ -31,7 +32,7 @@ batch costs at least 3.7 ms, so batches smaller than 32,768 don't pay.
 The kernel today takes one view key per dispatch, as push constants. Every
 work item multiplies a different `R` by the same `a`.
 
-## The change in fob-scanner: a keyring
+## The change in monokulo-8ar: a keyring
 
 A server has few `R`s and many `a`s. The kernel turns around:
 
@@ -162,13 +163,14 @@ to be measured with the 2,000-block mainnet fixture at 1, 10, 100 and
 
 ## Dependency
 
-`monokulo-lws` takes `fob-scanner` as a git dependency pinned to a revision
-of `monokulo-fob` until the crate is on crates.io (`publish = false` today).
-The direction is server → Fob: Fob gains no tie to Monokulo.
+`monokulo-lws` takes `monokulo-8ar` (its own repository beside this one,
+also what Fob's `fob-scanner` builds on) as a git dependency pinned to a
+revision until the crate is on crates.io. Fob's `scan.rs` (reader threads,
+the monero-oxide fan-out) stays Fob's.
 
 ## Order of work
 
-1. `fob-scanner`: the keyring API, the digits buffer and the two push
+1. `monokulo-8ar`: the keyring API, the digits buffer and the two push
    constants, vectors per account, and a test that a keyring of *n* copies
    of one key flags exactly what the single key flags.
 2. `monokulo-lws`: per-transaction output indices from the reader,
