@@ -118,9 +118,10 @@ compares.
   kept only if unlocked.
 - Storage is one SQLite file in WAL mode.
 
-Cost is accounts × blocks: fine for a shop, a family or a few dozen
-wallets; not a public service. Each account has its own view key, so the
-per-transaction work can't be shared between them.
+Cost today is accounts × blocks: fine for a shop, a family or a few dozen
+wallets. The planned engine for more is Fob's `fob-scanner`: one GPU pass
+computes `8·a·R` for every (account, transaction key) pair, 32,768 at a
+time, and only real hits reach monero-oxide. See `docs/scanning.md`.
 
 Not built yet: webhooks, the `/feed` websocket, fiat `rates`, pre-RingCT
 spends, import fees, remote scanning, `get_tree_path`, TLS on the listener.
