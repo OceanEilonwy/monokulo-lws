@@ -59,10 +59,20 @@ malformed JSON; spoof `X-Forwarded-For`.
   `/get_random_outs`, `/import_wallet_request` and account creation also
   take one from the strict bucket. A client is an IPv4 address or an IPv6
   /64. `/get_random_outs` is capped at monero-lws's limits (20 members a
-  ring, 150 rings), draws every ring's candidates in one `get_outs` per round
-  (at most eight rounds), and shares one cached output distribution between
-  requests. `get_info` for the public `/get_version` and `/daemon_status` is
-  cached for 5 s, so those endpoints don't make a node call each.
+  ring, 150 rings) and needs no account. Each round draws only what every
+  ring still lacks and asks the node for all of it in one `get_outs` (in
+  chunks of 1,000), so the most a request asks for in its first round is
+  3,000 outputs in three calls; later rounds replace only the members the
+  node called locked (the newest outputs, a few in a hundred), and after
+  monero-lws's 64 rounds the request fails. The output distribution is
+  shared between requests and fetched again only when the chain has grown
+  past it (at most every 5 s) or after two minutes. `/submit_raw_tx` parses
+  the transaction before the node sees it, so junk costs no node call; a
+  transaction the node relays is scanned once more for the live accounts
+  with the live keyring (one transaction: moments), and relaying one costs
+  its sender a real fee. `get_info` for the public `/get_version` and
+  `/daemon_status` is cached for 5 s, so those endpoints don't make a node
+  call each.
 - *Pick their own client address.* `X-Forwarded-For` (or the header named
   by `--client-ip-header`) is read only when the TCP peer is in
   `--trusted-proxies`; the client is then the rightmost address in it that is
@@ -107,6 +117,13 @@ token). An inactive account
 is served what was scanned but can't import or add subaddresses; a hidden
 account is refused everywhere.
 
+`/get_random_outs` and `/submit_raw_tx` take no account at all: what they
+answer (ring members, the node's verdict on a transaction) is public chain
+data, the same for anyone. A refusal's reason is rebuilt from the node's
+verification flags in monerod's own words, or else the node's reason cut to
+printable ASCII and 256 characters; a node that can't be reached is the
+fixed "the node is unavailable" sentence.
+
 ### A malicious or compromised node
 
 The server trusts its node, as monero-lws does (monero-lws's
@@ -149,6 +166,23 @@ a proof of inclusion in a block the node made up; a client that checks the
 proof against a node of its own sees that the block hash isn't the chain's
 (see the next section). Hidden transactions and lies about decoys are not
 caught that way.
+
+**Decoys in particular.** `/get_random_outs` rests entirely on the node:
+the output distribution (`get_output_distribution`) decides which ages and
+blocks are drawn from, and `get_outs` decides each member's key, commitment
+and whether it counts as unlocked. The server checks only that the
+distribution is cumulative and the keys are hex. A node that lies can bias
+every ring: a distribution that puts most outputs in blocks it chose draws
+members from there (outputs it made itself, or ones it can otherwise
+trace), and marking the rest locked makes the server draw again until it
+gets them. Such rings still verify, so nothing fails; the transactions
+are just less private, against whoever controls the node. A wrong key or
+commitment, by contrast, makes the transaction invalid, and the network
+refuses it. The server can't detect this (the distribution and lock state
+are chain facts only a node knows), so the control is the same: a node
+the operator runs. A client that wants no such trust picks its own ring
+members against a node of its own, as wallet2 does; the light wallet API
+leaves this to the server.
 
 ### The server, as its clients see it
 
@@ -203,6 +237,21 @@ the network accepted.
 
 Because of the last point, a client that wants proofs should treat a mined
 receive without one as unverified rather than as false.
+
+**What sending tells the server.** The server already knows which outputs
+are an account's. When a client sends, the server also hands out the ring
+members (`/get_random_outs`) and then sees the transaction
+(`/submit_raw_tx`, from the same client address): the member of each ring
+it didn't hand out, and that is one of the account's outputs, is the real
+spend, and the transaction's outputs that pay the account are its change.
+This is the light wallet API's design, in monero-lws as here; a server (or
+whoever reads its memory) can link an account's spends, though not prove
+them to anyone else. The server keeps none of it: neither request is
+logged with its contents, ring members are not stored, and a submitted
+transaction is held only in the pool view until it leaves the pool. A
+client that wants to hide its spends from the server picks its ring
+members and relays its transactions through a node of its own, using the
+server only to find its outputs.
 
 ### Someone who reads the database file
 
@@ -311,6 +360,10 @@ read the process's memory learns.
 | Rate limits | None | Per client (IPv4 or IPv6 /64), strict class, global creation cap |
 | Pending requests | `--create-queue-max` 10,000 | `--max-pending-requests` 10,000 |
 | `/get_random_outs` | 20 a ring, 150 rings | The same |
+| `/get_random_outs` over the caps | 500 (`exceeded_rest_request_limit` isn't mapped) | 400 with a sentence |
+| `/get_random_outs` without enough unlocked members after 64 rounds | 500 | 503 with a sentence |
+| Pre-RingCT amounts in `/get_random_outs` | Served from the node's histogram | 400: only amount `0` |
+| `/submit_raw_tx` that doesn't parse | 400, empty body | 400 with a sentence |
 | Client address behind a proxy | Not used | `--trusted-proxies` + header, rightmost untrusted hop |
 | TLS | `https://` listeners with `--rest-ssl-key`/`--rest-ssl-certificate` | `--tls-cert`/`--tls-key`, rustls, TLS 1.2+ |
 | External bind | `--confirm-external-bind` | `--confirm-external-bind` |
