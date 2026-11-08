@@ -8,6 +8,8 @@
 
 mod admin_keys;
 mod at_rest;
+#[cfg(test)]
+mod correctness;
 mod crypto;
 mod daemon;
 mod db;
@@ -19,6 +21,8 @@ mod redact;
 mod rest;
 mod scanner;
 mod server;
+#[cfg(test)]
+mod testkit;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

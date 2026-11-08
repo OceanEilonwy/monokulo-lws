@@ -83,6 +83,7 @@ pub struct PoolReceipt {
     pub amount: u64,
     pub public_key: [u8; 32],
     pub mask: Option<[u8; 32]>,
+    pub commitment: Option<[u8; 32]>,
     pub unlock_time: u64,
     pub mixin: u32,
     pub fee: u64,
@@ -92,12 +93,31 @@ pub struct PoolReceipt {
     pub seen: u64,
 }
 
+/// A candidate spend by a transaction still in the pool: an input whose ring
+/// holds one of the account's (mined) outputs.
+#[derive(Clone, Debug)]
+pub struct PoolSpend {
+    pub tx_hash: [u8; 32],
+    /// The output's row id.
+    pub output: i64,
+    pub key_image: [u8; 32],
+    pub mixin: u32,
+    pub unlock_time: u64,
+    pub fee: u64,
+}
+
+/// What the pool holds for the live lane's accounts, worked out once per
+/// pool transaction and forgotten when the transaction leaves the pool.
 #[derive(Default)]
 pub struct Mempool {
+    /// The accounts the pool was scanned for; another set scans it again.
+    accounts: Vec<i64>,
     /// Pool transactions already looked at, so each is scanned once.
     seen: HashSet<[u8; 32]>,
     /// What each account received, by account id.
     received: HashMap<i64, Vec<PoolReceipt>>,
+    /// Each account's candidate spends, by account id.
+    spent: HashMap<i64, Vec<PoolSpend>>,
 }
 
 impl Mempool {
@@ -105,12 +125,29 @@ impl Mempool {
         self.received.get(&account).cloned().unwrap_or_default()
     }
 
-    fn retain(&mut self, still_in_pool: &HashSet<[u8; 32]>) {
+    pub fn spends_for(&self, account: i64) -> Vec<PoolSpend> {
+        self.spent.get(&account).cloned().unwrap_or_default()
+    }
+
+    /// Forgets everything: after a reorg (transactions of orphaned blocks
+    /// come back to the pool) or when the accounts change.
+    pub(crate) fn reset(&mut self, accounts: Vec<i64>) {
+        *self = Mempool {
+            accounts,
+            ..Mempool::default()
+        };
+    }
+
+    pub(crate) fn retain(&mut self, still_in_pool: &HashSet<[u8; 32]>) {
         self.seen.retain(|h| still_in_pool.contains(h));
         for list in self.received.values_mut() {
             list.retain(|r| still_in_pool.contains(&r.tx_hash));
         }
         self.received.retain(|_, l| !l.is_empty());
+        for list in self.spent.values_mut() {
+            list.retain(|r| still_in_pool.contains(&r.tx_hash));
+        }
+        self.spent.retain(|_, l| !l.is_empty());
     }
 }
 
@@ -197,7 +234,7 @@ impl Ring {
     }
 
     /// The ring in `slot` if it's for `accounts`, else a new one there.
-    fn get<'a>(
+    pub(crate) fn get<'a>(
         slot: &'a mut Option<Ring>,
         w: &ScanWriter,
         accounts: &[Account],
@@ -225,6 +262,12 @@ impl Ring {
 
     fn account(&self, hit: &Hit) -> i64 {
         self.ids[hit.account.index()]
+    }
+
+    /// Each account's id in the keyring, in account id order.
+    #[cfg(test)]
+    pub fn keyring_ids(&self) -> Vec<AccountId> {
+        self.in_keyring.clone()
     }
 
     /// `account`'s `Scanner`, made the first time it's needed.
@@ -455,6 +498,16 @@ impl Scanner {
             return Ok(false);
         }
         if start >= chain_height {
+            // Caught up: a reorg that replaced the top block without making the
+            // chain longer shows only in the top block's hash.
+            let top = crate::daemon::hex32(&info.top_block_hash);
+            if let (Some(kept), Some(top)) = (self.db.block_hash(chain_height - 1)?, top)
+                && start == chain_height
+                && kept != top
+            {
+                self.reorg().await?;
+                return Ok(true);
+            }
             self.scan_pool(&accounts).await?;
             return Ok(false);
         }
@@ -469,18 +522,11 @@ impl Scanner {
         }
 
         // A reorg shows as the first block not following the one we kept.
-        if let Some(kept) = self.db.block_hash(start - 1)? {
-            if kept != fetched[0].block.block.header.previous {
-                let fork = self.find_fork().await?;
-                tracing::info!("reorg: rewinding to {fork}");
-                self.db.rewind(fork)?;
-                self.mempool.lock().unwrap_or_else(|e| e.into_inner()).seen.clear();
-                if self.plan().live.is_some() {
-                    self.plan().advance(fork);
-                    self.moved.notify_waiters();
-                }
-                return Ok(true);
-            }
+        if let Some(kept) = self.db.block_hash(start - 1)?
+            && kept != fetched[0].block.block.header.previous
+        {
+            self.reorg().await?;
+            return Ok(true);
         }
 
         let batch = Batch::new(fetched);
@@ -660,6 +706,24 @@ impl Scanner {
         })
     }
 
+    /// Unwinds a reorg: everything from the fork on (outputs, candidate spends,
+    /// transactions, kept hashes) goes, every account at or past it moves back
+    /// to it, and the pool is looked at afresh, as the orphaned blocks'
+    /// transactions may be back in it.
+    async fn reorg(&self) -> Result<()> {
+        let fork = self.find_fork().await?;
+        tracing::info!("reorg: rewinding to {fork}");
+        self.db.rewind(fork)?;
+        self.mempool.lock().unwrap_or_else(|e| e.into_inner()).reset(vec![]);
+        *self.last_block.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if self.plan().live.is_some() {
+            self.plan().advance(fork);
+            self.moved.notify_waiters();
+        }
+        self.set_status(|s| s.scanner_height = fork);
+        Ok(())
+    }
+
     /// The highest kept block the daemon still has; its successor is where
     /// to scan again from.
     async fn find_fork(&self) -> Result<u64> {
@@ -675,12 +739,21 @@ impl Scanner {
 
     /// Scans pool transactions not yet seen, in a stand-in block made of
     /// the last block scanned, and forgets ones that left the pool. The live
-    /// keyring says which accounts may be paid; only those are scanned.
+    /// keyring says which accounts may be paid; only those are scanned for
+    /// outputs, and every pool input's ring is looked up in one map of the
+    /// accounts' outputs for candidate spends.
     async fn scan_pool(&self, accounts: &[Account]) -> Result<()> {
         let hashes = self.daemon.pool_hashes().await?;
         let in_pool: HashSet<[u8; 32]> = hashes.iter().copied().collect();
+        let mut ids: Vec<i64> = accounts.iter().map(|a| a.id).collect();
+        ids.sort_unstable();
         let new: Vec<[u8; 32]> = {
             let mut pool = self.mempool.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.accounts != ids {
+                // An account came or went: everything is looked at again for
+                // the new set, so a newcomer sees what is already waiting.
+                pool.reset(ids.clone());
+            }
             pool.retain(&in_pool);
             hashes.into_iter().filter(|h| !pool.seen.contains(h)).collect()
         };
@@ -691,85 +764,25 @@ impl Scanner {
             return Ok(());
         };
         let txs = self.daemon.transactions(&new).await?;
-        let hashes: Vec<[u8; 32]> = txs.iter().map(|(h, _)| *h).collect();
-        let transactions: Vec<Transaction<Pruned>> = txs.into_iter().map(|(_, t)| t).collect();
-        let Some(block) = Block::new(
-            stand_in.header.clone(),
-            stand_in.miner_transaction().clone(),
-            hashes.clone(),
-        ) else {
+        let Some(block) = pool_block(&stand_in, txs) else {
             return Ok(());
         };
-        let block = ScannableBlock {
-            block,
-            transactions,
-            output_index_for_first_ringct_output: Some(0),
-        };
         let now = crate::db::now();
-        let mut found: HashMap<i64, Vec<PoolReceipt>> = HashMap::new();
         let mut slot = self.live_ring.lock().unwrap_or_else(|e| e.into_inner()).take();
         let result = tokio::task::block_in_place(|| {
             self.db.write(|tx| {
-                Ring::get(
-                    &mut slot,
-                    &ScanWriter::new(tx),
-                    accounts,
-                    self.config.lookahead,
-                    &self.arenas[0],
-                )
-                .map(|_| ())
-            })?;
-            let ring = slot.as_mut().expect("just made");
-            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-            // The accounts that may be paid, or every account unfiltered.
-            let paid: Vec<&Account> = match ring.keyring.flag_many(std::slice::from_ref(&block), threads, 0) {
-                Some(hits) => {
-                    let ids: BTreeSet<i64> = hits.iter().map(|h| ring.account(h)).collect();
-                    accounts.iter().filter(|a| ids.contains(&a.id)).collect()
-                }
-                None => accounts.iter().collect(),
-            };
-            for account in paid {
-                let scanner = ring.scanner(account, self.config.lookahead)?;
-                let outputs = scanner
-                    .scan(block.clone())
-                    .map_err(|e| Error::Internal(format!("scan: {e}")))?
-                    .ignore_additional_timelock();
-                for output in outputs {
-                    let tx_hash = output.transaction();
-                    let Some(i) = hashes.iter().position(|h| *h == tx_hash) else {
-                        continue;
-                    };
-                    let tx = &block.transactions[i];
-                    let meta = TxMeta::of(tx, &output, &account.view_key);
-                    found.entry(account.id).or_default().push(PoolReceipt {
-                        tx_hash,
-                        tx_prefix_hash: meta.prefix_hash,
-                        tx_pub_key: meta.derived_key,
-                        out_index: output.index_in_transaction() as u16,
-                        amount: output.commitment().amount,
-                        public_key: output.key().compress().to_bytes(),
-                        mask: Some(output.commitment().mask.into()).map(|m: DScalar| *m.as_bytes()),
-                        unlock_time: meta.unlock_time,
-                        mixin: meta.mixin,
-                        fee: meta.fee,
-                        payment_id: meta.payment_id.clone(),
-                        maj: output.subaddress().map(|s| s.account()).unwrap_or(0),
-                        min: output.subaddress().map(|s| s.address()).unwrap_or(0),
-                        seen: now,
-                    });
-                }
-            }
-            Ok::<_, Error>(())
+                let w = ScanWriter::new(tx);
+                let ring = Ring::get(&mut slot, &w, accounts, self.config.lookahead, &self.arenas[0])?;
+                let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+                let hits = ring.keyring.flag_many(std::slice::from_ref(&block), threads, 0);
+                scan_pool_block(&w, ring, self.config.lookahead, accounts, &block, hits.as_deref(), now)
+            })
         });
         *self.live_ring.lock().unwrap_or_else(|e| e.into_inner()) = slot;
-        result?;
+        let found = result?;
         let mut pool = self.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        for h in new {
-            pool.seen.insert(h);
-        }
-        for (account, receipts) in found {
-            pool.received.entry(account).or_default().extend(receipts);
+        if pool.accounts == ids {
+            pool.add(&new, found);
         }
         Ok(())
     }
@@ -800,6 +813,16 @@ pub fn record_batch(
     hits: Option<&[Hit]>,
     live: bool,
 ) -> Result<()> {
+    // Only accounts still where the batch was planned from: one rescanned,
+    // rewound by a reorg or hidden while the blocks were fetched is left for
+    // the next batch, which starts from where it stands now.
+    let mut current = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        if w.standing(account.id)? == Some((account.scan_height, Status::Active)) {
+            current.push(account.clone());
+        }
+    }
+    let accounts = current.as_slice();
     let by_id: HashMap<i64, &Account> = accounts.iter().map(|a| (a.id, a)).collect();
     let mut spends = SpendMap::of(w, accounts)?;
     let mut by_block: Vec<Vec<Hit>> = vec![vec![]; batch.blocks.len()];
@@ -812,8 +835,17 @@ pub fn record_batch(
         let height = start + i as u64;
         if hits.is_some() {
             let mut list = std::mem::take(&mut by_block[i]);
-            // Transactions in block order, as the first output with a key counts.
+            // Transactions in block order, as the first output with a key counts;
+            // each transaction once per account, and nothing else for an account
+            // whose block is read whole.
             list.sort_by_key(|h| (h.tx, h.account));
+            list.dedup();
+            let whole: HashSet<AccountId> = list
+                .iter()
+                .filter(|h| h.tx == Hit::WHOLE_BLOCK)
+                .map(|h| h.account)
+                .collect();
+            list.retain(|h| h.tx == Hit::WHOLE_BLOCK || !whole.contains(&h.account));
             for hit in list {
                 let Some(account) = by_id.get(&ring.account(&hit)).copied() else {
                     continue;
@@ -958,6 +990,7 @@ fn record_received(
         let tx_id = w.tx_row(account.id, &meta.new_tx(tx_hash, height, timestamp))?;
         let mask: DScalar = output.commitment().mask.into();
         let rct = !matches!(tx, Transaction::V1 { .. });
+        let index = output.index_in_transaction() as usize;
         let new = NewOutput {
             out_index: output.index_in_transaction() as u16,
             global_index: output.index_on_blockchain(),
@@ -968,29 +1001,178 @@ fn record_received(
             height,
             maj: output.subaddress().map(|s| s.account()).unwrap_or(0),
             min: output.subaddress().map(|s| s.address()).unwrap_or(0),
+            commitment: onchain_commitment(tx, index, &output),
         };
-        if let Some(id) = w.add_output(account.id, tx_id, &new)? {
-            if rct {
-                spends.add(
-                    account.id,
-                    OutputRow {
-                        id,
-                        tx: tx_id,
-                        out_index: new.out_index,
-                        global_index: new.global_index,
-                        amount: new.amount,
-                        public_key: new.public_key,
-                        tx_pub_key: new.tx_pub_key,
-                        mask: new.mask,
-                        height,
-                        maj: new.maj,
-                        min: new.min,
-                    },
-                );
-            }
+        if let Some(id) = w.add_output(account.id, tx_id, &new)?
+            && rct
+        {
+            spends.add(
+                account.id,
+                OutputRow {
+                    id,
+                    tx: tx_id,
+                    out_index: new.out_index,
+                    global_index: new.global_index,
+                    amount: new.amount,
+                    public_key: new.public_key,
+                    tx_pub_key: new.tx_pub_key,
+                    mask: new.mask,
+                    height,
+                    maj: new.maj,
+                    min: new.min,
+                    commitment: new.commitment,
+                },
+            );
         }
     }
     Ok(())
+}
+
+/// What a look at the pool found, by account id.
+#[derive(Default)]
+pub struct PoolFound {
+    pub received: HashMap<i64, Vec<PoolReceipt>>,
+    pub spent: HashMap<i64, Vec<PoolSpend>>,
+}
+
+impl Mempool {
+    /// Takes in what scanning the pool transactions `scanned` found; each is
+    /// looked at once, so nothing is added twice.
+    pub(crate) fn add(&mut self, scanned: &[[u8; 32]], found: PoolFound) {
+        let fresh: HashSet<[u8; 32]> = scanned.iter().copied().filter(|h| self.seen.insert(*h)).collect();
+        for (account, receipts) in found.received {
+            let list = self.received.entry(account).or_default();
+            list.extend(receipts.into_iter().filter(|r| fresh.contains(&r.tx_hash)));
+        }
+        for (account, spends) in found.spent {
+            let list = self.spent.entry(account).or_default();
+            list.extend(spends.into_iter().filter(|r| fresh.contains(&r.tx_hash)));
+        }
+        self.received.retain(|_, l| !l.is_empty());
+        self.spent.retain(|_, l| !l.is_empty());
+    }
+}
+
+/// Pool transactions as a block the `Scanner` takes: the header and miner
+/// transaction of `last` (the last block scanned), then the pool's. Pool
+/// outputs have no global index yet; theirs count from 0 and are not served.
+pub fn pool_block(last: &Block, txs: Vec<([u8; 32], Transaction<Pruned>)>) -> Option<ScannableBlock> {
+    let (hashes, transactions): (Vec<[u8; 32]>, Vec<Transaction<Pruned>>) = txs.into_iter().unzip();
+    let block = Block::new(last.header.clone(), last.miner_transaction().clone(), hashes)?;
+    Some(ScannableBlock {
+        block,
+        transactions,
+        output_index_for_first_ringct_output: Some(0),
+    })
+}
+
+/// What a block of pool transactions (`pool_block`) holds for `accounts`:
+/// with `hits`, only the accounts the keyring flags are scanned for outputs
+/// (every account without); the miner transaction of the stand-in is not the
+/// pool's and is skipped. Every input's ring is looked up in one map of the
+/// accounts' outputs for candidate spends.
+pub fn scan_pool_block(
+    w: &ScanWriter,
+    ring: &mut Ring,
+    lookahead: u32,
+    accounts: &[Account],
+    block: &ScannableBlock,
+    hits: Option<&[Hit]>,
+    now: u64,
+) -> Result<PoolFound> {
+    let mut found = PoolFound::default();
+    let paid: Vec<&Account> = match hits {
+        Some(hits) => {
+            let ids: BTreeSet<i64> = hits.iter().map(|h| ring.account(h)).collect();
+            accounts.iter().filter(|a| ids.contains(&a.id)).collect()
+        }
+        None => accounts.iter().collect(),
+    };
+    let hashes = &block.block.transactions;
+    for account in paid {
+        let scanner = ring.scanner(account, lookahead)?;
+        let outputs = scanner
+            .scan(block.clone())
+            .map_err(|e| Error::Internal(format!("scan: {e}")))?
+            .ignore_additional_timelock();
+        for output in outputs {
+            let tx_hash = output.transaction();
+            let Some(i) = hashes.iter().position(|h| *h == tx_hash) else {
+                continue;
+            };
+            let tx = &block.transactions[i];
+            let meta = TxMeta::of(tx, &output, &account.view_key);
+            let index = output.index_in_transaction() as usize;
+            let list = found.received.entry(account.id).or_default();
+            let public_key = output.key().compress().to_bytes();
+            // The burning bug: a key already received in this pool transaction counts once.
+            if list.iter().any(|r| r.public_key == public_key) {
+                continue;
+            }
+            list.push(PoolReceipt {
+                tx_hash,
+                tx_prefix_hash: meta.prefix_hash,
+                tx_pub_key: meta.derived_key,
+                out_index: index as u16,
+                amount: output.commitment().amount,
+                public_key,
+                mask: Some(output.commitment().mask.into()).map(|m: DScalar| *m.as_bytes()),
+                commitment: onchain_commitment(tx, index, &output),
+                unlock_time: meta.unlock_time,
+                mixin: meta.mixin,
+                fee: meta.fee,
+                payment_id: meta.payment_id.clone(),
+                maj: output.subaddress().map(|s| s.account()).unwrap_or(0),
+                min: output.subaddress().map(|s| s.address()).unwrap_or(0),
+                seen: now,
+            });
+        }
+    }
+    let spends = SpendMap::of(w, accounts)?;
+    if spends.is_empty() {
+        return Ok(found);
+    }
+    for (i, tx) in block.transactions.iter().enumerate() {
+        let tx_hash = hashes[i];
+        let mixin = mixin(tx);
+        let unlock_time = unlock_time(tx.prefix().additional_timelock);
+        for input in &tx.prefix().inputs {
+            let Input::ToKey {
+                amount,
+                key_offsets,
+                key_image,
+            } = input
+            else {
+                continue;
+            };
+            if amount.unwrap_or(0) != 0 {
+                continue;
+            }
+            let mut absolute = 0u64;
+            for offset in key_offsets {
+                absolute = absolute.saturating_add(*offset);
+                for (account, ours) in spends.get(absolute) {
+                    let list = found.spent.entry(*account).or_default();
+                    let key_image = key_image.to_bytes();
+                    if !list
+                        .iter()
+                        .any(|s| s.tx_hash == tx_hash && s.output == ours.id && s.key_image == key_image)
+                    {
+                        list.push(PoolSpend {
+                            tx_hash,
+                            output: ours.id,
+                            key_image,
+                            mixin,
+                            unlock_time,
+                            fee: fee(tx),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    found.spent.retain(|_, l| !l.is_empty());
+    Ok(found)
 }
 
 /// Possibly spent: an input whose ring holds an output of one of `accounts`
@@ -1105,10 +1287,43 @@ fn mixin(tx: &Transaction<Pruned>) -> u32 {
         .unwrap_or(0)
 }
 
+/// The fee a transaction paid: the RingCT base's for a RingCT transaction,
+/// inputs less outputs for a pre-RingCT one, 0 for a coinbase.
 fn fee(tx: &Transaction<Pruned>) -> u64 {
     match tx {
+        _ if is_coinbase(tx) => 0,
         Transaction::V2 { proofs: Some(p), .. } => p.base.fee,
-        _ => 0,
+        Transaction::V2 { proofs: None, .. } => 0,
+        Transaction::V1 { prefix, .. } => {
+            let inputs = prefix
+                .inputs
+                .iter()
+                .map(|i| match i {
+                    Input::ToKey { amount, .. } => amount.unwrap_or(0),
+                    Input::Gen(_) => 0,
+                })
+                .fold(0u64, u64::saturating_add);
+            let outputs = prefix
+                .outputs
+                .iter()
+                .map(|o| o.amount.unwrap_or(0))
+                .fold(0u64, u64::saturating_add);
+            inputs.saturating_sub(outputs)
+        }
+    }
+}
+
+/// The Pedersen commitment the chain holds for output `index` of `tx`, which
+/// the `Scanner` found as `output`: the RingCT base's `outPk` for a RingCT
+/// transaction; for a miner output (whose amount is in the clear) the
+/// commitment the chain gives it, `G + amount·H`; none for a pre-RingCT one.
+fn onchain_commitment(tx: &Transaction<Pruned>, index: usize, output: &WalletOutput) -> Option<[u8; 32]> {
+    let plain = tx.prefix().outputs.get(index).is_some_and(|o| o.amount.is_some());
+    match tx {
+        Transaction::V1 { .. } => None,
+        Transaction::V2 { .. } if plain => Some(output.commitment().commit().compress().to_bytes()),
+        Transaction::V2 { proofs: Some(p), .. } => p.base.commitments.get(index).map(|c| c.to_bytes()),
+        Transaction::V2 { proofs: None, .. } => None,
     }
 }
 
@@ -1149,11 +1364,14 @@ pub fn unlocked(height: u64, coinbase: bool, unlock_time: u64, chain_height: u64
     if unlock_time == 0 {
         return true;
     }
+    // As wallet2 and monero-lws: a block height while below 500,000,000, else
+    // a time, with a block's worth (120 s) of leeway.
     const BLOCK_OR_TIME: u64 = 500_000_000;
+    const TIME_LEEWAY: u64 = 120;
     if unlock_time < BLOCK_OR_TIME {
         unlock_time <= chain_height
     } else {
-        unlock_time <= now
+        unlock_time <= now.saturating_add(TIME_LEEWAY)
     }
 }
 
@@ -1164,8 +1382,15 @@ pub fn unlocked(height: u64, coinbase: bool, unlock_time: u64, chain_height: u64
 /// others. The blocks are rebuilt from the fixture, one transaction per key
 /// and no inputs, so this measures the prefilter and the writing, not
 /// fetching. Prints blocks a second.
-pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step: usize) -> anyhow::Result<()> {
-    use rand::RngCore;
+/// A fixture's blocks, their transactions' first output indexes, and its key count.
+pub type FixtureBlocks = (Vec<ScannableBlock>, Vec<Vec<Option<u64>>>, usize);
+
+/// The blocks of a fixture written by monokulo-8ar's `prototypes/scan-bench`
+/// (each transaction key with its outputs' indexes, view tags and keys, from
+/// 2,000 mainnet blocks from 3,797,000), rebuilt one transaction per key with
+/// no inputs and no RingCT proofs, output indexes counted from 1,000,000; with
+/// each block's transactions' first output indexes, and the number of keys.
+pub fn fixture_blocks(fixture: &std::path::Path) -> anyhow::Result<FixtureBlocks> {
     use std::io::Read;
 
     let mut f = std::io::BufReader::new(std::fs::File::open(fixture)?);
@@ -1264,6 +1489,13 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
         });
         first_indexes.push(firsts);
     }
+    Ok((blocks, first_indexes, key_count))
+}
+
+pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step: usize) -> anyhow::Result<()> {
+    use rand::RngCore;
+
+    let (blocks, first_indexes, key_count) = fixture_blocks(fixture)?;
     println!("{} blocks, {key_count} keys, from {}", blocks.len(), fixture.display());
 
     monokulo_8ar::warm_up();
@@ -1374,7 +1606,8 @@ mod tests {
         assert!(unlocked(100, true, 0, 160, 0));
         assert!(!unlocked(100, false, 200, 150, 0));
         assert!(unlocked(100, false, 200, 200, 0));
-        assert!(!unlocked(100, false, 1_700_000_000, 150, 1_699_999_999));
+        assert!(!unlocked(100, false, 1_700_000_000, 150, 1_699_999_879));
+        assert!(unlocked(100, false, 1_700_000_000, 150, 1_699_999_880));
         assert!(unlocked(100, false, 1_700_000_000, 150, 1_700_000_000));
     }
 
@@ -1573,6 +1806,7 @@ mod tests {
             height: 1,
             maj: 0,
             min: 0,
+            commitment: None,
         };
         map.add(1, row(10));
         map.add(2, row(11));
@@ -1602,7 +1836,9 @@ mod tests {
     /// Two blocks, the first paying `keys` and the second spending it in a ring,
     /// written with the hits given (or unfiltered), for an account at 100 and one
     /// with the same keys at 200, which must see neither.
-    fn record(hits: Option<&dyn Fn(&Ring) -> Vec<Hit>>) -> (Db, Account, Account) {
+    type FakeHits<'a> = Option<&'a dyn Fn(&Ring) -> Vec<Hit>>;
+
+    fn record(hits: FakeHits) -> (Db, Account, Account) {
         let keys = keys();
         let db = Db::in_memory();
         let (a, b) = (account(&db, &keys, "A", 100), account(&db, &keys, "B", 200));

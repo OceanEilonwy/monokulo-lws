@@ -72,7 +72,7 @@ fn accept(app: &App, p: Requests) -> Result<Value> {
                 app.db.add_account(&new, Status::Active)?;
             }
             "import" => {
-                app.db.rescan(std::slice::from_ref(&new.address), 0)?;
+                app.db.import(std::slice::from_ref(&new.address))?;
             }
             _ => return Err(bad("type must be \"create\" or \"import\"")),
         }

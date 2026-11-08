@@ -70,6 +70,8 @@ fn app(setup: Setup) -> Arc<App> {
             },
         },
     );
+    // As if the scanner had heard from the node: a new account starts below this.
+    scanner.status.write().unwrap().chain_height = 1_000;
     Arc::new(App {
         db,
         daemon,

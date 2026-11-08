@@ -303,8 +303,8 @@ pub struct Transaction {
     pub total_received: Amount,
     /// The sum of the candidate spends' amounts.
     pub total_sent: Amount,
-    /// The fee the transaction paid, as monero-lws serves it. Absent from
-    /// servers that do not serve it, and for a coinbase transaction.
+    /// The fee the transaction paid, as monero-lws serves it: `"0"` for a
+    /// coinbase transaction. Absent only from servers that do not serve it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee: Option<Amount>,
     pub unlock_time: u64,

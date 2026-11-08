@@ -140,43 +140,46 @@ pub fn derived_by(
     }
 }
 
-/// The 96-byte `rct` blob: the commitment, then the mask and the amount
-/// encrypted the original way (`ecdhEncode`, non-compact), which the
-/// client undoes with `H_s(shared)` and `H_s(H_s(shared))`.
+/// `mask·G + amount·H`, compressed: the Pedersen commitment an output's mask
+/// and amount open.
+pub fn commit(mask: &[u8; 32], amount: u64) -> [u8; 32] {
+    Commitment::new(Scalar::from(DScalar::from_bytes_mod_order(*mask)), amount)
+        .commit()
+        .compress()
+        .to_bytes()
+}
+
+/// The 96-byte `rct` blob: the output's on-chain commitment, then the mask
+/// and the amount encrypted the original way (`ecdhEncode`, non-compact),
+/// which the client undoes with `H_s(shared)` and `H_s(H_s(shared))`.
 pub fn legacy_rct(
     view_key: &[u8; 32],
     tx_pub_key: &[u8; 32],
     index: u64,
+    commitment: &[u8; 32],
     mask: &[u8; 32],
     amount: u64,
 ) -> Option<[u8; 96]> {
     let shared = shared_scalar(view_key, tx_pub_key, index)?;
     let mask_scalar = DScalar::from_bytes_mod_order(*mask);
-    let commitment = Commitment::new(Scalar::from(mask_scalar), amount)
-        .commit()
-        .compress()
-        .to_bytes();
     let s1 = hash_to_scalar(shared.as_bytes());
     let s2 = hash_to_scalar(s1.as_bytes());
     let masked = mask_scalar + s1;
     let amount_scalar = DScalar::from(amount) + s2;
     let mut out = [0u8; 96];
-    out[..32].copy_from_slice(&commitment);
+    out[..32].copy_from_slice(commitment);
     out[32..64].copy_from_slice(masked.as_bytes());
     out[64..].copy_from_slice(amount_scalar.as_bytes());
     Some(out)
 }
 
-/// The blob for a coinbase (or other plain-amount) output: the commitment
-/// to the amount under the identity mask, then the identity and the amount
-/// in the clear, as monero-lws sends them.
-pub fn plain_rct(amount: u64) -> [u8; 96] {
-    let commitment = Commitment::new(Scalar::from(DScalar::ONE), amount)
-        .commit()
-        .compress()
-        .to_bytes();
+/// The blob for a coinbase (or other plain-amount) output: its on-chain
+/// commitment (`G + amount·H`), then the identity mask and the amount in the
+/// clear. monero-lws sends zeros for the commitment here; a client takes the
+/// identity mask for a coinbase output either way.
+pub fn plain_rct(commitment: &[u8; 32], amount: u64) -> [u8; 96] {
     let mut out = [0u8; 96];
-    out[..32].copy_from_slice(&commitment);
+    out[..32].copy_from_slice(commitment);
     out[32..64].copy_from_slice(DScalar::ONE.as_bytes());
     out[64..].copy_from_slice(DScalar::from(amount).as_bytes());
     out
@@ -235,7 +238,8 @@ mod tests {
         let r = DScalar::from(5u64);
         let tx_pub = (&r * ED25519_BASEPOINT_TABLE).compress().to_bytes();
         let mask = DScalar::from(31u64);
-        let packed = legacy_rct(view.as_bytes(), &tx_pub, 2, mask.as_bytes(), 1_000_000).unwrap();
+        let commitment = commit(mask.as_bytes(), 1_000_000);
+        let packed = legacy_rct(view.as_bytes(), &tx_pub, 2, &commitment, mask.as_bytes(), 1_000_000).unwrap();
         let shared = shared_scalar(view.as_bytes(), &tx_pub, 2).unwrap();
         let s1 = hash_to_scalar(shared.as_bytes());
         let s2 = hash_to_scalar(s1.as_bytes());
