@@ -221,6 +221,7 @@ fn fixture_with_payments(w: &Wallet) -> Option<(Vec<Made>, Vec<u64>)> {
             block,
             first_indexes,
             next: 0,
+            raw: None,
         });
     }
     expected.sort();
@@ -581,7 +582,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
     let mut outgoing = Tx::new(k2, vec![stranger(4), stranger(5)]);
     outgoing.inputs = vec![ring(&[5_002, 17], 9)];
     outgoing.fee = 12_345;
-    let incoming_hash = tx_hash(101, 0, 0);
+    let incoming_hash = tx_hash(&incoming.build(), 101, 0, 0);
     let outgoing_hash = [0xee; 32];
     let pool = pool_block(
         &last,
@@ -614,6 +615,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
     assert_eq!(pooled.len(), 2);
     let inc = pooled.iter().find(|t| t.hash.0 == incoming_hash).unwrap();
     assert_eq!((inc.height, inc.timestamp.as_ref()), (None, None));
+    assert!(inc.proof.is_none(), "nothing to prove in the pool");
     assert_eq!(inc.receives.len(), 1);
     assert_eq!(inc.total_received, Amount(42_000));
     assert!(inc.receives[0].commitment.is_some());
@@ -637,6 +639,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
         0,
     );
     assert_eq!(mined.block.block.transactions[0], incoming_hash);
+    let mined_hash = mined.block.block.hash();
     write(&db, std::slice::from_ref(&account), vec![mined], 101, true, None);
     let served = txs(&app, &w).await;
     let same: Vec<_> = served
@@ -647,6 +650,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
     assert_eq!(same.len(), 1);
     assert_eq!((same[0].mempool, same[0].height), (false, Some(101)));
     assert_eq!(same[0].receives[0].global_index, 6_001);
+    check_proof(same[0], mined_hash);
 
     // Then dropped from the pool: the outgoing one goes.
     app.scanner
@@ -721,6 +725,7 @@ fn a_batch_cut_short_leaves_nothing_behind() {
     let batch = Batch {
         first_indexes: vec![made.first_indexes],
         blocks: vec![made.block],
+        raw: vec![made.raw],
     };
     let mut slot = None;
     let result: crate::error::Result<()> = db.write(|tx| {
@@ -881,4 +886,247 @@ async fn an_import_starts_the_account_at_block_zero() {
     assert_eq!(info(&app, &w).await.start_height, 0);
     let again = unwrap(wallet::import_wallet_request(State(app.clone()), None, ApiJson(w.login())).await);
     assert!(!again.new_request, "already from 0: nothing more to do");
+}
+
+/// What a client does with a served proof: the block's hash from its blob
+/// (which must be `block_hash`, as a node would say), and the transaction's
+/// hash from its parts (or, for the miner's, from the blob), which must be
+/// the served hash and in the block. Gives the block read from the blob.
+fn check_proof(t: &lws_api::Transaction, block_hash: [u8; 32]) -> monero_wallet::block::Block {
+    let proof = t.proof.as_ref().expect("a mined transaction that pays has a proof");
+    let block = monero_wallet::block::Block::read(&mut proof.block.0.as_slice()).expect("the blob reads");
+    assert_eq!(block.hash(), block_hash, "the blob hashes to the block's hash");
+    match (&proof.tx_prefix, &proof.rct_base, &proof.prunable_hash) {
+        (Some(prefix), Some(base), Some(prunable)) => {
+            assert!(!t.coinbase);
+            let hash = crate::proof::tx_hash(&prefix.0, &base.0, &prunable.0);
+            assert_eq!(hash, t.hash.0, "the parts hash to the served hash");
+            assert!(block.transactions.contains(&hash), "and the block lists it");
+            // What the client checks the receives against is in the parts.
+            for r in &t.receives {
+                assert!(prefix.0.windows(32).any(|w| w == r.public_key.0), "the one-time key");
+                let commitment = r.commitment.expect("served").0;
+                assert!(base.0.windows(32).any(|w| w == commitment), "the commitment");
+            }
+        }
+        (None, None, None) => {
+            assert!(t.coinbase, "only the miner's transaction comes without parts");
+            assert_eq!(
+                block.miner_transaction().hash(),
+                t.hash.0,
+                "the block's miner transaction"
+            );
+        }
+        _ => panic!("the parts come together or not at all"),
+    }
+    block
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mined_receive_comes_with_a_proof_of_its_block() {
+    let w = Wallet::new(120);
+    for hits in [
+        None,
+        Some(&every_hit as &dyn Fn(&Ring, &Batch) -> Vec<monokulo_8ar::Hit>),
+    ] {
+        let db = Arc::new(Db::in_memory());
+        let account = w.add(&db, 100);
+        let (made, _, _) = paying_block(&w);
+        let hash = made.block.block.hash();
+        write(&db, &[account], vec![made], 100, true, hits);
+        let (kept_hash, blob) = db.kept_block(100).unwrap().expect("the paying block is kept");
+        assert_eq!(kept_hash, hash);
+        assert_eq!(db.block_hash(100).unwrap(), Some(hash), "the hash the live lane keeps");
+        assert_eq!(
+            crate::proof::block_hash(&blob),
+            Some(hash),
+            "the kept blob hashes to it"
+        );
+        assert_eq!(
+            db.kept_counts().unwrap(),
+            (1, 1),
+            "the block and its one other transaction"
+        );
+
+        let served = txs(&app(db, 200), &w).await;
+        assert_eq!(served.transactions.len(), 2);
+        let coinbase = &served.transactions[0];
+        assert!(coinbase.coinbase);
+        let block = check_proof(coinbase, hash);
+        let payment = &served.transactions[1];
+        check_proof(payment, hash);
+        assert_eq!(block.transactions, vec![payment.hash.0]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proofs_are_kept_only_where_an_account_is_paid() {
+    let (a, b) = (Wallet::new(121), Wallet::new(122));
+    let db = Arc::new(Db::in_memory());
+    let accounts = vec![a.add(&db, 100), b.add(&db, 100)];
+    // A catch-up lane (no hashes kept) keeps proofs all the same.
+    write(&db, &accounts, pay_then_ring()(&a, &b), 100, false, Some(&every_hit));
+    assert!(db.block_hash(100).unwrap().is_none());
+    assert!(db.kept_block(100).unwrap().is_some(), "100 pays both");
+    assert!(db.kept_block(101).unwrap().is_none(), "101 only spends from a ring");
+    assert_eq!(db.kept_counts().unwrap(), (1, 1), "one transaction pays both");
+    let app = app(db.clone(), 200);
+    let served = txs(&app, &a).await;
+    assert_eq!(served.transactions.len(), 2);
+    let block = pay_then_ring()(&a, &b)[0].block.block.hash();
+    check_proof(&served.transactions[0], block);
+    assert!(
+        served.transactions[1].proof.is_none(),
+        "a candidate spend has none: its key image can't be forged"
+    );
+
+    // A rescan of one account leaves what the other still needs, and a
+    // rescan of both lets it go.
+    db.rescan(&[a.address()], 0).unwrap();
+    assert_eq!(db.kept_counts().unwrap(), (1, 1));
+    check_proof(&txs(&app, &b).await.transactions[0], block);
+    db.rescan(&[b.address()], 50).unwrap();
+    assert_eq!(db.kept_counts().unwrap(), (0, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reorg_drops_the_kept_block_and_the_new_one_is_proved() {
+    let w = Wallet::new(123);
+    let db = Arc::new(Db::in_memory());
+    let account = w.add(&db, 100);
+    let (made, _, _) = paying_block(&w);
+    write(&db, &[account], vec![made], 100, true, None);
+    assert_eq!(db.kept_counts().unwrap(), (1, 1));
+    db.rewind(100).unwrap();
+    assert!(db.kept_block(100).unwrap().is_none());
+    assert_eq!(db.kept_counts().unwrap(), (0, 0));
+
+    let account = db.account(&w.address()).unwrap().unwrap();
+    let (_, k) = tx_key(91);
+    let other = Tx::new(k, vec![w.pay(&k, 0, 0, 0, 555)]);
+    let new_100 = block(100, [9; 32], dull_miner(100), vec![other.build()], 1_000, 1);
+    let hash = new_100.block.block.hash();
+    write(&db, &[account], vec![new_100], 100, true, None);
+    assert_eq!(db.kept_block(100).unwrap().map(|k| k.0), Some(hash));
+    let served = txs(&app(db, 200), &w).await;
+    assert_eq!(served.transactions.len(), 1);
+    check_proof(&served.transactions[0], hash);
+}
+
+/// A node that answers every request with `body`, one connection at a time.
+async fn node_answering(body: String) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 64 * 1024];
+            let _ = s.read(&mut buf).await;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(reply.as_bytes()).await;
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// A node that sends no prunable hash in `get_blocks.bin`
+/// (monero-project/monero#10120): the parts are kept pending and served
+/// without a proof until `get_transactions` gives the hash, which is kept
+/// only if the parts hash to the transaction's hash with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_prunable_hash_is_filled_in_from_the_node() {
+    let w = Wallet::new(124);
+    for right in [true, false] {
+        let db = Arc::new(Db::in_memory());
+        let account = w.add(&db, 100);
+        let (mut made, _, _) = paying_block(&w);
+        let hash = made.block.block.hash();
+        let tx_hash = made.block.block.transactions[0];
+        made.raw.as_mut().unwrap().txs[0].prunable_hash = [0; 32];
+        write(&db, &[account], vec![made], 100, true, None);
+        assert_eq!(db.kept_counts().unwrap(), (1, 1));
+        assert_eq!(db.pending_proofs(10).unwrap().len(), 1);
+        let app = app(db.clone(), 200);
+        let served = txs(&app, &w).await;
+        check_proof(&served.transactions[0], hash);
+        assert!(served.transactions[1].proof.is_none(), "pending: no proof yet");
+
+        let prunable = if right { prunable_hash(100, 0, 0) } else { [7; 32] };
+        let node = node_answering(format!(
+            r#"{{"status":"OK","txs":[{{"tx_hash":"{}","prunable_hash":"{}"}}]}}"#,
+            hex::encode(tx_hash),
+            hex::encode(prunable)
+        ))
+        .await;
+        let scanner = crate::scanner::Scanner::new(
+            db.clone(),
+            crate::daemon::Daemon::new(&node).unwrap(),
+            app.scanner.config.clone(),
+        );
+        scanner.complete_proofs().await;
+        assert!(db.pending_proofs(10).unwrap().is_empty());
+        let served = txs(&app, &w).await;
+        if right {
+            check_proof(&served.transactions[1], hash);
+            assert_eq!(db.kept_counts().unwrap(), (1, 1));
+        } else {
+            assert!(
+                served.transactions[1].proof.is_none(),
+                "a hash that doesn't fit is dropped"
+            );
+            assert_eq!(db.kept_counts().unwrap(), (1, 0), "the block stays for the miner's");
+        }
+    }
+}
+
+/// A database made before proofs were kept: it opens, its transactions are
+/// served without a proof, and what is scanned from then on has one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_from_before_proofs_serves_old_rows_without_one() {
+    let w = Wallet::new(125);
+    let path = std::env::temp_dir().join(format!(
+        "lws-proof-migration-{}-{}.sqlite",
+        std::process::id(),
+        crate::db::now()
+    ));
+    {
+        // The schema as it was: no blocks_kept, no txs_kept.
+        let old = crate::db::SCHEMA
+            .split("CREATE TABLE IF NOT EXISTS blocks_kept")
+            .next()
+            .unwrap();
+        assert!(!old.contains("txs_kept"));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(old).unwrap();
+    }
+    let db = Arc::new(crate::db::Db::open(&path).unwrap());
+    let account = w.add(&db, 99);
+    // Block 99 as an older version wrote it: rows, no proof.
+    let (_, k) = tx_key(92);
+    let early = Tx::new(k, vec![w.pay(&k, 0, 0, 0, 1_234)]);
+    let mut b99 = block(99, [0; 32], dull_miner(99), vec![early.build()], 4_000, 0);
+    b99.raw = None;
+    write(&db, &[account], vec![b99], 99, true, None);
+    let account = db.account(&w.address()).unwrap().unwrap();
+    let (made, _, _) = paying_block(&w);
+    let hash = made.block.block.hash();
+    write(&db, &[account], vec![made], 100, true, None);
+    drop(db);
+
+    let db = Arc::new(crate::db::Db::open(&path).unwrap());
+    let served = txs(&app(db, 200), &w).await;
+    assert_eq!(served.transactions.len(), 3);
+    assert_eq!(served.transactions[0].height, Some(99));
+    assert!(
+        served.transactions[0].proof.is_none(),
+        "scanned before: no proof until a rescan"
+    );
+    check_proof(&served.transactions[1], hash);
+    check_proof(&served.transactions[2], hash);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }

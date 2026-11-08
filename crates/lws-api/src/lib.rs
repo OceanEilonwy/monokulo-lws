@@ -347,7 +347,9 @@ pub struct Transaction {
     pub mempool: bool,
     pub mixin: u32,
     /// Where the transaction is in the chain, for a client to check. Absent
-    /// in the pool and from servers that do not serve it.
+    /// in the pool and from servers that do not serve it; monokulo-lws also
+    /// leaves it out for a transaction that only (maybe) spends, and for one
+    /// it scanned before it kept proofs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<Proof>,
 }
