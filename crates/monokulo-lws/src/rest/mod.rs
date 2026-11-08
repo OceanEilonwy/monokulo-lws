@@ -58,10 +58,10 @@ impl App {
     /// The fee estimate, at most a minute old.
     pub async fn fee(&self) -> crate::error::Result<FeeEstimate> {
         let mut cached = self.fee.lock().await;
-        if let Some((at, fee)) = cached.as_ref() {
-            if at.elapsed() < Duration::from_secs(60) {
-                return Ok(fee.clone());
-            }
+        if let Some((at, fee)) = cached.as_ref()
+            && at.elapsed() < Duration::from_secs(60)
+        {
+            return Ok(fee.clone());
         }
         let fee = self.daemon.fee_estimate().await?;
         *cached = Some((Instant::now(), fee.clone()));

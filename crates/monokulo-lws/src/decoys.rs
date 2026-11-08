@@ -80,10 +80,10 @@ async fn ring(d: &Distribution, daemon: &Daemon, count: usize) -> Result<Vec<Mem
                 if picks.len() >= wanted {
                     break;
                 }
-                if let Some(i) = pick(d, &mut rng) {
-                    if tried.insert(i) {
-                        picks.push(i);
-                    }
+                if let Some(i) = pick(d, &mut rng)
+                    && tried.insert(i)
+                {
+                    picks.push(i);
                 }
             }
             picks

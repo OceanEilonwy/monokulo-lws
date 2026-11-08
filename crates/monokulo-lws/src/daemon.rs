@@ -125,10 +125,10 @@ impl Daemon {
         if !status.is_success() {
             return Err(Error::Daemon(format!("{route}: HTTP {status}")));
         }
-        if let Some(len) = response.content_length() {
-            if len as usize > limit {
-                return Err(Error::Daemon(format!("{route}: response of {len} bytes is too large")));
-            }
+        if let Some(len) = response.content_length()
+            && len as usize > limit
+        {
+            return Err(Error::Daemon(format!("{route}: response of {len} bytes is too large")));
         }
         let bytes = response.bytes().await?;
         if bytes.len() > limit {
