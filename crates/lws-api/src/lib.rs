@@ -12,7 +12,15 @@
 //! response is a JSON object. Amounts travel as decimal strings
 //! ([`Amount`]), keys and hashes as lowercase hex ([`Hex32`], [`Hex8`]),
 //! timestamps as ISO 8601 text ([`Timestamp`]).
+//!
+//! `Debug` on the types that carry a private view key ([`Login`] and the
+//! admin requests) prints neither the key nor the address, and a type's
+//! deserialization errors never quote the value that failed, so neither
+//! ends up in a log by accident.
 
+#![forbid(unsafe_code)]
+
+use std::borrow::Cow;
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -39,9 +47,7 @@ impl<'de> Deserialize<'de> for Amount {
                 f.write_str("a decimal string or an unsigned integer")
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Amount, E> {
-                v.parse()
-                    .map(Amount)
-                    .map_err(|_| E::custom(format!("not an unsigned decimal: {v:?}")))
+                v.parse().map(Amount).map_err(|_| E::custom("not an unsigned decimal"))
             }
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Amount, E> {
                 Ok(Amount(v))
@@ -96,9 +102,31 @@ impl<const N: usize> Serialize for Hex<N> {
     }
 }
 
+/// A string, borrowed or not (a JSON string with an escape in it can't be
+/// borrowed, and `&str`'s error for it would quote the whole string).
+fn text<'de, D: Deserializer<'de>>(d: D) -> Result<Cow<'de, str>, D::Error> {
+    struct V;
+    impl<'de> de::Visitor<'de> for V {
+        type Value = Cow<'de, str>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a hex string")
+        }
+        fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+            Ok(Cow::Borrowed(v))
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Cow::Owned(v.to_owned()))
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Cow::Owned(v))
+        }
+    }
+    d.deserialize_str(V)
+}
+
 impl<'de, const N: usize> Deserialize<'de> for Hex<N> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = <&str>::deserialize(d)?;
+        let s = text(d)?;
         let mut out = [0u8; N];
         if s.len() != 2 * N {
             return Err(de::Error::custom(format!(
@@ -107,7 +135,8 @@ impl<'de, const N: usize> Deserialize<'de> for Hex<N> {
                 s.len()
             )));
         }
-        hex::decode_to_slice(s, &mut out).map_err(de::Error::custom)?;
+        // Not the decoder's own error, which names the offending character.
+        hex::decode_to_slice(s.as_bytes(), &mut out).map_err(|_| de::Error::custom("not hex"))?;
         Ok(Hex(out))
     }
 }
@@ -130,8 +159,10 @@ impl Serialize for HexBytes {
 
 impl<'de> Deserialize<'de> for HexBytes {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = <&str>::deserialize(d)?;
-        hex::decode(s).map(HexBytes).map_err(de::Error::custom)
+        let s = text(d)?;
+        hex::decode(s.as_bytes())
+            .map(HexBytes)
+            .map_err(|_| de::Error::custom("not hex"))
     }
 }
 
@@ -171,11 +202,24 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// Every account-scoped request: the primary address and its private view
-/// key. The view key is the only credential the protocol has.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// key. The view key is the only credential the protocol has. `Debug`
+/// prints neither.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Login {
     pub address: String,
     pub view_key: Hex32,
+}
+
+/// What a secret or an address prints as in `Debug`.
+const REDACTED: &str = "<redacted>";
+
+impl fmt::Debug for Login {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Login")
+            .field("address", &REDACTED)
+            .field("view_key", &REDACTED)
+            .finish()
+    }
 }
 
 /// A subaddress index: major (account) and minor.
@@ -512,7 +556,8 @@ pub struct NewSubaddrs {
 pub mod admin {
     use super::*;
 
-    #[derive(Clone, Debug, Serialize, Deserialize)]
+    /// `Debug` leaves out the key.
+    #[derive(Clone, Serialize, Deserialize)]
     #[serde(bound(deserialize = "P: Deserialize<'de> + Default"))]
     pub struct Request<P> {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -521,13 +566,32 @@ pub mod admin {
         pub params: P,
     }
 
+    impl<P: fmt::Debug> fmt::Debug for Request<P> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.debug_struct("Request")
+                .field("auth", &self.auth.as_ref().map(|_| REDACTED))
+                .field("params", &self.params)
+                .finish()
+        }
+    }
+
     #[derive(Clone, Debug, Default, Serialize, Deserialize)]
     pub struct Empty {}
 
-    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    /// `Debug` prints neither the address nor the key.
+    #[derive(Clone, Default, Serialize, Deserialize)]
     pub struct AddAccount {
         pub address: String,
         pub key: Hex32,
+    }
+
+    impl fmt::Debug for AddAccount {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.debug_struct("AddAccount")
+                .field("address", &REDACTED)
+                .field("key", &REDACTED)
+                .finish()
+        }
     }
 
     #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -556,11 +620,22 @@ pub mod admin {
         pub addresses: Vec<String>,
     }
 
-    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    /// `Debug` leaves out the view key.
+    #[derive(Clone, Default, Serialize, Deserialize)]
     pub struct Validate {
         pub spend_public_hex: String,
         pub view_public_hex: String,
         pub view_key_hex: String,
+    }
+
+    impl fmt::Debug for Validate {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.debug_struct("Validate")
+                .field("spend_public_hex", &self.spend_public_hex)
+                .field("view_public_hex", &self.view_public_hex)
+                .field("view_key_hex", &REDACTED)
+                .finish()
+        }
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -623,6 +698,62 @@ mod tests {
         assert_eq!(serde_json::from_str::<Hex32>(&s).unwrap(), h);
         assert!(serde_json::from_str::<Hex32>("\"0707\"").is_err());
         assert!(serde_json::from_str::<Hex32>(&s.to_uppercase()).is_ok());
+    }
+
+    #[test]
+    fn debug_hides_keys_and_addresses() {
+        let key = Hex([0xcd; 32]);
+        let login = Login {
+            address: "5SecretAddress".into(),
+            view_key: key,
+        };
+        let printed = format!(
+            "{login:?} {:?}",
+            UnspentOutsRequest {
+                login: login.clone(),
+                amount: Amount(1),
+                mixin: 15,
+                use_dust: false,
+                dust_threshold: None,
+            }
+        );
+        assert!(!printed.contains("5SecretAddress"), "{printed}");
+        assert!(!printed.contains(&key.to_string()), "{printed}");
+        let add = admin::AddAccount {
+            address: "5SecretAddress".into(),
+            key,
+        };
+        let req = admin::Request {
+            auth: Some(key),
+            params: add,
+        };
+        let printed = format!("{req:?}");
+        assert!(!printed.contains("5SecretAddress"), "{printed}");
+        assert!(!printed.contains(&key.to_string()), "{printed}");
+    }
+
+    #[test]
+    fn errors_never_quote_the_value() {
+        let key = "cd".repeat(31) + "zz";
+        let e = serde_json::from_str::<Hex32>(&format!("\"{key}\""))
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("cdcd"), "{e}");
+        assert!(!e.contains('z'), "{e}");
+        // An escaped string can't be borrowed: still read, still not quoted.
+        let escaped = format!("\"\\u0063{}\"", &"cd".repeat(32)[1..]);
+        assert_eq!(serde_json::from_str::<Hex32>(&escaped).unwrap(), Hex([0xcd; 32]));
+        let e = serde_json::from_str::<Login>(&format!(
+            "{{\"address\":\"5Secret\",\"view_key\":\"\\u0063{}\"}}",
+            "d".repeat(64)
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(!e.contains("ddd"), "{e}");
+        let e = serde_json::from_str::<Amount>("\"12x5Secret\"")
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("5Secret"), "{e}");
     }
 
     #[test]
