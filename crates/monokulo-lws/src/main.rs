@@ -21,6 +21,8 @@ mod proof;
 mod redact;
 mod rest;
 mod scanner;
+#[cfg(test)]
+mod sending;
 mod server;
 #[cfg(test)]
 mod testkit;

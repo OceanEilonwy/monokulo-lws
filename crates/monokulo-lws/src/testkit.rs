@@ -392,10 +392,101 @@ pub fn every_hit(ring: &Ring, batch: &Batch) -> Vec<monokulo_8ar::Hit> {
     hits
 }
 
+/// A node on a local port that answers each request with what `answer`
+/// makes of it, and keeps every request it got. `answer` is given the
+/// route and the JSON it was sent: for `/json_rpc`, the method and its
+/// params, and its answer is wrapped as the JSON-RPC `result`; for the
+/// other endpoints, the path (`get_outs`) and the body.
+pub struct FakeNode {
+    pub url: String,
+    pub calls: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+}
+
+impl FakeNode {
+    /// The routes called, in order.
+    pub fn routes(&self) -> Vec<String> {
+        self.calls.lock().unwrap().iter().map(|(r, _)| r.clone()).collect()
+    }
+}
+
+pub async fn fake_node<F>(answer: F) -> FakeNode
+where
+    F: Fn(&str, &serde_json::Value) -> serde_json::Value + Send + Sync + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let answer = Arc::new(answer);
+    let calls: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
+    let kept = calls.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let (answer, kept) = (answer.clone(), kept.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![];
+                let mut chunk = [0u8; 16 * 1024];
+                let (head, body_at, len) = loop {
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..i]).into_owned();
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        break (head, i + 4, len);
+                    }
+                };
+                while buf.len() < body_at + len {
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let path = head.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/');
+                let body: serde_json::Value =
+                    serde_json::from_slice(&buf[body_at..body_at + len]).unwrap_or(serde_json::Value::Null);
+                let rpc = path == "json_rpc";
+                let (route, input) = match rpc {
+                    true => (
+                        body["method"].as_str().unwrap_or("").to_string(),
+                        body["params"].clone(),
+                    ),
+                    false => (path.to_string(), body),
+                };
+                kept.lock().unwrap().push((route.clone(), input.clone()));
+                let out = answer(&route, &input);
+                let out = match rpc {
+                    true => serde_json::json!({ "jsonrpc": "2.0", "id": "0", "result": out }),
+                    false => out,
+                }
+                .to_string();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                    out.len()
+                );
+                let _ = s.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    FakeNode { url, calls }
+}
+
 /// An `App` over `db` whose node is nowhere (anything that asks it fails),
 /// with a fee estimate cached and the chain at `chain_height`.
 pub fn app(db: Arc<Db>, chain_height: u64) -> Arc<App> {
-    let daemon = Daemon::new("http://127.0.0.1:9").unwrap();
+    app_with_node(db, chain_height, "http://127.0.0.1:9")
+}
+
+/// [`app`], with the node at `node`.
+pub fn app_with_node(db: Arc<Db>, chain_height: u64, node: &str) -> Arc<App> {
+    let daemon = Daemon::new(node).unwrap();
     let scanner = Scanner::new(
         db.clone(),
         daemon.clone(),
