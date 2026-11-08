@@ -30,7 +30,9 @@ cargo build --release
 ```
 
 The wallet API is then at `http://127.0.0.1:8443`. Put TLS in front of it
-(nginx, caddy): every request carries a view key in its body.
+(nginx, caddy), with `--trusted-proxies` set to the proxy's address, or give
+`--tls-cert` and `--tls-key`: every request carries a view key in its body.
+Listening anywhere but loopback takes `--confirm-external-bind`.
 
 Options that matter:
 
@@ -41,8 +43,20 @@ Options that matter:
 | `--max-subaddresses N` | 10000 | Subaddresses an account may register; 0 turns the endpoints off. |
 | `--lookahead N` | 200 | Minors `0..N` of account 0 are watched for every account without being asked. |
 | `--scan-interval SECS` | 10 | How often to look at the node once caught up. |
-| `--admin-listen ADDR` | off | Where the admin API listens. |
-| `--disable-admin-auth` | | Skip the admin key check (only behind something else that checks). |
+| `--admin-listen ADDR` | off | Where the admin API listens (an address of its own; the wallet listener never serves it). |
+| `--disable-admin-auth` | | Skip the admin key check. Only for a loopback `--admin-listen`, unless `--confirm-unauthenticated-admin` is given too. |
+| `--confirm-unauthenticated-admin` | | Let `--disable-admin-auth` apply off loopback (only behind something else that checks). |
+| `--confirm-external-bind` | | Allow a listener on an address other than loopback. |
+| `--tls-cert FILE`, `--tls-key FILE` | | PEM certificate chain and key: the listeners speak TLS 1.2 and 1.3 themselves (rustls). A reverse proxy is still the recommended setup. |
+| `--trusted-proxies CIDR,...` | | Reverse proxies whose client-address header is believed; without it the header is ignored. |
+| `--client-ip-header NAME` | `X-Forwarded-For` | The header a trusted proxy puts the client's address in (the rightmost untrusted entry is the client). |
+| `--rate-limit N` | 300 | Requests a minute from one client (an IPv4 address or IPv6 /64); 0 is no limit. |
+| `--strict-rate-limit N` | 12 | Requests a minute from one client for account creation, imports, `/submit_raw_tx` and `/get_random_outs`; 0 is no limit. |
+| `--max-new-accounts-per-hour N` | 1000 | New accounts and import requests an hour, across all clients; 0 is no limit. |
+| `--max-pending-requests N` | 10000 | Pending create and import requests at most (monero-lws's `--create-queue-max`). |
+| `--max-connections N` | 1024 | Open connections at most, per listener. |
+| `--max-connections-per-ip N` | 64 | Open connections from one address at most (a trusted proxy is exempt); 0 is no limit. |
+| `--request-timeout SECS` | 30 | Time a request may take, body and answer included. Headers must arrive within 10 s. |
 | `--access-control-origin ORIGIN` | | A browser origin allowed to call the API; repeat, or `*`. |
 | `--network main\|stage\|test` | | Refuse to start if the node is on another network. |
 | `--cache-dir DIR` | | Where the GPU's compiled shader is kept (the first compile takes 20 to 30 s). |
@@ -59,7 +73,25 @@ monero-oxide, and `/daemon_status` says which (`scanner_engine`) along with
 each catch-up lane's cursor.
 
 Every option is also an environment variable (`LWS_DAEMON`, `LWS_DB`,
-`LWS_LISTEN`, `LWS_ADMIN_LISTEN`).
+`LWS_LISTEN`, `LWS_ADMIN_LISTEN`, `LWS_TLS_CERT`, `LWS_TLS_KEY`,
+`LWS_TRUSTED_PROXIES`, `LWS_CLIENT_IP_HEADER`, `LWS_CONFIRM_EXTERNAL_BIND`).
+
+### Security
+
+The server holds every account's private view key, so read
+[`docs/security.md`](docs/security.md) before putting it on the internet:
+the threat model (internet clients, account holders, the node, someone who
+reads the database, operator mistakes), the controls, how it compares with
+monero-lws, and what the operator has to do. In short:
+
+- The view keys are stored in the clear in the database, as monero-lws
+  stores them (the scanner needs them for every block). The file is made
+  `0600`; keep it on an encrypted disk and run the server as its own user.
+- The server trusts its node, as monero-lws does: run your own.
+- Admin keys are stored hashed and work only on the admin listener.
+- Requests are limited in size, time and rate, per client and in all; the
+  defaults above suit a shop or a small public server.
+- No view key or address is written to the log at any level.
 
 ### Accounts
 
@@ -67,12 +99,16 @@ With `--create auto` a client registers itself through `/login`. Otherwise:
 
 ```sh
 monokulo-lws admin add-account --db lws.sqlite --network stage \
-    --address 5A... --view-key <64 hex> --start-height 2200000
+    --address 5A... --start-height 2200000     # asks for the view key on stdin
 monokulo-lws admin list --db lws.sqlite
 ```
 
+(`--view-key` or `LWS_VIEW_KEY` work too, but a key on the command line ends
+up in the process list and the shell's history.)
+
 The admin REST API (monero-lws's: `POST /<command>` with
-`{"auth": "<key>", "params": {...}}`) needs a key:
+`{"auth": "<key>", "params": {...}}`) needs a key, printed once by
+`create-key` (only its hash is stored):
 
 ```sh
 monokulo-lws admin create-key --db lws.sqlite
@@ -157,7 +193,7 @@ GPU the cost is accounts × blocks of monero-oxide scans: fine for a shop, a
 family or a few dozen wallets. See `docs/scanning.md`.
 
 Not built yet: webhooks, the `/feed` websocket, fiat `rates`, pre-RingCT
-spends, import fees, remote scanning, `get_tree_path`, TLS on the listener.
+spends, import fees, remote scanning, `get_tree_path`.
 
 ## Developing
 
