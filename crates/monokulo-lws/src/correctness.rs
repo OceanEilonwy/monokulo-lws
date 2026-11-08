@@ -326,11 +326,17 @@ async fn the_served_commitment_is_the_chains_and_heads_the_rct_blob() {
             .flat_map(|t| &t.receives)
             .find(|r| r.public_key == o.public_key)
             .unwrap();
-        assert_eq!(
-            &blob[..32],
-            &served.commitment.unwrap().0,
-            "the blob starts with the chain's commitment"
-        );
+        if o.global_index == Amount(5_000) {
+            // As monero-lws and the spec: zeros, the identity mask, zeros.
+            assert_eq!(blob[..], crypto::coinbase_rct()[..]);
+            assert_eq!(&blob[32..64], DScalar::ONE.as_bytes());
+        } else {
+            assert_eq!(
+                &blob[..32],
+                &served.commitment.unwrap().0,
+                "the blob starts with the chain's commitment"
+            );
+        }
     }
     // The regular output's blob decrypts to its mask and amount.
     let o = outs.outputs.iter().find(|o| o.global_index == Amount(5_002)).unwrap();

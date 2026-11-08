@@ -150,14 +150,52 @@ Things beyond the community API worth knowing:
   monero-lws writes it): the RingCT base's fee, or inputs less outputs for a
   pre-RingCT transaction, and `"0"` for a coinbase transaction, as
   monero-lws writes it. Pool transactions carry theirs too.
-- `/get_unspent_outs`'s 96-byte `rct` starts with that same on-chain
-  commitment, then the mask and the amount encrypted the original way. As
-  with monero-lws, every received output is listed, locked ones included
-  (by age, by `unlock_time`, or a coinbase not yet 60 blocks deep): the
-  client decides from the transaction's `unlock_time` in
-  `/get_address_txs`. `/get_address_info`'s `locked_funds` counts them by
-  wallet2's rules (10 blocks; an `unlock_time` below 500,000,000 is a
-  height, else a time with 120 s of leeway).
+- `/get_address_info`'s `locked_funds` counts outputs by wallet2's rules
+  (10 blocks; an `unlock_time` below 500,000,000 is a height, else a time
+  with 120 s of leeway).
+
+The three endpoints a client sends with answer as monero-lws does, field
+for field (monero-lws's own REST test responses parse and write back byte
+for byte through `lws-api`):
+
+- **`/get_unspent_outs`** lists every received output, locked ones included
+  (by age, by `unlock_time`, or a coinbase not yet 60 blocks deep), spent or
+  not: the client decides from the transaction's `unlock_time` in
+  `/get_address_txs` and from `spend_key_images`. `amount` is a check, not a
+  selection: every listed output comes back, or HTTP 400 when they add up
+  to less. An output is left out when its transaction's mixin is below
+  `mixin` (a coinbase transaction's is 0, so any `mixin` above 0 leaves
+  coinbase outputs out, as monero-lws does) or its amount is below
+  `dust_threshold` (unless `use_dust`). `per_byte_fee` and `fee_mask` are
+  the node's `get_fee_estimate` (10 grace blocks) `fee` and
+  `quantization_mask`, `fees` its four per-priority fees, lowest first; as
+  monero-lws writes them, all three are JSON numbers, not strings, and an
+  output's `global_index` is a number too, repeated as `tx_id`. The 96-byte
+  `rct` is the output's on-chain commitment, then its mask and its amount
+  each encrypted the original (`ecdhEncode` v1) way, `mask + H_s(s)` and
+  `amount + H_s(H_s(s))` with `s = H_s(8·a·R ‖ index)`; for a coinbase
+  output it is 32 zero bytes, the identity mask, 32 zero bytes, and the
+  client computes the commitment (`G + amount·H`) itself.
+- **`/get_random_outs`** picks `count` (at most 20) ring members for each
+  of up to 150 rings as wallet2's `gamma_picker` does (shape 19.28, scale
+  1/1.61, ages moved back by the 10-block unlock time, the youngest drawn
+  from the 15-block recent window, the newest nine blocks never), keeps
+  only members the node says are unlocked, never repeats one in a ring, and
+  sorts each ring by global index. Every ring comes back full, or the
+  request fails with 503 after monero-lws's 64 rounds. `count` members are
+  all decoys: a client making rings of 16 asks for 16 and drops one (the
+  output it spends, if it was picked). `rct` is the commitment then 64 zero
+  bytes. Only RingCT (amount `"0"`) is served; monero-lws also serves
+  pre-RingCT amounts.
+- **`/submit_raw_tx`** relays through the node's `send_raw_transaction`
+  (`do_not_relay: false`) and answers `{"status":"OK"}`; `{"status":"OK",
+  "reason":"Not relayed","not_relayed":true}` when the node kept it without
+  relaying it; and HTTP 422 `{"status":"Failed","reason":"..."}` when it
+  refused it, the reason in monerod's words (`"double spend and fee too
+  low"`). A transaction that doesn't parse is HTTP 400 before the node sees
+  it. A relayed transaction is scanned into the pool view at once, so a
+  client polling `/get_address_txs` right after sees its spend and change
+  with `mempool: true`.
 - A new account made by `/login` starts at the chain's top block, which is
   scanned for it too. `/login` takes no start height (nor does monero-lws's);
   an operator gives one with `admin add-account --start-height` or `rescan`.

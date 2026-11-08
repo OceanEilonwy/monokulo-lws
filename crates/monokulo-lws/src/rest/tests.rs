@@ -354,7 +354,7 @@ async fn the_per_client_limits_trigger() {
     }));
     // The strict limit: two /get_random_outs (refused for their count, but
     // counted), then 429.
-    let bad_count = json!({ "count": 0, "amounts": ["0"] });
+    let bad_count = json!({ "count": 21, "amounts": ["0"] });
     for _ in 0..2 {
         let r = call(&router, "/get_random_outs", &bad_count).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
@@ -682,7 +682,7 @@ async fn the_listener_speaks_tls() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     // A large body (a big transaction) goes through hyper whole: refused by
-    // the unreachable node, not by the listener.
+    // the handler (it isn't a transaction), not by the listener.
     let r = client
         .post(format!("https://localhost:{port}/submit_raw_tx"))
         .header("content-type", "application/json")
@@ -690,7 +690,8 @@ async fn the_listener_speaks_tls() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(r.text().await.unwrap(), "not a transaction");
     // Plain HTTP to the TLS port gets nowhere.
     let plain = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/get_version"))

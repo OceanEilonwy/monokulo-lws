@@ -92,14 +92,25 @@ pub struct OutInfo {
     pub height: u64,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// monerod's `send_raw_transaction` answer. On a refusal its JSON gives the
+/// verification flags and, for a few failures only (bad hex, the sanity
+/// check), a `reason`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct SendResult {
-    #[serde(default)]
     pub status: String,
-    #[serde(default)]
     pub reason: String,
-    #[serde(default)]
     pub not_relayed: bool,
+    pub low_mixin: bool,
+    pub double_spend: bool,
+    pub invalid_input: bool,
+    pub invalid_output: bool,
+    pub too_big: bool,
+    pub overspend: bool,
+    pub fee_too_low: bool,
+    pub too_few_outputs: bool,
+    pub tx_extra_too_big: bool,
+    pub nonzero_unlock_time: bool,
 }
 
 #[derive(Deserialize)]

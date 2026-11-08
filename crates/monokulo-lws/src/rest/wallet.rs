@@ -400,16 +400,21 @@ pub async fn get_unspent_outs(
     let mut listed = vec![];
     for o in outputs {
         let tx = &txs[&o.tx];
-        if tx.mixin < req.mixin && !tx.coinbase || o.amount < dust {
+        // As monero-lws: an output is left out when its transaction's mixin
+        // is below the one asked for (a coinbase transaction's is 0, so any
+        // mixin leaves coinbase outputs out) or its amount is below the
+        // dust threshold. Locked outputs are listed; the client decides.
+        if tx.mixin < req.mixin || o.amount < dust {
             continue;
         }
         total = total.saturating_add(o.amount);
-        // The blob starts with the commitment the chain holds for the output.
         let rct = o.mask.and_then(|mask| {
-            let commitment = o.commitment.unwrap_or_else(|| crypto::commit(&mask, o.amount));
             if tx.coinbase {
-                Some(crypto::plain_rct(&commitment, o.amount))
+                Some(crypto::coinbase_rct())
             } else {
+                // The commitment the chain holds for the output (the same as
+                // monero-lws's `commit(amount, mask)` for a sound output).
+                let commitment = o.commitment.unwrap_or_else(|| crypto::commit(&mask, o.amount));
                 crypto::legacy_rct(
                     &account.view_key,
                     &o.tx_pub_key,
@@ -422,28 +427,34 @@ pub async fn get_unspent_outs(
             .map(|b| HexBytes(b.to_vec()))
         });
         listed.push(Output {
-            tx_id: o.tx as u64,
             amount: Amount(o.amount),
+            public_key: Hex(o.public_key),
             index: o.out_index,
             global_index: Amount(o.global_index),
-            rct,
+            // monero-lws writes the global index here too.
+            tx_id: o.global_index,
             tx_hash: Hex(tx.hash),
             tx_prefix_hash: Hex(tx.prefix_hash),
-            public_key: Hex(o.public_key),
             tx_pub_key: Hex(o.tx_pub_key),
-            spend_key_images: images.remove(&o.id).unwrap_or_default(),
             timestamp: Timestamp::from_unix(tx.timestamp),
             height: o.height,
+            spend_key_images: images.remove(&o.id).unwrap_or_default(),
+            rct,
             recipient: Some(meta(o.maj, o.min)),
         });
     }
     if total < req.amount.0 {
         return Err(Error::InsufficientFunds.into());
     }
+    // monero-lws refuses a zero mask: every fee would be rounded to nothing.
+    if fee.quantization_mask == 0 {
+        return Err(Error::Daemon("get_fee_estimate: a zero quantization mask".into()).into());
+    }
     Ok(Json(UnspentOuts {
         per_byte_fee: Amount(fee.fee),
         fee_mask: Amount(fee.quantization_mask),
         amount: Amount(total),
+        lookahead_fail: None,
         outputs: listed,
         fees: fee.fees,
     }))
@@ -453,22 +464,41 @@ pub async fn get_unspent_outs(
 pub const MAX_RING_SIZE: u32 = 20;
 pub const MAX_RINGS: usize = 150;
 
+/// `/get_random_outs`, as monero-lws answers it: `count` members for every
+/// ring, picked as wallet2 picks them (`decoys`), each unlocked by the
+/// node's word, none twice in a ring, sorted by global index, with `rct`
+/// the commitment and 64 zero bytes. Only RingCT (amount 0) is served;
+/// monero-lws also serves pre-RingCT amounts from the node's histogram.
 pub async fn get_random_outs(
     State(app): State<Arc<App>>,
     ApiJson(req): ApiJson<RandomOutsRequest>,
 ) -> Reply<RandomOuts> {
-    if req.count == 0 || req.count > MAX_RING_SIZE {
-        return Err(bad(format!("count must be 1 to {MAX_RING_SIZE}")).into());
+    if req.count > MAX_RING_SIZE {
+        return Err(bad(format!("count must be at most {MAX_RING_SIZE}")).into());
     }
-    if req.amounts.is_empty() || req.amounts.len() > MAX_RINGS {
-        return Err(bad(format!("1 to {MAX_RINGS} amounts")).into());
+    if req.amounts.len() > MAX_RINGS {
+        return Err(bad(format!("at most {MAX_RINGS} amounts")).into());
     }
     if req.amounts.iter().any(|a| a.0 != 0) {
         return Err(bad("only RingCT (amount 0) outputs are served").into());
     }
+    // As monero-lws: nothing to pick, an empty ring for each amount, and the
+    // node isn't asked.
+    if req.count == 0 || req.amounts.is_empty() {
+        return Ok(Json(RandomOuts {
+            amount_outs: req
+                .amounts
+                .iter()
+                .map(|_| RandomOutputs {
+                    amount: Amount(0),
+                    outputs: vec![],
+                })
+                .collect(),
+        }));
+    }
     let rings = app
         .picker
-        .rings(&app.daemon, req.count as usize, req.amounts.len())
+        .rings(&app.daemon, req.count as usize, req.amounts.len(), chain_height(&app))
         .await?;
     Ok(Json(RandomOuts {
         amount_outs: rings
@@ -477,10 +507,14 @@ pub async fn get_random_outs(
                 amount: Amount(0),
                 outputs: members
                     .into_iter()
-                    .map(|m| RandomOutput {
-                        global_index: Amount(m.global_index),
-                        public_key: Hex(m.public_key),
-                        rct: HexBytes(m.commitment.to_vec()),
+                    .map(|m| {
+                        let mut rct = m.commitment.to_vec();
+                        rct.resize(96, 0);
+                        RandomOutput {
+                            global_index: Amount(m.global_index),
+                            public_key: Hex(m.public_key),
+                            rct: HexBytes(rct),
+                        }
                     })
                     .collect(),
             })
@@ -488,6 +522,58 @@ pub async fn get_random_outs(
     }))
 }
 
+/// The longest reason passed on from the node; monerod's are a few words.
+const MAX_REASON: usize = 256;
+
+/// Why the node refused a transaction, in the words monero-lws uses (those
+/// of monerod's ZMQ `send_raw_tx_hex`, which it relays): the verification
+/// flags joined with " and ", else the node's own reason, else monerod's
+/// catch-all. Only printable ASCII of the node's text is kept, and not
+/// much of it: it says what is wrong with the transaction, nothing more.
+fn refusal_reason(r: &crate::daemon::SendResult) -> String {
+    if r.status == "BUSY" {
+        // monerod's JSON for an unsynchronised node; its ZMQ words for it.
+        return "Not ready to accept transactions; try again later".into();
+    }
+    let flags = [
+        (r.low_mixin, "mixin too low"),
+        (r.double_spend, "double spend"),
+        (r.invalid_input, "invalid input"),
+        (r.invalid_output, "invalid output"),
+        (r.too_big, "too big"),
+        (r.overspend, "overspend"),
+        (r.fee_too_low, "fee too low"),
+        (r.too_few_outputs, "too few outputs"),
+        (r.tx_extra_too_big, "tx_extra too long"),
+        (r.nonzero_unlock_time, "non-zero unlock time"),
+    ];
+    let joined = flags
+        .iter()
+        .filter(|(set, _)| *set)
+        .map(|(_, why)| *why)
+        .collect::<Vec<_>>()
+        .join(" and ");
+    if !joined.is_empty() {
+        return joined;
+    }
+    let own: String = r
+        .reason
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(MAX_REASON)
+        .collect();
+    match own.trim() {
+        "" => "an unknown issue was found with the transaction".into(),
+        own => own.into(),
+    }
+}
+
+/// `/submit_raw_tx`, answered as monero-lws answers it (see
+/// [`SubmitResponse`]). The transaction must parse (its prefix and RingCT
+/// base) or it is refused with 400 before the node sees it. Once the node
+/// has taken and relayed it, it is scanned at once into the pool view for
+/// the account it came from, so a client polling right after sees it in
+/// `/get_address_txs` with `mempool: true`.
 pub async fn submit_raw_tx(
     State(app): State<Arc<App>>,
     ApiJson(req): ApiJson<SubmitRequest>,
@@ -498,27 +584,37 @@ pub async fn submit_raw_tx(
     if req.tx.0.len() > MAX_TX_BYTES {
         return Err(bad(format!("a transaction is at most {MAX_TX_BYTES} bytes")).into());
     }
+    let Some((hash, tx)) = crate::scanner::parse_submitted(&req.tx.0) else {
+        return Err(bad("not a transaction").into());
+    };
     let result = app.daemon.send_raw(&hex::encode(&req.tx.0)).await?;
     if result.status == "OK" {
+        if result.not_relayed {
+            return Ok(Json(SubmitResponse {
+                status: "OK".into(),
+                reason: Some("Not relayed".into()),
+                not_relayed: Some(true),
+            })
+            .into_response());
+        }
+        if let Err(e) = app.scanner.add_submitted(hash, tx).await {
+            // The next look at the pool finds it anyway.
+            tracing::warn!("a submitted transaction wasn't added to the pool view: {e}");
+        }
         app.scanner.wake.notify_one();
         return Ok(Json(SubmitResponse {
             status: "OK".into(),
             reason: None,
-            not_relayed: Some(result.not_relayed),
+            not_relayed: None,
         })
         .into_response());
     }
-    let reason = if result.reason.is_empty() {
-        result.status.clone()
-    } else {
-        result.reason.clone()
-    };
     Ok((
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(SubmitResponse {
             status: "Failed".into(),
-            reason: Some(reason),
-            not_relayed: Some(true),
+            reason: Some(refusal_reason(&result)),
+            not_relayed: None,
         }),
     )
         .into_response())

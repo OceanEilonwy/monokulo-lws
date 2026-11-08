@@ -846,6 +846,146 @@ impl Scanner {
         }
         Ok(())
     }
+
+    /// As after the live lane's look at the pool with `accounts`: its
+    /// keyring built, the pool view for them.
+    #[cfg(test)]
+    pub fn as_if_live(&self, accounts: &[Account]) {
+        let mut slot = self.live_ring.lock().unwrap();
+        self.db
+            .write(|tx| {
+                let w = ScanWriter::new(tx);
+                Ring::get(&mut slot, &w, accounts, self.config.lookahead, &self.arenas[0]).map(|_| ())
+            })
+            .unwrap();
+        let mut ids: Vec<i64> = accounts.iter().map(|a| a.id).collect();
+        ids.sort_unstable();
+        self.mempool.lock().unwrap().reset(ids);
+    }
+
+    /// A transaction the node has just taken from `/submit_raw_tx`, scanned
+    /// into the pool view at once, as monero-lws adds a relayed transaction
+    /// to its pool: for the accounts the pool was last looked at for (the
+    /// live lane's), with the live keyring, so a client polling right after
+    /// sees its spend and its change. Skipped when the pool hasn't been
+    /// looked at yet, or the live lane holds its keyring right now, or the
+    /// keyring is for other accounts; the lane's next look at the pool,
+    /// which the handler wakes, finds it then. That look keeps it while the
+    /// node has it and drops it after.
+    pub async fn add_submitted(&self, hash: [u8; 32], tx: Transaction<Pruned>) -> Result<()> {
+        let ids = {
+            let pool = self.mempool.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.accounts.is_empty() || pool.seen.contains(&hash) {
+                return Ok(());
+            }
+            pool.accounts.clone()
+        };
+        let accounts: Vec<Account> = self
+            .db
+            .accounts(Some(Status::Active))?
+            .into_iter()
+            .filter(|a| ids.binary_search(&a.id).is_ok())
+            .collect();
+        if accounts.len() != ids.len() {
+            return Ok(());
+        }
+        let header = self
+            .last_block
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|b| b.header.clone());
+        let Some(block) = submitted_block(header, hash, tx) else {
+            return Ok(());
+        };
+        let now = crate::db::now();
+        let found = tokio::task::block_in_place(|| {
+            // Held while scanning (one transaction: moments), so the live
+            // lane waits for its keyring rather than building another.
+            let mut slot = self.live_ring.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(ring) = slot
+                .as_mut()
+                .filter(|r| r.key.iter().map(|k| k.0).eq(ids.iter().copied()))
+            else {
+                return Ok(None);
+            };
+            self.db
+                .write(|tx| {
+                    let w = ScanWriter::new(tx);
+                    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+                    let hits = ring.keyring.flag_many(std::slice::from_ref(&block), threads, 0);
+                    scan_pool_block(&w, ring, self.config.lookahead, &accounts, &block, hits.as_deref(), now)
+                })
+                .map(Some)
+        })?;
+        if let Some(found) = found {
+            let mut pool = self.mempool.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.accounts == ids {
+                pool.add(&[hash], found);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A submitted transaction parsed as far as the server needs it (its
+/// prefix and RingCT base), with its hash: for a version 2 transaction the
+/// bytes after the base are its prunable part, hashed as monerod hashes it;
+/// a version 1 transaction is hashed whole. `None` if it doesn't parse, or
+/// is a miner transaction, which can't be submitted.
+pub fn parse_submitted(bytes: &[u8]) -> Option<([u8; 32], Transaction<Pruned>)> {
+    let mut rest = bytes;
+    let tx = Transaction::<Pruned>::read(&mut rest).ok()?;
+    if is_coinbase(&tx) || tx.prefix().inputs.is_empty() {
+        return None;
+    }
+    let hash = match &tx {
+        Transaction::V1 { .. } => keccak256(bytes),
+        Transaction::V2 { proofs: None, .. } => {
+            if !rest.is_empty() {
+                return None;
+            }
+            tx.hash_with_prunable_hash([0; 32])?
+        }
+        Transaction::V2 { proofs: Some(_), .. } => tx.hash_with_prunable_hash(keccak256(rest))?,
+    };
+    Some((hash, tx))
+}
+
+/// A block holding only a submitted transaction, for the `Scanner`: the last
+/// scanned block's header (or a stand-in's), and a miner transaction paying
+/// nothing.
+fn submitted_block(
+    header: Option<monero_wallet::block::BlockHeader>,
+    hash: [u8; 32],
+    tx: Transaction<Pruned>,
+) -> Option<ScannableBlock> {
+    let header = header.unwrap_or(monero_wallet::block::BlockHeader {
+        hardfork_version: 16,
+        hardfork_signal: 16,
+        timestamp: 0,
+        previous: [0; 32],
+        nonce: 0,
+    });
+    let miner = TransactionPrefix {
+        additional_timelock: Timelock::None,
+        inputs: vec![Input::Gen(0)],
+        outputs: vec![],
+        extra: vec![],
+    };
+    let block = Block::new(
+        header,
+        Transaction::V2 {
+            prefix: miner,
+            proofs: None,
+        },
+        vec![hash],
+    )?;
+    Some(ScannableBlock {
+        block,
+        transactions: vec![tx],
+        output_index_for_first_ringct_output: Some(0),
+    })
 }
 
 /// What a catch-up lane's step came to.
