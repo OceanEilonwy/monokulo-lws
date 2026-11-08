@@ -257,6 +257,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
             let mut receives = receives_by_tx.remove(&t.id).unwrap_or_default();
             receives.sort_by_key(|r| r.index);
             Transaction {
+                proof: None,
                 fee: fee_of(t.fee),
                 id: t.id as u64,
                 hash: Hex(t.hash),
@@ -317,6 +318,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
             (None, None) => continue,
         };
         transactions.push(Transaction {
+            proof: None,
             fee: Some(Amount(fee)),
             id: next_id + n as u64,
             hash: Hex(hash),

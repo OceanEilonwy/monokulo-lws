@@ -247,6 +247,32 @@ pub struct Spend {
     pub sender: Option<AddressMeta>,
 }
 
+/// Proof that a transaction is in a block: enough for a client to recompute
+/// the block's hash and the transaction's hash itself and check the block's
+/// hash against any node, so a server that knows the view key cannot invent
+/// an output the chain does not hold. An extension of the API; monero-lws
+/// does not serve it, and a transaction still in the pool has none.
+///
+/// `block` is the block as Monero serialises it (header, miner transaction,
+/// the hashes of the other transactions): its hash is the block hash, and
+/// the transaction's hash must be among the hashes it lists (or be the miner
+/// transaction's). For a transaction other than the miner's, `tx_prefix`,
+/// `rct_base` and `prunable_hash` are the pruned transaction: its hash is
+/// keccak(keccak(tx_prefix) ‖ keccak(rct_base) ‖ prunable_hash). For the
+/// miner transaction they are absent, as the block holds it whole. The
+/// prefix carries the transaction key (in extra) and the one-time keys; the
+/// RingCT base carries the commitments and the fee.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proof {
+    pub block: HexBytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_prefix: Option<HexBytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rct_base: Option<HexBytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prunable_hash: Option<Hex32>,
+}
+
 /// An output received, as `/get_unspent_outs` lists them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Output {
@@ -320,6 +346,10 @@ pub struct Transaction {
     pub coinbase: bool,
     pub mempool: bool,
     pub mixin: u32,
+    /// Where the transaction is in the chain, for a client to check. Absent
+    /// in the pool and from servers that do not serve it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<Proof>,
 }
 
 /// Fiat rates, as the spec lists them. Omitted fields are unavailable.
@@ -778,6 +808,7 @@ mod tests {
     #[test]
     fn mempool_transaction_leaves_out_height_and_time() {
         let t = Transaction {
+            proof: None,
             fee: None,
             id: 1,
             hash: Hex([1; 32]),
