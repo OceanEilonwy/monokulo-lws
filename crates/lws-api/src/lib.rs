@@ -63,6 +63,21 @@ impl From<u64> for Amount {
     }
 }
 
+/// For an [`Amount`] that monero-lws writes as a JSON number rather than a
+/// string (`per_byte_fee`, `fee_mask`, an output's `global_index`), though
+/// the community spec says string: written as a number, read as either.
+pub mod as_number {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(v: &Amount, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(v.0)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Amount, D::Error> {
+        Amount::deserialize(d)
+    }
+}
+
 /// Fixed-size binary, as lowercase hex on the wire. Reading accepts either case.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hex<const N: usize>(pub [u8; N]);
@@ -273,26 +288,41 @@ pub struct Proof {
     pub prunable_hash: Option<Hex32>,
 }
 
-/// An output received, as `/get_unspent_outs` lists them.
+/// An output received, as `/get_unspent_outs` lists them. Fields are in
+/// monero-lws's order, and typed as monero-lws writes them where that
+/// differs from the community spec (`global_index` is a number).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Output {
-    pub tx_id: u64,
     pub amount: Amount,
+    pub public_key: Hex32,
     pub index: u16,
+    /// The output's global (RingCT) index, a JSON number as monero-lws
+    /// writes it; read from a string too, as the spec has it.
+    #[serde(with = "as_number")]
     pub global_index: Amount,
-    /// 96 bytes: commitment, then the mask and the amount encrypted the
-    /// original (non-compact) way under the shared secret, so a client
-    /// decrypts them with the view key. Absent for a non-RingCT output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rct: Option<HexBytes>,
+    /// What monero-lws puts here: the output's global index again, not a
+    /// transaction index as the spec describes. Nothing should rely on it.
+    pub tx_id: u64,
     pub tx_hash: Hex32,
     pub tx_prefix_hash: Hex32,
-    pub public_key: Hex32,
     pub tx_pub_key: Hex32,
-    /// Key images of every candidate spend of this output.
-    pub spend_key_images: Vec<Hex32>,
     pub timestamp: Timestamp,
     pub height: u64,
+    /// Key images of every candidate spend of this output. Left out when
+    /// there are none, as monero-lws does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spend_key_images: Vec<Hex32>,
+    /// 96 bytes, absent for a non-RingCT output. For any other output: its
+    /// commitment, then its mask and its amount (as a 32-byte scalar) each
+    /// encrypted the original (pre-Bulletproofs2, `ecdhEncode` v1) way,
+    /// `mask + H_s(s)` and `amount + H_s(H_s(s))` where
+    /// `s = H_s(8·a·R ‖ index)`. For a coinbase output, as monero-lws and
+    /// the spec have it: 32 zero bytes (not the commitment), the identity
+    /// mask (the scalar 1), then 32 zero bytes (the amount is `amount`); a
+    /// client recognises a coinbase output by that mask and computes its
+    /// commitment, `G + amount·H`, itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rct: Option<HexBytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient: Option<AddressMeta>,
 }
@@ -405,37 +435,61 @@ pub struct AddressTxs {
 pub struct UnspentOutsRequest {
     #[serde(flatten)]
     pub login: Login,
-    /// The amount wanted; HTTP 400 if the account never received that much.
+    /// The amount about to be sent. The answer is every listed output all
+    /// the same, not a selection reaching it; it only makes the request
+    /// fail (HTTP 400) when the listed outputs add up to less.
     #[serde(default)]
     pub amount: Amount,
-    /// The least ring size an output's transaction may have had.
+    /// Outputs whose transaction had a smaller mixin (ring size less one)
+    /// than this are left out. A coinbase transaction has none (mixin 0),
+    /// so any mixin above 0 leaves coinbase outputs out, as in monero-lws.
     #[serde(default)]
     pub mixin: u32,
-    /// Return every output, dust included.
+    /// Ignore `dust_threshold` and list outputs of every amount.
     #[serde(default)]
     pub use_dust: bool,
+    /// Outputs of a smaller amount are left out (unless `use_dust`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dust_threshold: Option<Amount>,
 }
 
-/// `/get_unspent_outs` response.
+/// `/get_unspent_outs` response, as monero-lws writes it: the two fee
+/// fields are JSON numbers (the spec says strings; reading takes both),
+/// `outputs` is left out when empty, and `fees` is always there.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnspentOuts {
+    /// The node's `get_fee_estimate` `fee` (with 10 grace blocks): the
+    /// per-byte fee of the lowest priority.
+    #[serde(with = "as_number")]
     pub per_byte_fee: Amount,
+    /// The node's fee quantization mask; a fee is rounded up to a multiple.
+    #[serde(with = "as_number")]
     pub fee_mask: Amount,
+    /// The sum of the listed outputs.
     pub amount: Amount,
-    pub outputs: Vec<Output>,
-    /// Per-byte fees for the four priorities, lowest first (monero-lws).
+    /// monero-lws's count of lookahead failures; left out when 0, which is
+    /// all this server sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookahead_fail: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<Output>,
+    /// The node's per-byte fees for the four priorities, lowest first
+    /// (`get_fee_estimate` `fees`). Empty from a node too old to send them.
+    #[serde(default)]
     pub fees: Vec<u64>,
 }
 
 /// `/get_random_outs` request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RandomOutsRequest {
-    /// Ring members wanted per amount (the mixin level).
+    /// Ring members wanted for each ring, 0 to 20. The spec calls it the
+    /// mixin, but every ring comes back with exactly this many, none of
+    /// them the real output: a client making rings of 16 asks for 16 and
+    /// drops a member that happens to be the output it spends (or the
+    /// last one), as wallet2-derived clients do.
     pub count: u32,
-    /// One entry per ring; `"0"` for RingCT. Duplicates are answered each.
+    /// One entry per ring, at most 150; `"0"` for RingCT, the only amount
+    /// this server answers. Duplicates are answered each.
     pub amounts: Vec<Amount>,
 }
 
@@ -444,15 +498,17 @@ pub struct RandomOutsRequest {
 pub struct RandomOutput {
     pub global_index: Amount,
     pub public_key: Hex32,
-    /// The commitment (32 bytes hex), optionally followed by 64 zero bytes
-    /// for old clients.
+    /// 96 bytes, as monero-lws sends it: the output's commitment as the
+    /// node gave it (`get_outs` `mask`), then 64 zero bytes. Only the first
+    /// 32 bytes mean anything.
     pub rct: HexBytes,
 }
 
-/// Ring members for one requested amount.
+/// Ring members for one requested amount, sorted by global index.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RandomOutputs {
     pub amount: Amount,
+    #[serde(default)]
     pub outputs: Vec<RandomOutput>,
 }
 
@@ -505,7 +561,15 @@ pub struct SubmitRequest {
     pub tx: HexBytes,
 }
 
-/// `/submit_raw_tx` response.
+/// `/submit_raw_tx` response, as monero-lws writes it:
+///
+/// - relayed: HTTP 200, `{"status":"OK"}`;
+/// - accepted but not relayed: HTTP 200,
+///   `{"status":"OK","reason":"Not relayed","not_relayed":true}`;
+/// - refused by the node: HTTP 422, `{"status":"Failed","reason":"..."}`,
+///   the reason in monerod's words (`"double spend and fee too low"`).
+///
+/// A transaction that doesn't parse is HTTP 400 before the node sees it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubmitResponse {
     pub status: String,
@@ -831,5 +895,86 @@ mod tests {
         assert!(!s.contains("timestamp"));
         assert!(!s.contains("receives"));
         assert!(s.contains("\"mempool\":true"));
+    }
+
+    /// Parses `json` as `T` and writes it back: the same bytes.
+    fn round_trips<T: Serialize + for<'de> Deserialize<'de>>(json: &str) -> T {
+        let value: T = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_string(&value).unwrap(), json);
+        value
+    }
+
+    // The responses below are monero-lws's own, from its REST tests
+    // (tests/unit/rest.test.cpp), with its random keys and hashes filled in.
+
+    #[test]
+    fn unspent_outs_as_monero_lws_writes_them() {
+        // An account with nothing: no `outputs`, the fees as numbers.
+        let empty: UnspentOuts = round_trips(r#"{"per_byte_fee":39,"fee_mask":1000,"amount":"0","fees":[40,41]}"#);
+        assert!(empty.outputs.is_empty());
+        assert_eq!((empty.per_byte_fee, empty.fee_mask), (Amount(39), Amount(1000)));
+
+        let key = "11".repeat(32);
+        let hash = "22".repeat(32);
+        let prefix = "33".repeat(32);
+        let tx_pub = "44".repeat(32);
+        let image = "55".repeat(32);
+        let rct = "66".repeat(96);
+        let one = format!(
+            concat!(
+                r#"{{"per_byte_fee":39,"fee_mask":1000,"amount":"40000","outputs":["#,
+                r#"{{"amount":"40000","public_key":"{key}","index":2,"global_index":35,"tx_id":35,"#,
+                r#""tx_hash":"{hash}","tx_prefix_hash":"{prefix}","tx_pub_key":"{tx_pub}","#,
+                r#""timestamp":"1970-01-01T01:56:40Z","height":4000,"spend_key_images":["{image}"],"#,
+                r#""rct":"{rct}","recipient":{{"maj_i":2,"min_i":66}}}}"#,
+                r#"],"fees":[40,41]}}"#
+            ),
+            key = key,
+            hash = hash,
+            prefix = prefix,
+            tx_pub = tx_pub,
+            image = image,
+            rct = rct
+        );
+        let outs: UnspentOuts = round_trips(&one);
+        let o = &outs.outputs[0];
+        assert_eq!((o.global_index, o.tx_id, o.index, o.height), (Amount(35), 35, 2, 4000));
+        assert_eq!(o.rct.as_ref().unwrap().0.len(), 96);
+        assert_eq!(o.recipient, Some(AddressMeta { maj_i: 2, min_i: 66 }));
+        // An output without candidate spends: no `spend_key_images`.
+        let unspent = one.replace(&format!(r#""spend_key_images":["{image}"],"#), "");
+        let outs: UnspentOuts = round_trips(&unspent);
+        assert!(outs.outputs[0].spend_key_images.is_empty());
+
+        // The spec's shape (strings for the fees and the index) reads too.
+        let spec = r#"{"per_byte_fee":"39","fee_mask":"1000","amount":"0","outputs":[]}"#;
+        let read: UnspentOuts = serde_json::from_str(spec).unwrap();
+        assert_eq!(read.per_byte_fee, Amount(39));
+        assert!(read.fees.is_empty());
+    }
+
+    #[test]
+    fn submit_answers_as_monero_lws_writes_them() {
+        let ok: SubmitResponse = round_trips(r#"{"status":"OK"}"#);
+        assert!(ok.reason.is_none() && ok.not_relayed.is_none());
+        let kept: SubmitResponse = round_trips(r#"{"status":"OK","reason":"Not relayed","not_relayed":true}"#);
+        assert_eq!(kept.not_relayed, Some(true));
+        let failed: SubmitResponse = round_trips(r#"{"status":"Failed","reason":"double spend and fee too low"}"#);
+        assert_eq!(failed.reason.as_deref(), Some("double spend and fee too low"));
+    }
+
+    #[test]
+    fn random_outs_as_monero_lws_writes_them() {
+        // monero-lws's writer: `global_index` and `amount` as strings, `rct`
+        // the commitment and 64 zero bytes.
+        let rct = format!("{}{}", "77".repeat(32), "00".repeat(64));
+        let json = format!(
+            r#"{{"amount_outs":[{{"amount":"0","outputs":[{{"global_index":"123456789","public_key":"{}","rct":"{rct}"}}]}}]}}"#,
+            "88".repeat(32)
+        );
+        let outs: RandomOuts = round_trips(&json);
+        assert_eq!(outs.amount_outs[0].outputs[0].global_index, Amount(123_456_789));
+        let request: RandomOutsRequest = round_trips(r#"{"count":16,"amounts":["0","0"]}"#);
+        assert_eq!(request.amounts, vec![Amount(0), Amount(0)]);
     }
 }

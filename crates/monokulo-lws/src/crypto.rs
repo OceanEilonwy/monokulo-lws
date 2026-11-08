@@ -173,15 +173,15 @@ pub fn legacy_rct(
     Some(out)
 }
 
-/// The blob for a coinbase (or other plain-amount) output: its on-chain
-/// commitment (`G + amount·H`), then the identity mask and the amount in the
-/// clear. monero-lws sends zeros for the commitment here; a client takes the
-/// identity mask for a coinbase output either way.
-pub fn plain_rct(commitment: &[u8; 32], amount: u64) -> [u8; 96] {
+/// The blob for a RingCT coinbase output, byte for byte as monero-lws writes
+/// it (and as the spec describes it): 32 zero bytes where the commitment
+/// would be, the identity mask (`rct::identity()`, which is the scalar 1),
+/// then 32 zero bytes for the amount. A client tells a coinbase output by
+/// that mask, takes the amount from the output's `amount` and computes the
+/// commitment, `G + amount·H`, itself.
+pub fn coinbase_rct() -> [u8; 96] {
     let mut out = [0u8; 96];
-    out[..32].copy_from_slice(commitment);
     out[32..64].copy_from_slice(DScalar::ONE.as_bytes());
-    out[64..].copy_from_slice(DScalar::from(amount).as_bytes());
     out
 }
 
