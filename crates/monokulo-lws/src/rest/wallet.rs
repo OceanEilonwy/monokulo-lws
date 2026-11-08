@@ -20,7 +20,9 @@ type Reply<T> = std::result::Result<Json<T>, ApiError>;
 /// the account is here and not hidden. Hidden and unknown look the same.
 async fn authorize(app: &App, login: &Login) -> Result<Account> {
     let checked = crypto::check_login(app.scanner.config.network, &login.address, &login.view_key.0)?;
-    let Some(account) = app.db.account(&checked.address)? else { return Err(Error::Forbidden) };
+    let Some(account) = app.db.account(&checked.address)? else {
+        return Err(Error::Forbidden);
+    };
     if account.status == Status::Hidden || account.view_key.ct_eq(&checked.view_key).unwrap_u8() == 0 {
         return Err(Error::Forbidden);
     }
@@ -29,7 +31,10 @@ async fn authorize(app: &App, login: &Login) -> Result<Account> {
 }
 
 fn lookahead(app: &App) -> Option<AddressMeta> {
-    (app.config.lookahead > 0).then_some(AddressMeta { maj_i: 1, min_i: app.config.lookahead })
+    (app.config.lookahead > 0).then_some(AddressMeta {
+        maj_i: 1,
+        min_i: app.config.lookahead,
+    })
 }
 
 fn meta(maj: u32, min: u32) -> AddressMeta {
@@ -113,7 +118,11 @@ pub async fn login(State(app): State<Arc<App>>, Json(req): Json<LoginRequest>) -
 }
 
 fn short(address: &str) -> String {
-    format!("{}…{}", &address[..8.min(address.len())], &address[address.len().saturating_sub(4)..])
+    format!(
+        "{}…{}",
+        &address[..8.min(address.len())],
+        &address[address.len().saturating_sub(4)..]
+    )
 }
 
 pub async fn get_address_info(State(app): State<Arc<App>>, Json(login): Json<Login>) -> Reply<AddressInfo> {
@@ -131,7 +140,10 @@ pub async fn get_address_info(State(app): State<Arc<App>>, Json(login): Json<Log
             locked = locked.saturating_add(o.amount);
         }
     }
-    let spent_outputs: Vec<Spend> = spends_by_tx(&app, &account, &outputs)?.into_values().flatten().collect();
+    let spent_outputs: Vec<Spend> = spends_by_tx(&app, &account, &outputs)?
+        .into_values()
+        .flatten()
+        .collect();
     let total_sent = spent_outputs.iter().map(|s| s.amount.0).fold(0u64, u64::saturating_add);
     Ok(Json(AddressInfo {
         locked_funds: Amount(locked),
@@ -156,6 +168,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, Json(login): Json<Logi
     let mut receives_by_tx: HashMap<i64, Vec<ReceivedOutput>> = HashMap::new();
     for o in outputs.values() {
         receives_by_tx.entry(o.tx).or_default().push(ReceivedOutput {
+            commitment: None,
             amount: Amount(o.amount),
             public_key: Hex(o.public_key),
             index: o.out_index,
@@ -173,6 +186,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, Json(login): Json<Logi
             let mut receives = receives_by_tx.remove(&t.id).unwrap_or_default();
             receives.sort_by_key(|r| r.index);
             Transaction {
+                fee: None,
                 id: t.id as u64,
                 hash: Hex(t.hash),
                 timestamp: Some(Timestamp::from_unix(t.timestamp)),
@@ -190,7 +204,12 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, Json(login): Json<Logi
         })
         .collect();
     // What is still in the pool, one transaction per pool transaction.
-    let pool = app.scanner.mempool.lock().unwrap_or_else(|e| e.into_inner()).for_account(account.id);
+    let pool = app
+        .scanner
+        .mempool
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .for_account(account.id);
     let mut pooled: Vec<([u8; 32], Vec<PoolReceipt>)> = vec![];
     for r in pool {
         match pooled.iter_mut().find(|(h, _)| *h == r.tx_hash) {
@@ -202,6 +221,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, Json(login): Json<Logi
     for (n, (hash, receipts)) in pooled.into_iter().enumerate() {
         let first = &receipts[0];
         transactions.push(Transaction {
+            fee: None,
             id: next_id + n as u64,
             hash: Hex(hash),
             timestamp: None,
@@ -213,6 +233,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, Json(login): Json<Logi
             receives: receipts
                 .iter()
                 .map(|r| ReceivedOutput {
+                    commitment: None,
                     amount: Amount(r.amount),
                     public_key: Hex(r.public_key),
                     index: r.out_index,
@@ -249,7 +270,11 @@ pub async fn get_unspent_outs(State(app): State<Arc<App>>, Json(req): Json<Unspe
     for s in app.db.spends(account.id)? {
         images.entry(s.output).or_default().push(Hex(s.key_image));
     }
-    let dust = if req.use_dust { 0 } else { req.dust_threshold.map(|d| d.0).unwrap_or(0) };
+    let dust = if req.use_dust {
+        0
+    } else {
+        req.dust_threshold.map(|d| d.0).unwrap_or(0)
+    };
     let mut total = 0u64;
     let mut listed = vec![];
     for o in outputs {
@@ -259,7 +284,10 @@ pub async fn get_unspent_outs(State(app): State<Arc<App>>, Json(req): Json<Unspe
         }
         total = total.saturating_add(o.amount);
         let rct = match (o.mask, tx.coinbase) {
-            (Some(mask), false) => crypto::legacy_rct(&account.view_key, &o.tx_pub_key, o.out_index as u64, &mask, o.amount).map(|b| HexBytes(b.to_vec())),
+            (Some(mask), false) => {
+                crypto::legacy_rct(&account.view_key, &o.tx_pub_key, o.out_index as u64, &mask, o.amount)
+                    .map(|b| HexBytes(b.to_vec()))
+            }
             (Some(_), true) => Some(HexBytes(crypto::plain_rct(o.amount).to_vec())),
             (None, _) => None,
         };
@@ -312,24 +340,48 @@ pub async fn get_random_outs(State(app): State<Arc<App>>, Json(req): Json<Random
                 amount: Amount(0),
                 outputs: members
                     .into_iter()
-                    .map(|m| RandomOutput { global_index: Amount(m.global_index), public_key: Hex(m.public_key), rct: HexBytes(m.commitment.to_vec()) })
+                    .map(|m| RandomOutput {
+                        global_index: Amount(m.global_index),
+                        public_key: Hex(m.public_key),
+                        rct: HexBytes(m.commitment.to_vec()),
+                    })
                     .collect(),
             })
             .collect(),
     }))
 }
 
-pub async fn submit_raw_tx(State(app): State<Arc<App>>, Json(req): Json<SubmitRequest>) -> std::result::Result<axum::response::Response, ApiError> {
+pub async fn submit_raw_tx(
+    State(app): State<Arc<App>>,
+    Json(req): Json<SubmitRequest>,
+) -> std::result::Result<axum::response::Response, ApiError> {
     if req.tx.0.is_empty() {
         return Err(bad("an empty transaction").into());
     }
     let result = app.daemon.send_raw(&hex::encode(&req.tx.0)).await?;
     if result.status == "OK" {
         app.scanner.wake.notify_one();
-        return Ok(Json(SubmitResponse { status: "OK".into(), reason: None, not_relayed: Some(result.not_relayed) }).into_response());
+        return Ok(Json(SubmitResponse {
+            status: "OK".into(),
+            reason: None,
+            not_relayed: Some(result.not_relayed),
+        })
+        .into_response());
     }
-    let reason = if result.reason.is_empty() { result.status.clone() } else { result.reason.clone() };
-    Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(SubmitResponse { status: "Failed".into(), reason: Some(reason), not_relayed: Some(true) })).into_response())
+    let reason = if result.reason.is_empty() {
+        result.status.clone()
+    } else {
+        result.reason.clone()
+    };
+    Ok((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(SubmitResponse {
+            status: "Failed".into(),
+            reason: Some(reason),
+            not_relayed: Some(true),
+        }),
+    )
+        .into_response())
 }
 
 pub async fn import_wallet_request(State(app): State<Arc<App>>, Json(login): Json<Login>) -> Reply<ImportResponse> {
@@ -377,18 +429,30 @@ fn subaddresses_on(app: &App) -> Result<u64> {
 pub async fn get_subaddrs(State(app): State<Arc<App>>, Json(login): Json<Login>) -> Reply<Subaddrs> {
     let max = subaddresses_on(&app)?;
     let account = authorize(&app, &login).await?;
-    Ok(Json(Subaddrs { all_subaddrs: app.db.subaddrs(account.id)?, max_subaddrs: Some(max) }))
+    Ok(Json(Subaddrs {
+        all_subaddrs: app.db.subaddrs(account.id)?,
+        max_subaddrs: Some(max),
+    }))
 }
 
-pub async fn upsert_subaddrs(State(app): State<Arc<App>>, Json(req): Json<UpsertSubaddrsRequest>) -> Reply<NewSubaddrs> {
+pub async fn upsert_subaddrs(
+    State(app): State<Arc<App>>,
+    Json(req): Json<UpsertSubaddrsRequest>,
+) -> Reply<NewSubaddrs> {
     let max = subaddresses_on(&app)?;
     let account = authorize(&app, &req.login).await?;
     let new_subaddrs = app.db.upsert_subaddrs(account.id, &req.subaddrs, max)?;
     let all_subaddrs = req.get_all.then(|| app.db.subaddrs(account.id)).transpose()?;
-    Ok(Json(NewSubaddrs { new_subaddrs, all_subaddrs }))
+    Ok(Json(NewSubaddrs {
+        new_subaddrs,
+        all_subaddrs,
+    }))
 }
 
-pub async fn provision_subaddrs(State(app): State<Arc<App>>, Json(req): Json<ProvisionSubaddrsRequest>) -> Reply<NewSubaddrs> {
+pub async fn provision_subaddrs(
+    State(app): State<Arc<App>>,
+    Json(req): Json<ProvisionSubaddrsRequest>,
+) -> Reply<NewSubaddrs> {
     let max = subaddresses_on(&app)?;
     let account = authorize(&app, &req.login).await?;
     let maj_i = req.maj_i.unwrap_or(0);
@@ -400,13 +464,23 @@ pub async fn provision_subaddrs(State(app): State<Arc<App>>, Json(req): Json<Pro
     let have = app.db.subaddrs(account.id)?;
     let mut wanted = vec![];
     for maj in maj_i..maj_i.saturating_add(n_maj) {
-        let next = have.iter().find(|r| r.key == maj).and_then(|r| r.value.iter().map(|[_, hi]| hi + 1).max()).unwrap_or(0);
+        let next = have
+            .iter()
+            .find(|r| r.key == maj)
+            .and_then(|r| r.value.iter().map(|[_, hi]| hi + 1).max())
+            .unwrap_or(0);
         let lo = req.min_i.unwrap_or(next).max(next);
-        wanted.push(SubaddrRanges { key: maj, value: vec![[lo, lo.saturating_add(n_min - 1)]] });
+        wanted.push(SubaddrRanges {
+            key: maj,
+            value: vec![[lo, lo.saturating_add(n_min - 1)]],
+        });
     }
     let new_subaddrs = app.db.upsert_subaddrs(account.id, &wanted, max)?;
     let all_subaddrs = req.get_all.then(|| app.db.subaddrs(account.id)).transpose()?;
-    Ok(Json(NewSubaddrs { new_subaddrs, all_subaddrs }))
+    Ok(Json(NewSubaddrs {
+        new_subaddrs,
+        all_subaddrs,
+    }))
 }
 
 pub async fn get_version(State(app): State<Arc<App>>) -> Reply<Version> {

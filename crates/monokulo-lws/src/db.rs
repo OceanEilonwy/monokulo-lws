@@ -99,7 +99,10 @@ CREATE TABLE IF NOT EXISTS admin_keys (key BLOB PRIMARY KEY, created INTEGER NOT
 "#;
 
 pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,15 +295,22 @@ impl Db {
 
     pub fn account(&self, address: &str) -> Result<Option<Account>> {
         self.read(|c| {
-            Ok(c.query_row(&format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE address = ?1"), [address], account_row)
-                .optional()?)
+            Ok(c.query_row(
+                &format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE address = ?1"),
+                [address],
+                account_row,
+            )
+            .optional()?)
         })
     }
 
     pub fn accounts(&self, status: Option<Status>) -> Result<Vec<Account>> {
         self.read(|c| {
             let sql = match status {
-                Some(s) => format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE status = '{}' ORDER BY id", s.as_str()),
+                Some(s) => format!(
+                    "SELECT {ACCOUNT_COLS} FROM accounts WHERE status = '{}' ORDER BY id",
+                    s.as_str()
+                ),
                 None => format!("SELECT {ACCOUNT_COLS} FROM accounts ORDER BY id"),
             };
             let mut st = c.prepare(&sql)?;
@@ -338,7 +348,11 @@ impl Db {
         self.write(|tx| {
             let mut done = vec![];
             for a in addresses {
-                if tx.execute("UPDATE accounts SET status = ?1 WHERE address = ?2", params![status.as_str(), a])? > 0 {
+                if tx.execute(
+                    "UPDATE accounts SET status = ?1 WHERE address = ?2",
+                    params![status.as_str(), a],
+                )? > 0
+                {
                     done.push(a.clone());
                 }
             }
@@ -348,7 +362,10 @@ impl Db {
 
     pub fn touch(&self, id: i64) -> Result<()> {
         self.write(|tx| {
-            tx.execute("UPDATE accounts SET access_time = ?1 WHERE id = ?2", params![now() as i64, id])?;
+            tx.execute(
+                "UPDATE accounts SET access_time = ?1 WHERE id = ?2",
+                params![now() as i64, id],
+            )?;
             Ok(())
         })
     }
@@ -358,11 +375,15 @@ impl Db {
         self.write(|tx| {
             let mut done = vec![];
             for a in addresses {
-                let id: Option<i64> =
-                    tx.query_row("SELECT id FROM accounts WHERE address = ?1", [a], |r| r.get(0)).optional()?;
+                let id: Option<i64> = tx
+                    .query_row("SELECT id FROM accounts WHERE address = ?1", [a], |r| r.get(0))
+                    .optional()?;
                 let Some(id) = id else { continue };
                 delete_account_from(tx, id, height)?;
-                tx.execute("UPDATE accounts SET scan_height = MIN(scan_height, ?1) WHERE id = ?2", params![height as i64, id])?;
+                tx.execute(
+                    "UPDATE accounts SET scan_height = MIN(scan_height, ?1) WHERE id = ?2",
+                    params![height as i64, id],
+                )?;
                 done.push(a.clone());
             }
             Ok(done)
@@ -421,7 +442,10 @@ impl Db {
         self.write(|tx| {
             for (k, new) in all {
                 if k == kind && addresses.contains(&new.address) {
-                    tx.execute("DELETE FROM requests WHERE kind = ?1 AND address = ?2", params![kind, new.address])?;
+                    tx.execute(
+                        "DELETE FROM requests WHERE kind = ?1 AND address = ?2",
+                        params![kind, new.address],
+                    )?;
                     taken.push(new);
                 }
             }
@@ -446,8 +470,7 @@ impl Db {
     ) -> Result<Vec<lws_api::SubaddrRanges>> {
         self.write(|tx| {
             let existing = subaddrs_in(tx, account)?;
-            let mut by_major: HashMap<u32, Vec<[u32; 2]>> =
-                existing.into_iter().map(|r| (r.key, r.value)).collect();
+            let mut by_major: HashMap<u32, Vec<[u32; 2]>> = existing.into_iter().map(|r| (r.key, r.value)).collect();
             let mut added = vec![];
             for want in wanted {
                 let have = by_major.entry(want.key).or_default();
@@ -482,12 +505,17 @@ impl Db {
                 }
                 *have = merge(std::mem::take(have));
                 if !new_here.is_empty() {
-                    added.push(lws_api::SubaddrRanges { key: want.key, value: merge(new_here) });
+                    added.push(lws_api::SubaddrRanges {
+                        key: want.key,
+                        value: merge(new_here),
+                    });
                 }
             }
             let total: u64 = by_major.values().flatten().map(|[lo, hi]| u64::from(hi - lo) + 1).sum();
             if total > max {
-                return Err(Error::Conflict(format!("subaddress limit of {max} would be passed ({total})")));
+                return Err(Error::Conflict(format!(
+                    "subaddress limit of {max} would be passed ({total})"
+                )));
             }
             tx.execute("DELETE FROM subaddrs WHERE account = ?1", [account])?;
             let mut majors: Vec<_> = by_major.into_iter().collect();
@@ -509,10 +537,14 @@ impl Db {
 
     pub fn block_hash(&self, height: u64) -> Result<Option<[u8; 32]>> {
         self.read(|c| {
-            Ok(c.query_row("SELECT hash FROM blocks WHERE height = ?1", [height as i64], |r| r.get::<_, Vec<u8>>(0))
+            Ok(
+                c.query_row("SELECT hash FROM blocks WHERE height = ?1", [height as i64], |r| {
+                    r.get::<_, Vec<u8>>(0)
+                })
                 .optional()?
                 .map(|v| blob32(v))
-                .transpose()?)
+                .transpose()?,
+            )
         })
     }
 
@@ -530,9 +562,13 @@ impl Db {
     #[cfg(test)]
     pub fn scanner_height(&self) -> Result<Option<u64>> {
         self.read(|c| {
-            Ok(c.query_row("SELECT value FROM meta WHERE key = 'scanner_height'", [], |r| r.get::<_, String>(0))
+            Ok(
+                c.query_row("SELECT value FROM meta WHERE key = 'scanner_height'", [], |r| {
+                    r.get::<_, String>(0)
+                })
                 .optional()?
-                .and_then(|s| s.parse().ok()))
+                .and_then(|s| s.parse().ok()),
+            )
         })
     }
 
@@ -591,7 +627,9 @@ impl Db {
 
     pub fn spends(&self, account: i64) -> Result<Vec<SpendRow>> {
         self.read(|c| {
-            let mut st = c.prepare("SELECT tx, output, key_image, mixin, height FROM spends WHERE account = ?1 ORDER BY height, id")?;
+            let mut st = c.prepare(
+                "SELECT tx, output, key_image, mixin, height FROM spends WHERE account = ?1 ORDER BY height, id",
+            )?;
             let rows = st
                 .query_map([account], |r| {
                     Ok(SpendRow {
@@ -611,7 +649,10 @@ impl Db {
 
     pub fn add_admin_key(&self, key: &[u8; 32]) -> Result<()> {
         self.write(|tx| {
-            tx.execute("INSERT OR IGNORE INTO admin_keys (key, created) VALUES (?1, ?2)", params![key.as_slice(), now() as i64])?;
+            tx.execute(
+                "INSERT OR IGNORE INTO admin_keys (key, created) VALUES (?1, ?2)",
+                params![key.as_slice(), now() as i64],
+            )?;
             Ok(())
         })
     }
@@ -619,7 +660,9 @@ impl Db {
     pub fn admin_keys(&self) -> Result<Vec<[u8; 32]>> {
         self.read(|c| {
             let mut st = c.prepare("SELECT key FROM admin_keys")?;
-            let rows = st.query_map([], |r| blob32(r.get(0)?))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let rows = st
+                .query_map([], |r| blob32(r.get(0)?))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
     }
@@ -640,11 +683,16 @@ fn merge(mut ranges: Vec<[u32; 2]>) -> Vec<[u32; 2]> {
 fn subaddrs_in(c: &Connection, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
     let mut st = c.prepare("SELECT maj, min_lo, min_hi FROM subaddrs WHERE account = ?1 ORDER BY maj, min_lo")?;
     let mut out: Vec<lws_api::SubaddrRanges> = vec![];
-    for row in st.query_map([account], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?)))? {
+    for row in st.query_map([account], |r| {
+        Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?))
+    })? {
         let (maj, lo, hi) = row?;
         match out.last_mut() {
             Some(last) if last.key == maj => last.value.push([lo, hi]),
-            _ => out.push(lws_api::SubaddrRanges { key: maj, value: vec![[lo, hi]] }),
+            _ => out.push(lws_api::SubaddrRanges {
+                key: maj,
+                value: vec![[lo, hi]],
+            }),
         }
     }
     Ok(out)
@@ -676,9 +724,18 @@ fn outputs_in(c: &Connection, account: i64) -> Result<Vec<OutputRow>> {
 
 fn delete_account_from(tx: &Transaction, account: i64, height: u64) -> Result<()> {
     let h = height as i64;
-    tx.execute("DELETE FROM spends WHERE account = ?1 AND height >= ?2", params![account, h])?;
-    tx.execute("DELETE FROM outputs WHERE account = ?1 AND height >= ?2", params![account, h])?;
-    tx.execute("DELETE FROM txs WHERE account = ?1 AND height >= ?2", params![account, h])?;
+    tx.execute(
+        "DELETE FROM spends WHERE account = ?1 AND height >= ?2",
+        params![account, h],
+    )?;
+    tx.execute(
+        "DELETE FROM outputs WHERE account = ?1 AND height >= ?2",
+        params![account, h],
+    )?;
+    tx.execute(
+        "DELETE FROM txs WHERE account = ?1 AND height >= ?2",
+        params![account, h],
+    )?;
     Ok(())
 }
 
@@ -693,14 +750,26 @@ impl<'a> ScanWriter<'a> {
     }
 
     pub fn set_block(&self, height: u64, hash: &[u8; 32], keep: u64) -> Result<()> {
-        self.tx.execute("INSERT OR REPLACE INTO blocks (height, hash) VALUES (?1, ?2)", params![height as i64, hash.as_slice()])?;
-        self.tx.execute("DELETE FROM blocks WHERE height < ?1", [height.saturating_sub(keep) as i64])?;
-        self.tx.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('scanner_height', ?1)", [(height + 1).to_string()])?;
+        self.tx.execute(
+            "INSERT OR REPLACE INTO blocks (height, hash) VALUES (?1, ?2)",
+            params![height as i64, hash.as_slice()],
+        )?;
+        self.tx.execute(
+            "DELETE FROM blocks WHERE height < ?1",
+            [height.saturating_sub(keep) as i64],
+        )?;
+        self.tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('scanner_height', ?1)",
+            [(height + 1).to_string()],
+        )?;
         Ok(())
     }
 
     pub fn set_scan_height(&self, account: i64, height: u64) -> Result<()> {
-        self.tx.execute("UPDATE accounts SET scan_height = ?1 WHERE id = ?2", params![height as i64, account])?;
+        self.tx.execute(
+            "UPDATE accounts SET scan_height = ?1 WHERE id = ?2",
+            params![height as i64, account],
+        )?;
         Ok(())
     }
 
@@ -722,9 +791,11 @@ impl<'a> ScanWriter<'a> {
                 new.tx_pub_key.as_slice()
             ],
         )?;
-        let id = self.tx.query_row("SELECT id FROM txs WHERE account = ?1 AND hash = ?2", params![account, new.hash.as_slice()], |r| {
-            r.get(0)
-        })?;
+        let id = self.tx.query_row(
+            "SELECT id FROM txs WHERE account = ?1 AND hash = ?2",
+            params![account, new.hash.as_slice()],
+            |r| r.get(0),
+        )?;
         Ok(id)
     }
 
@@ -750,24 +821,43 @@ impl<'a> ScanWriter<'a> {
         if changed == 0 {
             return Ok(None);
         }
-        self.tx.execute("UPDATE txs SET total_received = total_received + ?1 WHERE id = ?2", params![o.amount as i64, tx])?;
+        self.tx.execute(
+            "UPDATE txs SET total_received = total_received + ?1 WHERE id = ?2",
+            params![o.amount as i64, tx],
+        )?;
         Ok(Some(self.tx.last_insert_rowid()))
     }
 
-    pub fn add_spend(&self, account: i64, tx: i64, output: i64, amount: u64, key_image: &[u8; 32], mixin: u32, height: u64) -> Result<()> {
+    pub fn add_spend(
+        &self,
+        account: i64,
+        tx: i64,
+        output: i64,
+        amount: u64,
+        key_image: &[u8; 32],
+        mixin: u32,
+        height: u64,
+    ) -> Result<()> {
         let changed = self.tx.execute(
             "INSERT OR IGNORE INTO spends (account, tx, output, key_image, mixin, height) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![account, tx, output, key_image.as_slice(), mixin, height as i64],
         )?;
         if changed > 0 {
-            self.tx.execute("UPDATE txs SET total_sent = total_sent + ?1 WHERE id = ?2", params![amount as i64, tx])?;
+            self.tx.execute(
+                "UPDATE txs SET total_sent = total_sent + ?1 WHERE id = ?2",
+                params![amount as i64, tx],
+            )?;
         }
         Ok(())
     }
 
     /// Owned outputs by global index, for matching rings against.
     pub fn owned_indexes(&self, account: i64) -> Result<HashMap<u64, OutputRow>> {
-        Ok(outputs_in(self.tx, account)?.into_iter().filter(|o| o.mask.is_some()).map(|o| (o.global_index, o)).collect())
+        Ok(outputs_in(self.tx, account)?
+            .into_iter()
+            .filter(|o| o.mask.is_some())
+            .map(|o| (o.global_index, o))
+            .collect())
     }
 
     pub fn subaddrs(&self, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
@@ -781,7 +871,14 @@ mod tests {
 
     fn acct(db: &Db) -> Account {
         db.add_account(
-            &NewAccount { address: "A".into(), view_key: [1; 32], spend_pub: [2; 32], view_pub: [3; 32], start_height: 10, generated_locally: false },
+            &NewAccount {
+                address: "A".into(),
+                view_key: [1; 32],
+                spend_pub: [2; 32],
+                view_pub: [3; 32],
+                start_height: 10,
+                generated_locally: false,
+            },
             Status::Active,
         )
         .unwrap()
@@ -792,8 +889,24 @@ mod tests {
         let db = Db::in_memory();
         let a = acct(&db);
         assert_eq!(a.scan_height, 10);
-        assert!(db.add_account(&NewAccount { address: "A".into(), view_key: [1; 32], spend_pub: [2; 32], view_pub: [3; 32], start_height: 0, generated_locally: false }, Status::Active).is_err());
-        assert_eq!(db.set_status(&["A".into(), "B".into()], Status::Hidden).unwrap(), vec!["A".to_string()]);
+        assert!(
+            db.add_account(
+                &NewAccount {
+                    address: "A".into(),
+                    view_key: [1; 32],
+                    spend_pub: [2; 32],
+                    view_pub: [3; 32],
+                    start_height: 0,
+                    generated_locally: false
+                },
+                Status::Active
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.set_status(&["A".into(), "B".into()], Status::Hidden).unwrap(),
+            vec!["A".to_string()]
+        );
         assert_eq!(db.account("A").unwrap().unwrap().status, Status::Hidden);
         assert!(db.accounts(Some(Status::Active)).unwrap().is_empty());
     }
@@ -802,14 +915,69 @@ mod tests {
     fn subaddress_ranges_merge_and_report_only_new() {
         let db = Db::in_memory();
         let a = acct(&db);
-        let new = db.upsert_subaddrs(a.id, &[lws_api::SubaddrRanges { key: 0, value: vec![[1, 10]] }], 1000).unwrap();
-        assert_eq!(new, vec![lws_api::SubaddrRanges { key: 0, value: vec![[1, 10]] }]);
-        let new = db.upsert_subaddrs(a.id, &[lws_api::SubaddrRanges { key: 0, value: vec![[5, 15], [20, 20]] }], 1000).unwrap();
-        assert_eq!(new, vec![lws_api::SubaddrRanges { key: 0, value: vec![[11, 15], [20, 20]] }]);
+        let new = db
+            .upsert_subaddrs(
+                a.id,
+                &[lws_api::SubaddrRanges {
+                    key: 0,
+                    value: vec![[1, 10]],
+                }],
+                1000,
+            )
+            .unwrap();
+        assert_eq!(
+            new,
+            vec![lws_api::SubaddrRanges {
+                key: 0,
+                value: vec![[1, 10]]
+            }]
+        );
+        let new = db
+            .upsert_subaddrs(
+                a.id,
+                &[lws_api::SubaddrRanges {
+                    key: 0,
+                    value: vec![[5, 15], [20, 20]],
+                }],
+                1000,
+            )
+            .unwrap();
+        assert_eq!(
+            new,
+            vec![lws_api::SubaddrRanges {
+                key: 0,
+                value: vec![[11, 15], [20, 20]]
+            }]
+        );
         let all = db.subaddrs(a.id).unwrap();
-        assert_eq!(all, vec![lws_api::SubaddrRanges { key: 0, value: vec![[1, 15], [20, 20]] }]);
-        assert!(db.upsert_subaddrs(a.id, &[lws_api::SubaddrRanges { key: 1, value: vec![[0, 100]] }], 50).is_err());
-        let none = db.upsert_subaddrs(a.id, &[lws_api::SubaddrRanges { key: 0, value: vec![[2, 3]] }], 1000).unwrap();
+        assert_eq!(
+            all,
+            vec![lws_api::SubaddrRanges {
+                key: 0,
+                value: vec![[1, 15], [20, 20]]
+            }]
+        );
+        assert!(
+            db.upsert_subaddrs(
+                a.id,
+                &[lws_api::SubaddrRanges {
+                    key: 1,
+                    value: vec![[0, 100]]
+                }],
+                50
+            )
+            .is_err()
+        );
+        let none = db
+            .upsert_subaddrs(
+                a.id,
+                &[lws_api::SubaddrRanges {
+                    key: 0,
+                    value: vec![[2, 3]],
+                }],
+                1000,
+            )
+            .unwrap();
         assert!(none.is_empty());
     }
 
@@ -819,10 +987,72 @@ mod tests {
         let a = acct(&db);
         db.write(|tx| {
             let w = ScanWriter::new(tx);
-            let t = w.tx_row(a.id, &NewTx { hash: [9; 32], prefix_hash: [8; 32], height: 12, timestamp: 5, unlock_time: 0, coinbase: false, mixin: 15, fee: 3, payment_id: None, tx_pub_key: [7; 32] })?;
-            assert!(w.add_output(a.id, t, &NewOutput { out_index: 0, global_index: 100, amount: 50, public_key: [4; 32], tx_pub_key: [7; 32], mask: Some([5; 32]), height: 12, maj: 0, min: 0 })?.is_some());
-            assert!(w.add_output(a.id, t, &NewOutput { out_index: 1, global_index: 101, amount: 50, public_key: [4; 32], tx_pub_key: [7; 32], mask: Some([5; 32]), height: 12, maj: 0, min: 0 })?.is_none());
-            let t2 = w.tx_row(a.id, &NewTx { hash: [10; 32], prefix_hash: [8; 32], height: 14, timestamp: 6, unlock_time: 0, coinbase: false, mixin: 15, fee: 3, payment_id: None, tx_pub_key: [7; 32] })?;
+            let t = w.tx_row(
+                a.id,
+                &NewTx {
+                    hash: [9; 32],
+                    prefix_hash: [8; 32],
+                    height: 12,
+                    timestamp: 5,
+                    unlock_time: 0,
+                    coinbase: false,
+                    mixin: 15,
+                    fee: 3,
+                    payment_id: None,
+                    tx_pub_key: [7; 32],
+                },
+            )?;
+            assert!(
+                w.add_output(
+                    a.id,
+                    t,
+                    &NewOutput {
+                        out_index: 0,
+                        global_index: 100,
+                        amount: 50,
+                        public_key: [4; 32],
+                        tx_pub_key: [7; 32],
+                        mask: Some([5; 32]),
+                        height: 12,
+                        maj: 0,
+                        min: 0
+                    }
+                )?
+                .is_some()
+            );
+            assert!(
+                w.add_output(
+                    a.id,
+                    t,
+                    &NewOutput {
+                        out_index: 1,
+                        global_index: 101,
+                        amount: 50,
+                        public_key: [4; 32],
+                        tx_pub_key: [7; 32],
+                        mask: Some([5; 32]),
+                        height: 12,
+                        maj: 0,
+                        min: 0
+                    }
+                )?
+                .is_none()
+            );
+            let t2 = w.tx_row(
+                a.id,
+                &NewTx {
+                    hash: [10; 32],
+                    prefix_hash: [8; 32],
+                    height: 14,
+                    timestamp: 6,
+                    unlock_time: 0,
+                    coinbase: false,
+                    mixin: 15,
+                    fee: 3,
+                    payment_id: None,
+                    tx_pub_key: [7; 32],
+                },
+            )?;
             let owned = w.owned_indexes(a.id)?;
             let o = &owned[&100];
             w.add_spend(a.id, t2, o.id, o.amount, &[6; 32], 15, 14)?;

@@ -37,7 +37,11 @@ impl Picker {
     }
 
     async fn distribution(&mut self, daemon: &Daemon) -> Result<&Distribution> {
-        let stale = self.distribution.as_ref().map(|(at, _)| at.elapsed() > FRESH_FOR).unwrap_or(true);
+        let stale = self
+            .distribution
+            .as_ref()
+            .map(|(at, _)| at.elapsed() > FRESH_FOR)
+            .unwrap_or(true);
         if stale {
             let d = daemon.output_distribution().await?;
             if d.cumulative.len() < SPENDABLE_AGE as usize + 2 {
@@ -92,10 +96,15 @@ async fn ring(d: &Distribution, daemon: &Daemon, count: usize) -> Result<Vec<Mem
             if !out.unlocked {
                 continue;
             }
-            let (Some(key), Some(commitment)) = (crate::daemon::hex32(&out.key), crate::daemon::hex32(&out.mask)) else {
+            let (Some(key), Some(commitment)) = (crate::daemon::hex32(&out.key), crate::daemon::hex32(&out.mask))
+            else {
                 continue;
             };
-            members.push(Member { global_index: *index, public_key: key, commitment });
+            members.push(Member {
+                global_index: *index,
+                public_key: key,
+                commitment,
+            });
             if members.len() >= count {
                 break;
             }
@@ -142,7 +151,10 @@ mod tests {
     fn picks_stay_on_the_chain_and_lean_recent() {
         // A thousand blocks of ten outputs each.
         let cumulative: Vec<u64> = (1..=100_000u64).map(|b| b * 10).collect();
-        let d = Distribution { start_height: 0, cumulative };
+        let d = Distribution {
+            start_height: 0,
+            cumulative,
+        };
         let mut rng = rand::thread_rng();
         let mut picks = vec![];
         for _ in 0..2000 {

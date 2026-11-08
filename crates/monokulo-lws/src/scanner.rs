@@ -156,7 +156,11 @@ fn watched(lookahead: u32, ranges: &[SubaddrRanges]) -> Vec<SubaddressIndex> {
     let mut seen = HashSet::new();
     let mut out = vec![];
     let lookahead = (1..lookahead).map(|minor| (0, minor));
-    let registered = ranges.iter().flat_map(|r| r.value.iter().flat_map(move |[lo, hi]| (*lo..=*hi).map(move |minor| (r.key, minor))));
+    let registered = ranges.iter().flat_map(|r| {
+        r.value
+            .iter()
+            .flat_map(move |[lo, hi]| (*lo..=*hi).map(move |minor| (r.key, minor)))
+    });
     for (major, minor) in lookahead.chain(registered) {
         if (major, minor) == (0, 0) || !seen.insert((major, minor)) {
             continue;
@@ -183,15 +187,36 @@ impl Ring {
             ids.push(account.id);
             in_keyring.push(id);
         }
-        Ok(Ring { key: accounts.iter().map(|(a, r)| (a.id, r.clone())).collect(), keyring, ids, in_keyring, scanners: HashMap::new() })
+        Ok(Ring {
+            key: accounts.iter().map(|(a, r)| (a.id, r.clone())).collect(),
+            keyring,
+            ids,
+            in_keyring,
+            scanners: HashMap::new(),
+        })
     }
 
     /// The ring in `slot` if it's for `accounts`, else a new one there.
-    fn get<'a>(slot: &'a mut Option<Ring>, w: &ScanWriter, accounts: &[Account], lookahead: u32, arena: &Arena) -> Result<&'a mut Ring> {
+    fn get<'a>(
+        slot: &'a mut Option<Ring>,
+        w: &ScanWriter,
+        accounts: &[Account],
+        lookahead: u32,
+        arena: &Arena,
+    ) -> Result<&'a mut Ring> {
         let mut sorted: Vec<&Account> = accounts.iter().collect();
         sorted.sort_by_key(|a| a.id);
-        let with_ranges = sorted.into_iter().map(|a| Ok((a, w.subaddrs(a.id)?))).collect::<Result<Vec<_>>>()?;
-        let same = slot.as_ref().is_some_and(|r| r.key.len() == with_ranges.len() && r.key.iter().zip(&with_ranges).all(|(k, (a, ranges))| k.0 == a.id && &k.1 == ranges));
+        let with_ranges = sorted
+            .into_iter()
+            .map(|a| Ok((a, w.subaddrs(a.id)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let same = slot.as_ref().is_some_and(|r| {
+            r.key.len() == with_ranges.len()
+                && r.key
+                    .iter()
+                    .zip(&with_ranges)
+                    .all(|(k, (a, ranges))| k.0 == a.id && &k.1 == ranges)
+        });
         if !same {
             *slot = Some(Ring::build(&with_ranges, lookahead, arena)?);
         }
@@ -205,7 +230,12 @@ impl Ring {
     /// `account`'s `Scanner`, made the first time it's needed.
     fn scanner(&mut self, account: &Account, lookahead: u32) -> Result<&mut OxideScanner> {
         if !self.scanners.contains_key(&account.id) {
-            let ranges = self.key.iter().find(|(id, _)| *id == account.id).map(|(_, r)| r.clone()).unwrap_or_default();
+            let ranges = self
+                .key
+                .iter()
+                .find(|(id, _)| *id == account.id)
+                .map(|(_, r)| r.clone())
+                .unwrap_or_default();
             let mut scanner = OxideScanner::new(crypto::view_pair(&account.spend_pub, &account.view_key)?);
             for index in watched(lookahead, &ranges) {
                 scanner.register_subaddress(index);
@@ -239,12 +269,25 @@ pub fn stand_in(block: &ScannableBlock, first_indexes: &[Option<u64>], tx: usize
     let header = block.block.header.clone();
     if tx == 0 {
         let only = Block::new(header, block.block.miner_transaction().clone(), vec![])?;
-        return Some(ScannableBlock { block: only, transactions: vec![], output_index_for_first_ringct_output: *first_indexes.first()? });
+        return Some(ScannableBlock {
+            block: only,
+            transactions: vec![],
+            output_index_for_first_ringct_output: *first_indexes.first()?,
+        });
     }
     let hash = *block.block.transactions.get(tx - 1)?;
-    let prefix = TransactionPrefix { additional_timelock: Timelock::None, inputs: vec![Input::Gen(block.block.number())], outputs: vec![], extra: vec![] };
+    let prefix = TransactionPrefix {
+        additional_timelock: Timelock::None,
+        inputs: vec![Input::Gen(block.block.number())],
+        outputs: vec![],
+        extra: vec![],
+    };
     let only = Block::new(header, Transaction::V2 { prefix, proofs: None }, vec![hash])?;
-    Some(ScannableBlock { block: only, transactions: vec![block.transactions.get(tx - 1)?.clone()], output_index_for_first_ringct_output: *first_indexes.get(tx)? })
+    Some(ScannableBlock {
+        block: only,
+        transactions: vec![block.transactions.get(tx - 1)?.clone()],
+        output_index_for_first_ringct_output: *first_indexes.get(tx)?,
+    })
 }
 
 /// Every lane account's RingCT outputs by global index, for candidate spends:
@@ -334,7 +377,16 @@ impl Scanner {
     }
 
     fn show_lanes(&self) {
-        let lanes = self.plan().lanes.iter().map(|l| LaneStatus { id: l.id, cursor: l.cursor, accounts: l.accounts.len() }).collect();
+        let lanes = self
+            .plan()
+            .lanes
+            .iter()
+            .map(|l| LaneStatus {
+                id: l.id,
+                cursor: l.cursor,
+                accounts: l.accounts.len(),
+            })
+            .collect();
         self.set_status(|s| s.lanes = lanes);
     }
 
@@ -388,7 +440,12 @@ impl Scanner {
         });
         let active = self.db.accounts(Some(Status::Active))?;
         let (accounts, start) = if self.config.lanes.lanes == 0 {
-            let start = active.iter().map(|a| a.scan_height).min().unwrap_or(chain_height).max(1);
+            let start = active
+                .iter()
+                .map(|a| a.scan_height)
+                .min()
+                .unwrap_or(chain_height)
+                .max(1);
             (active, start)
         } else {
             self.live_accounts(active, chain_height)
@@ -430,7 +487,8 @@ impl Scanner {
         let fetched = batch.blocks.len() as u64;
         let last = batch.blocks.last().map(|b| b.block.clone());
         let mut ring = self.live_ring.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let result = tokio::task::block_in_place(|| self.scan_batch(&mut ring, &self.arenas[0], &accounts, &batch, start, true));
+        let result =
+            tokio::task::block_in_place(|| self.scan_batch(&mut ring, &self.arenas[0], &accounts, &batch, start, true));
         *self.live_ring.lock().unwrap_or_else(|e| e.into_inner()) = ring;
         result?;
         *self.last_block.lock().unwrap_or_else(|e| e.into_inner()) = last;
@@ -452,15 +510,29 @@ impl Scanner {
     fn live_accounts(self: &Arc<Self>, active: Vec<Account>, chain_height: u64) -> (Vec<Account>, u64) {
         let opened = {
             let mut plan = self.plan();
-            let live = *plan.live.get_or_insert_with(|| active.iter().map(|a| a.scan_height).max().unwrap_or(chain_height).clamp(1, chain_height.max(1)));
+            let live = *plan.live.get_or_insert_with(|| {
+                active
+                    .iter()
+                    .map(|a| a.scan_height)
+                    .max()
+                    .unwrap_or(chain_height)
+                    .clamp(1, chain_height.max(1))
+            });
             let merged = plan.merge_ready();
             if !merged.is_empty() {
                 tracing::info!("{} accounts caught up: into the live lane at {live}", merged.len());
             }
             plan.keep_only(&active.iter().map(|a| a.id).collect::<BTreeSet<_>>());
-            let behind: Vec<(i64, u64)> = active.iter().filter(|a| a.scan_height < live && plan.owner(a.id).is_none()).map(|a| (a.id, a.scan_height)).collect();
+            let behind: Vec<(i64, u64)> = active
+                .iter()
+                .filter(|a| a.scan_height < live && plan.owner(a.id).is_none())
+                .map(|a| (a.id, a.scan_height))
+                .collect();
             let opened = plan.place(&behind, self.config.lanes.lanes, self.config.lanes.join);
-            let mine: Vec<Account> = active.into_iter().filter(|a| a.scan_height >= live && plan.owner(a.id).is_none()).collect();
+            let mine: Vec<Account> = active
+                .into_iter()
+                .filter(|a| a.scan_height >= live && plan.owner(a.id).is_none())
+                .collect();
             // With no account of its own, the live lane only keeps up with the
             // tip, for the lanes to merge at.
             if mine.is_empty() && live < chain_height {
@@ -472,9 +544,16 @@ impl Scanner {
         };
         let (opened, mine, start) = opened;
         for id in opened {
-            tracing::info!("catch-up lane {id} from {}", self.plan().lane(id).map_or(0, |l| l.cursor));
+            tracing::info!(
+                "catch-up lane {id} from {}",
+                self.plan().lane(id).map_or(0, |l| l.cursor)
+            );
             let scanner = self.clone();
-            let task = LaneTask { id, ring: None, arena: self.arena(id) };
+            let task = LaneTask {
+                id,
+                ring: None,
+                arena: self.arena(id),
+            };
             tokio::spawn(scanner.run_lane(task));
         }
         self.show_lanes();
@@ -508,8 +587,15 @@ impl Scanner {
     }
 
     async fn lane_step(&self, task: &mut LaneTask) -> Result<LaneStep> {
-        let Some(lane) = self.plan().lane(task.id).cloned() else { return Ok(LaneStep::Done) };
-        let accounts: Vec<Account> = self.db.accounts(Some(Status::Active))?.into_iter().filter(|a| lane.accounts.contains(&a.id)).collect();
+        let Some(lane) = self.plan().lane(task.id).cloned() else {
+            return Ok(LaneStep::Done);
+        };
+        let accounts: Vec<Account> = self
+            .db
+            .accounts(Some(Status::Active))?
+            .into_iter()
+            .filter(|a| lane.accounts.contains(&a.id))
+            .collect();
         if accounts.is_empty() {
             self.plan().end(task.id);
             return Ok(LaneStep::Done);
@@ -526,7 +612,11 @@ impl Scanner {
         }
         let count = self.config.lanes.blocks.max(1).min(live - cursor);
         let fetched = {
-            let _permit = self.catch_up.acquire().await.map_err(|e| Error::Internal(e.to_string()))?;
+            let _permit = self
+                .catch_up
+                .acquire()
+                .await
+                .map_err(|e| Error::Internal(e.to_string()))?;
             self.daemon.blocks(cursor, count).await?
         };
         if fetched.first().map(|f| f.block.block.number() as u64) != Some(cursor) {
@@ -540,13 +630,34 @@ impl Scanner {
     /// Scans `batch` (from height `start`) for `accounts`, each only in the
     /// blocks at or above its scan height, writing outputs, spends and scan
     /// heights, and the block hashes for the live lane.
-    fn scan_batch(&self, slot: &mut Option<Ring>, arena: &Arena, accounts: &[Account], batch: &Batch, start: u64, live: bool) -> Result<()> {
-        let ring = self.db.write(|tx| Ring::get(slot, &ScanWriter::new(tx), accounts, self.config.lookahead, arena).map(|_| ()));
+    fn scan_batch(
+        &self,
+        slot: &mut Option<Ring>,
+        arena: &Arena,
+        accounts: &[Account],
+        batch: &Batch,
+        start: u64,
+        live: bool,
+    ) -> Result<()> {
+        let ring = self
+            .db
+            .write(|tx| Ring::get(slot, &ScanWriter::new(tx), accounts, self.config.lookahead, arena).map(|_| ()));
         ring?;
         let ring = slot.as_mut().expect("just made");
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         let hits = ring.keyring.flag_many(&batch.blocks, threads, 0);
-        self.db.write(|tx| record_batch(&ScanWriter::new(tx), ring, self.config.lookahead, accounts, batch, start, hits.as_deref(), live))
+        self.db.write(|tx| {
+            record_batch(
+                &ScanWriter::new(tx),
+                ring,
+                self.config.lookahead,
+                accounts,
+                batch,
+                start,
+                hits.as_deref(),
+                live,
+            )
+        })
     }
 
     /// The highest kept block the daemon still has; its successor is where
@@ -582,15 +693,32 @@ impl Scanner {
         let txs = self.daemon.transactions(&new).await?;
         let hashes: Vec<[u8; 32]> = txs.iter().map(|(h, _)| *h).collect();
         let transactions: Vec<Transaction<Pruned>> = txs.into_iter().map(|(_, t)| t).collect();
-        let Some(block) = Block::new(stand_in.header.clone(), stand_in.miner_transaction().clone(), hashes.clone()) else {
+        let Some(block) = Block::new(
+            stand_in.header.clone(),
+            stand_in.miner_transaction().clone(),
+            hashes.clone(),
+        ) else {
             return Ok(());
         };
-        let block = ScannableBlock { block, transactions, output_index_for_first_ringct_output: Some(0) };
+        let block = ScannableBlock {
+            block,
+            transactions,
+            output_index_for_first_ringct_output: Some(0),
+        };
         let now = crate::db::now();
         let mut found: HashMap<i64, Vec<PoolReceipt>> = HashMap::new();
         let mut slot = self.live_ring.lock().unwrap_or_else(|e| e.into_inner()).take();
         let result = tokio::task::block_in_place(|| {
-            self.db.write(|tx| Ring::get(&mut slot, &ScanWriter::new(tx), accounts, self.config.lookahead, &self.arenas[0]).map(|_| ()))?;
+            self.db.write(|tx| {
+                Ring::get(
+                    &mut slot,
+                    &ScanWriter::new(tx),
+                    accounts,
+                    self.config.lookahead,
+                    &self.arenas[0],
+                )
+                .map(|_| ())
+            })?;
             let ring = slot.as_mut().expect("just made");
             let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
             // The accounts that may be paid, or every account unfiltered.
@@ -603,10 +731,15 @@ impl Scanner {
             };
             for account in paid {
                 let scanner = ring.scanner(account, self.config.lookahead)?;
-                let outputs = scanner.scan(block.clone()).map_err(|e| Error::Internal(format!("scan: {e}")))?.ignore_additional_timelock();
+                let outputs = scanner
+                    .scan(block.clone())
+                    .map_err(|e| Error::Internal(format!("scan: {e}")))?
+                    .ignore_additional_timelock();
                 for output in outputs {
                     let tx_hash = output.transaction();
-                    let Some(i) = hashes.iter().position(|h| *h == tx_hash) else { continue };
+                    let Some(i) = hashes.iter().position(|h| *h == tx_hash) else {
+                        continue;
+                    };
                     let tx = &block.transactions[i];
                     let meta = TxMeta::of(tx, &output, &account.view_key);
                     found.entry(account.id).or_default().push(PoolReceipt {
@@ -657,7 +790,16 @@ enum LaneStep {
 /// block for every account. Then candidate spends, scan heights and, for the
 /// live lane, block hashes.
 #[allow(clippy::too_many_arguments)]
-pub fn record_batch(w: &ScanWriter, ring: &mut Ring, lookahead: u32, accounts: &[Account], batch: &Batch, start: u64, hits: Option<&[Hit]>, live: bool) -> Result<()> {
+pub fn record_batch(
+    w: &ScanWriter,
+    ring: &mut Ring,
+    lookahead: u32,
+    accounts: &[Account],
+    batch: &Batch,
+    start: u64,
+    hits: Option<&[Hit]>,
+    live: bool,
+) -> Result<()> {
     let by_id: HashMap<i64, &Account> = accounts.iter().map(|a| (a.id, a)).collect();
     let mut spends = SpendMap::of(w, accounts)?;
     let mut by_block: Vec<Vec<Hit>> = vec![vec![]; batch.blocks.len()];
@@ -673,11 +815,17 @@ pub fn record_batch(w: &ScanWriter, ring: &mut Ring, lookahead: u32, accounts: &
             // Transactions in block order, as the first output with a key counts.
             list.sort_by_key(|h| (h.tx, h.account));
             for hit in list {
-                let Some(account) = by_id.get(&ring.account(&hit)).copied() else { continue };
+                let Some(account) = by_id.get(&ring.account(&hit)).copied() else {
+                    continue;
+                };
                 if account.scan_height > height {
                     continue;
                 }
-                let target = if hit.tx == Hit::WHOLE_BLOCK { Some(block.clone()) } else { stand_in(block, &batch.first_indexes[i], hit.tx) };
+                let target = if hit.tx == Hit::WHOLE_BLOCK {
+                    Some(block.clone())
+                } else {
+                    stand_in(block, &batch.first_indexes[i], hit.tx)
+                };
                 let Some(target) = target else { continue };
                 scan_for(w, ring, lookahead, account, target, block, height, &mut spends)?;
             }
@@ -705,8 +853,21 @@ pub fn record_batch(w: &ScanWriter, ring: &mut Ring, lookahead: u32, accounts: &
 /// `target` (`block`, or a stand-in for part of it) scanned for `account`,
 /// and what it receives written.
 #[allow(clippy::too_many_arguments)]
-fn scan_for(w: &ScanWriter, ring: &mut Ring, lookahead: u32, account: &Account, target: ScannableBlock, block: &ScannableBlock, height: u64, spends: &mut SpendMap) -> Result<()> {
-    let outputs = ring.scanner(account, lookahead)?.scan(target).map_err(|e| Error::Internal(format!("scan: {e}")))?.ignore_additional_timelock();
+fn scan_for(
+    w: &ScanWriter,
+    ring: &mut Ring,
+    lookahead: u32,
+    account: &Account,
+    target: ScannableBlock,
+    block: &ScannableBlock,
+    height: u64,
+    spends: &mut SpendMap,
+) -> Result<()> {
+    let outputs = ring
+        .scanner(account, lookahead)?
+        .scan(target)
+        .map_err(|e| Error::Internal(format!("scan: {e}")))?
+        .ignore_additional_timelock();
     record_received(w, account, outputs, block, height, spends)
 }
 
@@ -728,7 +889,10 @@ impl TxMeta {
         let prefix = tx.prefix();
         let (main_key, additional) = extra_keys(&prefix.extra);
         let index = output.index_in_transaction();
-        let sub = output.subaddress().map(|s| (s.account(), s.address())).unwrap_or((0, 0));
+        let sub = output
+            .subaddress()
+            .map(|s| (s.account(), s.address()))
+            .unwrap_or((0, 0));
         let key_offset: DScalar = output.key_offset().into();
         let extra_key = additional.get(index as usize);
         let derived_key = crypto::derived_by(view_key, index, &key_offset, sub, &main_key, extra_key);
@@ -763,10 +927,16 @@ impl TxMeta {
     }
 }
 
-
 /// Writes the outputs `account` received in `block` at `height`, and adds the
 /// RingCT ones to `spends`, so a spend later in the batch is seen.
-fn record_received(w: &ScanWriter, account: &Account, outputs: Vec<WalletOutput>, block: &ScannableBlock, height: u64, spends: &mut SpendMap) -> Result<()> {
+fn record_received(
+    w: &ScanWriter,
+    account: &Account,
+    outputs: Vec<WalletOutput>,
+    block: &ScannableBlock,
+    height: u64,
+    spends: &mut SpendMap,
+) -> Result<()> {
     let timestamp = block.block.header.timestamp;
     let miner_hash = block.block.miner_transaction().hash();
     let miner: Transaction<Pruned> = block.block.miner_transaction().clone().into();
@@ -774,7 +944,12 @@ fn record_received(w: &ScanWriter, account: &Account, outputs: Vec<WalletOutput>
         if hash == miner_hash {
             return Some(&miner);
         }
-        block.block.transactions.iter().position(|h| *h == hash).map(|i| &block.transactions[i])
+        block
+            .block
+            .transactions
+            .iter()
+            .position(|h| *h == hash)
+            .map(|i| &block.transactions[i])
     };
     for output in outputs {
         let tx_hash = output.transaction();
@@ -820,7 +995,13 @@ fn record_received(w: &ScanWriter, account: &Account, outputs: Vec<WalletOutput>
 
 /// Possibly spent: an input whose ring holds an output of one of `accounts`
 /// (each only from its scan height on), looked up once per ring member.
-fn record_spends(w: &ScanWriter, accounts: &HashMap<i64, &Account>, block: &ScannableBlock, height: u64, spends: &SpendMap) -> Result<()> {
+fn record_spends(
+    w: &ScanWriter,
+    accounts: &HashMap<i64, &Account>,
+    block: &ScannableBlock,
+    height: u64,
+    spends: &SpendMap,
+) -> Result<()> {
     if spends.is_empty() {
         return Ok(());
     }
@@ -829,7 +1010,14 @@ fn record_spends(w: &ScanWriter, accounts: &HashMap<i64, &Account>, block: &Scan
         let hash = block.block.transactions[i];
         let ring_size = mixin(tx) + 1;
         for input in &tx.prefix().inputs {
-            let Input::ToKey { amount, key_offsets, key_image } = input else { continue };
+            let Input::ToKey {
+                amount,
+                key_offsets,
+                key_image,
+            } = input
+            else {
+                continue;
+            };
             if amount.unwrap_or(0) != 0 {
                 continue; // Pre-RingCT amounts aren't tracked.
             }
@@ -842,7 +1030,15 @@ fn record_spends(w: &ScanWriter, accounts: &HashMap<i64, &Account>, block: &Scan
                     }
                     let meta = TxMeta::spend_only(tx);
                     let tx_id = w.tx_row(*account, &meta.new_tx(hash, height, timestamp))?;
-                    w.add_spend(*account, tx_id, ours.id, ours.amount, &key_image.to_bytes(), ring_size - 1, height)?;
+                    w.add_spend(
+                        *account,
+                        tx_id,
+                        ours.id,
+                        ours.amount,
+                        &key_image.to_bytes(),
+                        ring_size - 1,
+                        height,
+                    )?;
                 }
             }
         }
@@ -870,11 +1066,17 @@ impl TxMeta {
 }
 
 fn extra_keys(extra: &[u8]) -> ([u8; 32], Vec<[u8; 32]>) {
-    let Ok(extra) = Extra::read(&mut &extra[..]) else { return ([0; 32], vec![]) };
+    let Ok(extra) = Extra::read(&mut &extra[..]) else {
+        return ([0; 32], vec![]);
+    };
     match extra.keys() {
         Some((keys, additional)) => (
             keys.first().map(|k| k.compress().to_bytes()).unwrap_or([0; 32]),
-            additional.unwrap_or_default().into_iter().map(|k| k.compress().to_bytes()).collect(),
+            additional
+                .unwrap_or_default()
+                .into_iter()
+                .map(|k| k.compress().to_bytes())
+                .collect(),
         ),
         None => ([0; 32], vec![]),
     }
@@ -948,7 +1150,11 @@ pub fn unlocked(height: u64, coinbase: bool, unlock_time: u64, chain_height: u64
         return true;
     }
     const BLOCK_OR_TIME: u64 = 500_000_000;
-    if unlock_time < BLOCK_OR_TIME { unlock_time <= chain_height } else { unlock_time <= now }
+    if unlock_time < BLOCK_OR_TIME {
+        unlock_time <= chain_height
+    } else {
+        unlock_time <= now
+    }
 }
 
 /// Feeds a fixture written by monokulo-8ar's `prototypes/scan-bench` (each
@@ -978,7 +1184,11 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
         for _ in 0..u32::from_le_bytes(n) {
             let mut out = [0u8; 37];
             f.read_exact(&mut out)?;
-            outs.push((u32::from_le_bytes(out[..4].try_into().expect("4 bytes")), out[4], <[u8; 32]>::try_from(&out[5..]).expect("32 bytes")));
+            outs.push((
+                u32::from_le_bytes(out[..4].try_into().expect("4 bytes")),
+                out[4],
+                <[u8; 32]>::try_from(&out[5..]).expect("32 bytes"),
+            ));
         }
         keys.push((r, outs));
     }
@@ -991,7 +1201,15 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
     for number in 0..block_count {
         let part = &keys[number * key_count / block_count..(number + 1) * key_count / block_count];
         let number = 3_797_000 + number;
-        let miner = Transaction::V2 { prefix: TransactionPrefix { additional_timelock: Timelock::None, inputs: vec![Input::Gen(number)], outputs: vec![], extra: vec![] }, proofs: None };
+        let miner = Transaction::V2 {
+            prefix: TransactionPrefix {
+                additional_timelock: Timelock::None,
+                inputs: vec![Input::Gen(number)],
+                outputs: vec![],
+                extra: vec![],
+            },
+            proofs: None,
+        };
         let mut firsts = vec![None];
         let mut txs = vec![];
         let mut hashes = vec![];
@@ -999,24 +1217,51 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
             let len = outs.iter().map(|(index, _, _)| *index as usize + 1).max().unwrap_or(0);
             // Outputs another key of the transaction pays are the identity here,
             // which is skipped, as the fixture says nothing of them.
-            let mut outputs: Vec<monero_wallet::transaction::Output> =
-                (0..len).map(|_| monero_wallet::transaction::Output { amount: None, key: monero_wallet::ed25519::CompressedPoint::IDENTITY, view_tag: None }).collect();
+            let mut outputs: Vec<monero_wallet::transaction::Output> = (0..len)
+                .map(|_| monero_wallet::transaction::Output {
+                    amount: None,
+                    key: monero_wallet::ed25519::CompressedPoint::IDENTITY,
+                    view_tag: None,
+                })
+                .collect();
             for (index, tag, key) in outs {
-                outputs[*index as usize] = monero_wallet::transaction::Output { amount: None, key: monero_wallet::ed25519::CompressedPoint::from(*key), view_tag: Some(*tag) };
+                outputs[*index as usize] = monero_wallet::transaction::Output {
+                    amount: None,
+                    key: monero_wallet::ed25519::CompressedPoint::from(*key),
+                    view_tag: Some(*tag),
+                };
             }
             let mut extra = vec![1];
             extra.extend_from_slice(r);
             firsts.push((len > 0).then_some(next_index));
             next_index += len as u64;
-            txs.push(Transaction::<Pruned>::V2 { prefix: TransactionPrefix { additional_timelock: Timelock::None, inputs: vec![], outputs, extra }, proofs: None });
+            txs.push(Transaction::<Pruned>::V2 {
+                prefix: TransactionPrefix {
+                    additional_timelock: Timelock::None,
+                    inputs: vec![],
+                    outputs,
+                    extra,
+                },
+                proofs: None,
+            });
             let mut hash = [0u8; 32];
             hash[..8].copy_from_slice(&(number as u64).to_le_bytes());
             hash[8..16].copy_from_slice(&(i as u64).to_le_bytes());
             hashes.push(hash);
         }
-        let header = monero_wallet::block::BlockHeader { hardfork_version: 16, hardfork_signal: 16, timestamp: 1_700_000_000, previous: [0; 32], nonce: 0 };
+        let header = monero_wallet::block::BlockHeader {
+            hardfork_version: 16,
+            hardfork_signal: 16,
+            timestamp: 1_700_000_000,
+            previous: [0; 32],
+            nonce: 0,
+        };
         let first = firsts.iter().flatten().next().copied();
-        blocks.push(ScannableBlock { block: Block::new(header, miner, hashes).expect("a miner transaction"), transactions: txs, output_index_for_first_ringct_output: first });
+        blocks.push(ScannableBlock {
+            block: Block::new(header, miner, hashes).expect("a miner transaction"),
+            transactions: txs,
+            output_index_for_first_ringct_output: first,
+        });
         first_indexes.push(firsts);
     }
     println!("{} blocks, {key_count} keys, from {}", blocks.len(), fixture.display());
@@ -1045,10 +1290,20 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
             };
             let mut wide = [0u8; 64];
             rng.fill_bytes(&mut wide);
-            let spend = &DScalar::from_bytes_mod_order_wide(&wide) * curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
-            let view_pub = (&view * curve25519_dalek::constants::ED25519_BASEPOINT_TABLE).compress().to_bytes();
+            let spend =
+                &DScalar::from_bytes_mod_order_wide(&wide) * curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
+            let view_pub = (&view * curve25519_dalek::constants::ED25519_BASEPOINT_TABLE)
+                .compress()
+                .to_bytes();
             accounts.push(db.add_account(
-                &crate::db::NewAccount { address: format!("replay-{i}"), view_key: view.to_bytes(), spend_pub: spend.compress().to_bytes(), view_pub, start_height: 3_797_000, generated_locally: false },
+                &crate::db::NewAccount {
+                    address: format!("replay-{i}"),
+                    view_key: view.to_bytes(),
+                    spend_pub: spend.compress().to_bytes(),
+                    view_pub,
+                    start_height: 3_797_000,
+                    generated_locally: false,
+                },
                 Status::Active,
             )?);
         }
@@ -1063,7 +1318,10 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
         let mut flagging = 0.0;
         for (at, part) in blocks.chunks(step).enumerate() {
             let start = 3_797_000 + (at * step) as u64;
-            let batch = Batch { blocks: part.to_vec(), first_indexes: first_indexes[at * step..at * step + part.len()].to_vec() };
+            let batch = Batch {
+                blocks: part.to_vec(),
+                first_indexes: first_indexes[at * step..at * step + part.len()].to_vec(),
+            };
             let t = Instant::now();
             let found = ring.keyring.flag_many(&batch.blocks, threads, 0);
             flagging += t.elapsed().as_secs_f64();
@@ -1078,7 +1336,18 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
             for account in &mut accounts {
                 account.scan_height = start;
             }
-            db.write(|tx| record_batch(&ScanWriter::new(tx), ring, lookahead, &accounts, &batch, start, found.as_deref(), false))?;
+            db.write(|tx| {
+                record_batch(
+                    &ScanWriter::new(tx),
+                    ring,
+                    lookahead,
+                    &accounts,
+                    &batch,
+                    start,
+                    found.as_deref(),
+                    false,
+                )
+            })?;
         }
         let seconds = started.elapsed().as_secs_f64();
         println!(
@@ -1123,11 +1392,7 @@ mod tests {
     // what monero-oxide's `Scanner` finds in the whole block.
 
     use curve25519_dalek::{EdwardsPoint, constants::ED25519_BASEPOINT_TABLE};
-    use monero_wallet::{
-        block::BlockHeader,
-        ed25519::CompressedPoint,
-        transaction::Output,
-    };
+    use monero_wallet::{block::BlockHeader, ed25519::CompressedPoint, transaction::Output};
 
     use crate::db::NewAccount;
 
@@ -1137,12 +1402,18 @@ mod tests {
     }
 
     fn keys() -> Keys {
-        Keys { view: DScalar::from_bytes_mod_order([9; 32]), spend: &DScalar::from(7u64) * ED25519_BASEPOINT_TABLE }
+        Keys {
+            view: DScalar::from_bytes_mod_order([9; 32]),
+            spend: &DScalar::from(7u64) * ED25519_BASEPOINT_TABLE,
+        }
     }
 
     /// Output `index` of the transaction with key `r`, paying `keys`.
     fn paying(keys: &Keys, r: &DScalar, index: u64) -> Output {
-        let derivation = (keys.view * (r * ED25519_BASEPOINT_TABLE)).mul_by_cofactor().compress().to_bytes();
+        let derivation = (keys.view * (r * ED25519_BASEPOINT_TABLE))
+            .mul_by_cofactor()
+            .compress()
+            .to_bytes();
         let mut tagged = b"view_tag".to_vec();
         tagged.extend_from_slice(&derivation);
         varint(index, &mut tagged);
@@ -1150,43 +1421,108 @@ mod tests {
         varint(index, &mut shared);
         let shared = DScalar::from_bytes_mod_order(keccak256(&shared));
         let key = &shared * ED25519_BASEPOINT_TABLE + keys.spend;
-        Output { amount: Some(1_000), key: CompressedPoint::from(key.compress().to_bytes()), view_tag: Some(keccak256(&tagged)[0]) }
+        Output {
+            amount: Some(1_000),
+            key: CompressedPoint::from(key.compress().to_bytes()),
+            view_tag: Some(keccak256(&tagged)[0]),
+        }
     }
 
     fn stranger(seed: u64) -> Output {
         let key = &DScalar::from(seed * 7919 + 13) * ED25519_BASEPOINT_TABLE;
-        Output { amount: Some(1_000), key: CompressedPoint::from(key.compress().to_bytes()), view_tag: Some(seed as u8) }
+        Output {
+            amount: Some(1_000),
+            key: CompressedPoint::from(key.compress().to_bytes()),
+            view_tag: Some(seed as u8),
+        }
     }
 
     fn prefix(outputs: Vec<Output>, r: &DScalar, inputs: Vec<Input>) -> TransactionPrefix {
         let mut extra = vec![1];
         extra.extend_from_slice(&(r * ED25519_BASEPOINT_TABLE).compress().to_bytes());
-        TransactionPrefix { additional_timelock: Timelock::None, inputs, outputs, extra }
+        TransactionPrefix {
+            additional_timelock: Timelock::None,
+            inputs,
+            outputs,
+            extra,
+        }
     }
 
     /// Block `number`: a miner transaction of two outputs, then one of three and
     /// one of two, the second output of the last paying `keys` (or the miner's
     /// first, with `miner_pays`; or nothing, with `spends`, the last spending
     /// from a ring of those offsets instead), and output indexes from 1000.
-    fn block(keys: &Keys, number: usize, miner_pays: bool, spends: Option<Vec<u64>>) -> (ScannableBlock, Vec<Option<u64>>) {
+    fn block(
+        keys: &Keys,
+        number: usize,
+        miner_pays: bool,
+        spends: Option<Vec<u64>>,
+    ) -> (ScannableBlock, Vec<Option<u64>>) {
         let r = |n: u64| DScalar::from(1000 + n + number as u64 * 10);
-        let miner_outputs = if miner_pays { vec![paying(keys, &r(0), 0), stranger(1)] } else { vec![stranger(1), stranger(2)] };
-        let miner = Transaction::V2 { prefix: prefix(miner_outputs, &r(0), vec![Input::Gen(number)]), proofs: None };
+        let miner_outputs = if miner_pays {
+            vec![paying(keys, &r(0), 0), stranger(1)]
+        } else {
+            vec![stranger(1), stranger(2)]
+        };
+        let miner = Transaction::V2 {
+            prefix: prefix(miner_outputs, &r(0), vec![Input::Gen(number)]),
+            proofs: None,
+        };
         let pays_here = !miner_pays && spends.is_none();
-        let ring = spends.map(|offsets| vec![Input::ToKey { amount: None, key_offsets: offsets, key_image: CompressedPoint::from([5; 32]) }]).unwrap_or_default();
+        let ring = spends
+            .map(|offsets| {
+                vec![Input::ToKey {
+                    amount: None,
+                    key_offsets: offsets,
+                    key_image: CompressedPoint::from([5; 32]),
+                }]
+            })
+            .unwrap_or_default();
         let txs: Vec<Transaction<Pruned>> = vec![
-            Transaction::V2 { prefix: prefix(vec![stranger(3), stranger(4), stranger(5)], &r(1), vec![]), proofs: None },
-            Transaction::V2 { prefix: prefix(vec![stranger(6), if pays_here { paying(keys, &r(2), 1) } else { stranger(7) }], &r(2), ring), proofs: None },
+            Transaction::V2 {
+                prefix: prefix(vec![stranger(3), stranger(4), stranger(5)], &r(1), vec![]),
+                proofs: None,
+            },
+            Transaction::V2 {
+                prefix: prefix(
+                    vec![
+                        stranger(6),
+                        if pays_here { paying(keys, &r(2), 1) } else { stranger(7) },
+                    ],
+                    &r(2),
+                    ring,
+                ),
+                proofs: None,
+            },
         ];
-        let header = BlockHeader { hardfork_version: 16, hardfork_signal: 16, timestamp: 1_700_000_000, previous: [0; 32], nonce: 0 };
+        let header = BlockHeader {
+            hardfork_version: 16,
+            hardfork_signal: 16,
+            timestamp: 1_700_000_000,
+            previous: [0; 32],
+            nonce: 0,
+        };
         let block = Block::new(header, miner, vec![[1; 32], [2; 32]]).unwrap();
-        (ScannableBlock { block, transactions: txs, output_index_for_first_ringct_output: Some(1000) }, vec![Some(1000), Some(1002), Some(1005)])
+        (
+            ScannableBlock {
+                block,
+                transactions: txs,
+                output_index_for_first_ringct_output: Some(1000),
+            },
+            vec![Some(1000), Some(1002), Some(1005)],
+        )
     }
 
     fn found(keys: &Keys, block: ScannableBlock) -> Vec<(u64, [u8; 32])> {
         let pair = crypto::view_pair(&keys.spend.compress().to_bytes(), &keys.view.to_bytes()).unwrap();
         let mut scanner = OxideScanner::new(pair);
-        scanner.scan(block).unwrap().ignore_additional_timelock().iter().map(|o| (o.index_on_blockchain(), o.transaction())).collect()
+        scanner
+            .scan(block)
+            .unwrap()
+            .ignore_additional_timelock()
+            .iter()
+            .map(|o| (o.index_on_blockchain(), o.transaction()))
+            .collect()
     }
 
     #[test]
@@ -1194,23 +1530,50 @@ mod tests {
         let keys = keys();
         let (whole, firsts) = block(&keys, 50, false, None);
         let expected = found(&keys, whole.clone());
-        assert_eq!(expected, vec![(1006, [2; 32])], "the whole block: the 2nd output of the 3rd transaction");
-        assert_eq!(found(&keys, stand_in(&whole, &firsts, 2).unwrap()), expected, "the stand-in, the same");
-        assert!(found(&keys, stand_in(&whole, &firsts, 1).unwrap()).is_empty(), "another transaction, nothing");
+        assert_eq!(
+            expected,
+            vec![(1006, [2; 32])],
+            "the whole block: the 2nd output of the 3rd transaction"
+        );
+        assert_eq!(
+            found(&keys, stand_in(&whole, &firsts, 2).unwrap()),
+            expected,
+            "the stand-in, the same"
+        );
+        assert!(
+            found(&keys, stand_in(&whole, &firsts, 1).unwrap()).is_empty(),
+            "another transaction, nothing"
+        );
         assert_eq!(stand_in(&whole, &firsts, 2).unwrap().block.number(), 50);
 
         let (whole, firsts) = block(&keys, 51, true, None);
         let expected = found(&keys, whole.clone());
         assert_eq!(expected.len(), 1);
         assert_eq!(expected[0].0, 1000, "the miner's first output");
-        assert_eq!(found(&keys, stand_in(&whole, &firsts, 0).unwrap()), expected, "the miner's stand-in, the same");
+        assert_eq!(
+            found(&keys, stand_in(&whole, &firsts, 0).unwrap()),
+            expected,
+            "the miner's stand-in, the same"
+        );
         assert!(stand_in(&whole, &firsts, 3).is_none(), "no such transaction");
     }
 
     #[test]
     fn spends_are_looked_up_once_whoever_owns_the_output() {
         let mut map = SpendMap::default();
-        let row = |global_index: u64| OutputRow { id: global_index as i64, tx: 1, out_index: 0, global_index, amount: 5, public_key: [0; 32], tx_pub_key: [0; 32], mask: Some([0; 32]), height: 1, maj: 0, min: 0 };
+        let row = |global_index: u64| OutputRow {
+            id: global_index as i64,
+            tx: 1,
+            out_index: 0,
+            global_index,
+            amount: 5,
+            public_key: [0; 32],
+            tx_pub_key: [0; 32],
+            mask: Some([0; 32]),
+            height: 1,
+            maj: 0,
+            min: 0,
+        };
         map.add(1, row(10));
         map.add(2, row(11));
         map.add(3, row(10));
@@ -1222,7 +1585,18 @@ mod tests {
     fn account(db: &Db, keys: &Keys, address: &str, start: u64) -> Account {
         let spend_pub = keys.spend.compress().to_bytes();
         let view_pub = (&keys.view * ED25519_BASEPOINT_TABLE).compress().to_bytes();
-        db.add_account(&NewAccount { address: address.into(), view_key: keys.view.to_bytes(), spend_pub, view_pub, start_height: start, generated_locally: false }, Status::Active).unwrap()
+        db.add_account(
+            &NewAccount {
+                address: address.into(),
+                view_key: keys.view.to_bytes(),
+                spend_pub,
+                view_pub,
+                start_height: start,
+                generated_locally: false,
+            },
+            Status::Active,
+        )
+        .unwrap()
     }
 
     /// Two blocks, the first paying `keys` and the second spending it in a ring,
@@ -1234,7 +1608,10 @@ mod tests {
         let (a, b) = (account(&db, &keys, "A", 100), account(&db, &keys, "B", 200));
         let (pays, firsts_pays) = block(&keys, 100, false, None);
         let (spends, firsts_spends) = block(&keys, 101, false, Some(vec![1000, 6]));
-        let batch = Batch { blocks: vec![pays, spends], first_indexes: vec![firsts_pays, firsts_spends] };
+        let batch = Batch {
+            blocks: vec![pays, spends],
+            first_indexes: vec![firsts_pays, firsts_spends],
+        };
         let accounts = vec![a.clone(), b.clone()];
         let mut slot = None;
         db.write(|tx| {
@@ -1254,7 +1631,10 @@ mod tests {
         assert_eq!(outputs[0].height, 100);
         let spends = db.spends(a.id).unwrap();
         assert_eq!(spends.len(), 1, "the ring at 101 holds 1006");
-        assert!(db.outputs(b.id).unwrap().is_empty() && db.spends(b.id).unwrap().is_empty(), "B starts at 200");
+        assert!(
+            db.outputs(b.id).unwrap().is_empty() && db.spends(b.id).unwrap().is_empty(),
+            "B starts at 200"
+        );
         assert_eq!(db.account("A").unwrap().unwrap().scan_height, 102);
         assert_eq!(db.account("B").unwrap().unwrap().scan_height, 200);
         assert!(db.block_hash(101).unwrap().is_some(), "the live lane keeps hashes");
@@ -1264,7 +1644,25 @@ mod tests {
     fn hits_are_scanned_alone_and_spends_found_through_one_map() {
         // The prefilter's answer, faked: A's and B's hit in block 0's third
         // transaction, and a stray hit for A in a transaction that pays nobody.
-        let hits = |ring: &Ring| vec![Hit { account: ring.in_keyring[0], block: 0, tx: 2 }, Hit { account: ring.in_keyring[1], block: 0, tx: 2 }, Hit { account: ring.in_keyring[0], block: 1, tx: 1 }];
+        let hits = |ring: &Ring| {
+            vec![
+                Hit {
+                    account: ring.in_keyring[0],
+                    block: 0,
+                    tx: 2,
+                },
+                Hit {
+                    account: ring.in_keyring[1],
+                    block: 0,
+                    tx: 2,
+                },
+                Hit {
+                    account: ring.in_keyring[0],
+                    block: 1,
+                    tx: 1,
+                },
+            ]
+        };
         let (db, a, b) = record(Some(&hits));
         check_recorded(&db, &a, &b);
     }
@@ -1284,14 +1682,29 @@ mod tests {
 
     #[test]
     fn a_block_to_read_whole_is_read_whole() {
-        let hits = |ring: &Ring| vec![Hit { account: ring.in_keyring[0], block: 0, tx: Hit::WHOLE_BLOCK }];
+        let hits = |ring: &Ring| {
+            vec![Hit {
+                account: ring.in_keyring[0],
+                block: 0,
+                tx: Hit::WHOLE_BLOCK,
+            }]
+        };
         let (db, a, _) = record(Some(&hits));
         assert_eq!(db.outputs(a.id).unwrap().len(), 1);
     }
 
     #[test]
     fn the_watched_subaddresses_are_the_lookahead_and_the_ranges() {
-        let ranges = vec![SubaddrRanges { key: 0, value: vec![[0, 3]] }, SubaddrRanges { key: 2, value: vec![[5, 6]] }];
+        let ranges = vec![
+            SubaddrRanges {
+                key: 0,
+                value: vec![[0, 3]],
+            },
+            SubaddrRanges {
+                key: 2,
+                value: vec![[5, 6]],
+            },
+        ];
         let got: Vec<(u32, u32)> = watched(3, &ranges).iter().map(|i| (i.account(), i.address())).collect();
         assert_eq!(got, vec![(0, 1), (0, 2), (0, 3), (2, 5), (2, 6)]);
     }
@@ -1302,7 +1715,10 @@ mod tests {
     #[ignore = "needs a GPU; run with --ignored"]
     fn the_gpu_finds_the_paying_transaction() {
         monokulo_8ar::warm_up();
-        assert!(monokulo_8ar::settle(Duration::from_secs(120)) && monokulo_8ar::gpu_ready(), "the GPU started");
+        assert!(
+            monokulo_8ar::settle(Duration::from_secs(120)) && monokulo_8ar::gpu_ready(),
+            "the GPU started"
+        );
         let keys = keys();
         let db = Db::in_memory();
         let (a, b) = (account(&db, &keys, "A", 100), account(&db, &keys, "B", 200));
@@ -1310,11 +1726,37 @@ mod tests {
         let (spends, _) = block(&keys, 101, false, Some(vec![1000, 6]));
         let accounts = vec![a, b];
         let mut slot = None;
-        db.write(|tx| Ring::get(&mut slot, &ScanWriter::new(tx), &accounts, 1, &Arena::new()).map(|_| ())).unwrap();
+        db.write(|tx| Ring::get(&mut slot, &ScanWriter::new(tx), &accounts, 1, &Arena::new()).map(|_| ()))
+            .unwrap();
         let ring = slot.as_mut().unwrap();
         let hits = ring.keyring.flag_many(&[pays, spends], 4, 0).expect("the GPU filtered");
-        assert_eq!(hits, vec![Hit { account: ring.in_keyring[0], block: 0, tx: 2 }, Hit { account: ring.in_keyring[1], block: 0, tx: 2 }]);
-        let gpu = |ring: &Ring| ring.keyring.flag_many(&[block(&keys, 100, false, None).0, block(&keys, 101, false, Some(vec![1000, 6])).0], 4, 0).expect("the GPU filtered");
+        assert_eq!(
+            hits,
+            vec![
+                Hit {
+                    account: ring.in_keyring[0],
+                    block: 0,
+                    tx: 2
+                },
+                Hit {
+                    account: ring.in_keyring[1],
+                    block: 0,
+                    tx: 2
+                }
+            ]
+        );
+        let gpu = |ring: &Ring| {
+            ring.keyring
+                .flag_many(
+                    &[
+                        block(&keys, 100, false, None).0,
+                        block(&keys, 101, false, Some(vec![1000, 6])).0,
+                    ],
+                    4,
+                    0,
+                )
+                .expect("the GPU filtered")
+        };
         let (db, a, b) = record(Some(&gpu));
         check_recorded(&db, &a, &b);
     }

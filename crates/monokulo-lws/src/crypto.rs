@@ -49,7 +49,9 @@ fn Point_mul_base(scalar: Scalar) -> [u8; 32] {
 }
 
 pub fn view_pair(spend_pub: &[u8; 32], view_key: &[u8; 32]) -> Result<ViewPair> {
-    let spend = CompressedPoint::from(*spend_pub).decompress().ok_or_else(|| bad("the spend key isn't a point"))?;
+    let spend = CompressedPoint::from(*spend_pub)
+        .decompress()
+        .ok_or_else(|| bad("the spend key isn't a point"))?;
     let view = Scalar::read(&mut view_key.as_slice()).map_err(|_| bad("the view key isn't a canonical scalar"))?;
     ViewPair::new(spend, Zeroizing::new(view)).map_err(|e| bad(format!("view pair: {e}")))
 }
@@ -119,7 +121,11 @@ pub fn derived_by(
     additional: Option<&[u8; 32]>,
 ) -> [u8; 32] {
     let sub = subaddress_derivation(view_key, major, minor);
-    let fits = |r: &[u8; 32]| shared_scalar(view_key, r, index).map(|s| s + sub == *key_offset).unwrap_or(false);
+    let fits = |r: &[u8; 32]| {
+        shared_scalar(view_key, r, index)
+            .map(|s| s + sub == *key_offset)
+            .unwrap_or(false)
+    };
     match additional {
         Some(extra) if fits(extra) && !fits(main) => *extra,
         _ => *main,
@@ -129,10 +135,19 @@ pub fn derived_by(
 /// The 96-byte `rct` blob: the commitment, then the mask and the amount
 /// encrypted the original way (`ecdhEncode`, non-compact), which the
 /// client undoes with `H_s(shared)` and `H_s(H_s(shared))`.
-pub fn legacy_rct(view_key: &[u8; 32], tx_pub_key: &[u8; 32], index: u64, mask: &[u8; 32], amount: u64) -> Option<[u8; 96]> {
+pub fn legacy_rct(
+    view_key: &[u8; 32],
+    tx_pub_key: &[u8; 32],
+    index: u64,
+    mask: &[u8; 32],
+    amount: u64,
+) -> Option<[u8; 96]> {
     let shared = shared_scalar(view_key, tx_pub_key, index)?;
     let mask_scalar = DScalar::from_bytes_mod_order(*mask);
-    let commitment = Commitment::new(Scalar::from(mask_scalar), amount).commit().compress().to_bytes();
+    let commitment = Commitment::new(Scalar::from(mask_scalar), amount)
+        .commit()
+        .compress()
+        .to_bytes();
     let s1 = hash_to_scalar(shared.as_bytes());
     let s2 = hash_to_scalar(s1.as_bytes());
     let masked = mask_scalar + s1;
@@ -148,7 +163,10 @@ pub fn legacy_rct(view_key: &[u8; 32], tx_pub_key: &[u8; 32], index: u64, mask: 
 /// to the amount under the identity mask, then the identity and the amount
 /// in the clear, as monero-lws sends them.
 pub fn plain_rct(amount: u64) -> [u8; 96] {
-    let commitment = Commitment::new(Scalar::from(DScalar::ONE), amount).commit().compress().to_bytes();
+    let commitment = Commitment::new(Scalar::from(DScalar::ONE), amount)
+        .commit()
+        .compress()
+        .to_bytes();
     let mut out = [0u8; 96];
     out[..32].copy_from_slice(&commitment);
     out[32..64].copy_from_slice(DScalar::ONE.as_bytes());
@@ -178,10 +196,19 @@ mod tests {
             Err(Error::Forbidden) => {}
             other => panic!("{other:?}"),
         }
-        assert!(matches!(check_login(Network::Mainnet, &address, &wrong), Err(Error::BadRequest(_))));
+        assert!(matches!(
+            check_login(Network::Mainnet, &address, &wrong),
+            Err(Error::BadRequest(_))
+        ));
         let not_canonical = [0xff; 32];
-        assert!(matches!(check_login(Network::Stagenet, &address, &not_canonical), Err(Error::BadRequest(_))));
-        assert!(matches!(check_login(Network::Stagenet, "not an address", &wrong), Err(Error::BadRequest(_))));
+        assert!(matches!(
+            check_login(Network::Stagenet, &address, &not_canonical),
+            Err(Error::BadRequest(_))
+        ));
+        assert!(matches!(
+            check_login(Network::Stagenet, "not an address", &wrong),
+            Err(Error::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -208,7 +235,10 @@ mod tests {
         let amount = DScalar::from_bytes_mod_order(packed[64..].try_into().unwrap());
         assert_eq!(masked - s1, mask);
         assert_eq!(amount - s2, DScalar::from(1_000_000u64));
-        let expected = Commitment::new(Scalar::from(mask), 1_000_000).commit().compress().to_bytes();
+        let expected = Commitment::new(Scalar::from(mask), 1_000_000)
+            .commit()
+            .compress()
+            .to_bytes();
         assert_eq!(&packed[..32], &expected);
     }
 

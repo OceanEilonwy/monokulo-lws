@@ -127,7 +127,9 @@ pub fn wallet_router(app: Arc<App>) -> Router {
 }
 
 pub fn admin_router(app: Arc<App>) -> Router {
-    let mut router = Router::new().route("/{command}", post(admin::command)).layer(RequestBodyLimitLayer::new(1024 * 1024));
+    let mut router = Router::new()
+        .route("/{command}", post(admin::command))
+        .layer(RequestBodyLimitLayer::new(1024 * 1024));
     if let Some(cors) = cors(&app.config.access_control_origins) {
         router = router.layer(cors);
     }

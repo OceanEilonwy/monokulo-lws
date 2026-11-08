@@ -36,7 +36,11 @@ fn params<P: DeserializeOwned>(value: &Value) -> Result<P> {
     serde_json::from_value(value.clone()).map_err(|e| bad(format!("params: {e}")))
 }
 
-pub async fn command(State(app): State<Arc<App>>, Path(command): Path<String>, Json(req): Json<Request<Value>>) -> std::result::Result<Response, ApiError> {
+pub async fn command(
+    State(app): State<Arc<App>>,
+    Path(command): Path<String>,
+    Json(req): Json<Request<Value>>,
+) -> std::result::Result<Response, ApiError> {
     authorize(&app, req.auth.as_ref())?;
     let out = match command.as_str() {
         "accept_requests" => accept(&app, params(&req.params)?)?,
@@ -101,7 +105,11 @@ fn add_account(app: &App, p: AddAccount) -> Result<Value> {
 fn list_accounts(app: &App) -> Result<Value> {
     let mut out = Accounts::default();
     for a in app.db.accounts(None)? {
-        let row = AccountRow { address: a.address, scan_height: a.scan_height, access_time: a.access_time };
+        let row = AccountRow {
+            address: a.address,
+            scan_height: a.scan_height,
+            access_time: a.access_time,
+        };
         match a.status {
             Status::Active => out.active.push(row),
             Status::Inactive => out.inactive.push(row),
@@ -114,8 +122,15 @@ fn list_accounts(app: &App) -> Result<Value> {
 fn list_requests(app: &App) -> Result<Value> {
     let mut out = PendingRequests::default();
     for (kind, new) in app.db.requests()? {
-        let row = RequestRow { address: new.address, start_height: new.start_height };
-        if kind == "create" { out.create.push(row) } else { out.import.push(row) }
+        let row = RequestRow {
+            address: new.address,
+            start_height: new.start_height,
+        };
+        if kind == "create" {
+            out.create.push(row)
+        } else {
+            out.import.push(row)
+        }
     }
     Ok(serde_json::to_value(out).expect("json"))
 }
@@ -142,9 +157,14 @@ fn validate(app: &App, p: Validate) -> Result<Value> {
     let spend = key(&p.spend_public_hex, "spend_public_hex")?;
     let view_pub = key(&p.view_public_hex, "view_public_hex")?;
     let view_key = key(&p.view_key_hex, "view_key_hex")?;
-    let spend_point = CompressedPoint::from(spend).decompress().ok_or_else(|| bad("spend_public_hex isn't a point"))?;
-    let view_point = CompressedPoint::from(view_pub).decompress().ok_or_else(|| bad("view_public_hex isn't a point"))?;
-    let address = MoneroAddress::new(app.scanner.config.network, AddressType::Legacy, spend_point, view_point).to_string();
+    let spend_point = CompressedPoint::from(spend)
+        .decompress()
+        .ok_or_else(|| bad("spend_public_hex isn't a point"))?;
+    let view_point = CompressedPoint::from(view_pub)
+        .decompress()
+        .ok_or_else(|| bad("view_public_hex isn't a point"))?;
+    let address =
+        MoneroAddress::new(app.scanner.config.network, AddressType::Legacy, spend_point, view_point).to_string();
     match crypto::check_login(app.scanner.config.network, &address, &view_key) {
         Ok(_) => Ok(json!({ "address": address })),
         Err(e) => Ok(json!({ "error": e.to_string() })),

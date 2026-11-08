@@ -9,8 +9,8 @@ mod daemon;
 mod db;
 mod decoys;
 mod error;
-mod rest;
 mod lanes;
+mod rest;
 mod scanner;
 
 use std::net::SocketAddr;
@@ -176,7 +176,13 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(args) => serve(args).await,
         Command::Admin { command } => admin(command),
-        Command::Replay { fixture, accounts, lookahead, blocks, cache_dir } => {
+        Command::Replay {
+            fixture,
+            accounts,
+            lookahead,
+            blocks,
+            cache_dir,
+        } => {
             if let Some(dir) = cache_dir {
                 std::fs::create_dir_all(&dir)?;
                 monokulo_8ar::set_cache_dir(dir);
@@ -189,14 +195,28 @@ async fn main() -> anyhow::Result<()> {
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let db = Arc::new(Db::open(&args.db).with_context(|| format!("opening {}", args.db.display()))?);
     let daemon = Daemon::new(&args.daemon)?;
-    let info = daemon.info().await.with_context(|| format!("asking {} for get_info", args.daemon))?;
-    let network = crypto::network_from_daemon(&info.nettype).with_context(|| format!("the node's network is {:?}", info.nettype))?;
+    let info = daemon
+        .info()
+        .await
+        .with_context(|| format!("asking {} for get_info", args.daemon))?;
+    let network = crypto::network_from_daemon(&info.nettype)
+        .with_context(|| format!("the node's network is {:?}", info.nettype))?;
     if let Some(wanted) = args.network {
         if wanted != network {
-            bail!("the node is on {} but --network asks for {}", crypto::network_name(network), crypto::network_name(wanted));
+            bail!(
+                "the node is on {} but --network asks for {}",
+                crypto::network_name(network),
+                crypto::network_name(wanted)
+            );
         }
     }
-    tracing::info!("node {} on {} at height {} ({})", args.daemon, crypto::network_name(network), info.height, info.version);
+    tracing::info!(
+        "node {} on {} at height {} ({})",
+        args.daemon,
+        crypto::network_name(network),
+        info.height,
+        info.version
+    );
 
     // The GPU starts in the background; until it's ready (or if it can't be
     // used) every block is scanned with monero-oxide.
@@ -219,7 +239,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let scanner = Scanner::new(
         db.clone(),
         daemon.clone(),
-        ScanConfig { network, lookahead: args.lookahead, interval: Duration::from_secs(args.scan_interval.max(1)), lanes },
+        ScanConfig {
+            network,
+            lookahead: args.lookahead,
+            interval: Duration::from_secs(args.scan_interval.max(1)),
+            lanes,
+        },
     );
     let app = Arc::new(App {
         db,
@@ -239,18 +264,24 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let scan_task = tokio::spawn(scanner.run());
 
-    let wallet = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("listening on {}", args.listen))?;
+    let wallet = tokio::net::TcpListener::bind(args.listen)
+        .await
+        .with_context(|| format!("listening on {}", args.listen))?;
     tracing::info!("wallet API on http://{}", args.listen);
     let wallet_task = tokio::spawn(axum::serve(wallet, rest::wallet_router(app.clone())).into_future());
 
     let admin_task = match args.admin_listen {
         Some(addr) => {
-            let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("listening on {addr}"))?;
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("listening on {addr}"))?;
             if app.config.admin_auth && app.db.admin_keys()?.is_empty() {
                 tracing::warn!("admin API on but no admin key yet: run `monokulo-lws admin create-key`");
             }
             tracing::info!("admin API on http://{addr}");
-            Some(tokio::spawn(axum::serve(listener, rest::admin_router(app.clone())).into_future()))
+            Some(tokio::spawn(
+                axum::serve(listener, rest::admin_router(app.clone())).into_future(),
+            ))
         }
         None => None,
     };
@@ -276,7 +307,13 @@ fn admin(command: AdminCommand) -> anyhow::Result<()> {
             db.add_admin_key(&key)?;
             println!("{}", hex::encode(key));
         }
-        AdminCommand::AddAccount { db, network, address, view_key, start_height } => {
+        AdminCommand::AddAccount {
+            db,
+            network,
+            address,
+            view_key,
+            start_height,
+        } => {
             let db = Db::open(&db)?;
             let key = daemon::hex32(&view_key).context("the view key must be 64 hex characters")?;
             let checked = crypto::check_login(network, &address, &key)?;

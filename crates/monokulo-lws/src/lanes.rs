@@ -52,20 +52,37 @@ impl Plan {
     /// its height (it rides along unscanned until the cursor passes it);
     /// otherwise it waits for the next call. Returns the lanes opened.
     pub fn place(&mut self, behind: &[(i64, u64)], most: usize, join: Join) -> Vec<u64> {
-        let mut behind: Vec<(i64, u64)> = behind.iter().copied().filter(|(a, _)| self.owner(*a).is_none()).collect();
+        let mut behind: Vec<(i64, u64)> = behind
+            .iter()
+            .copied()
+            .filter(|(a, _)| self.owner(*a).is_none())
+            .collect();
         behind.sort_by_key(|&(a, h)| (h, a));
         let mut opened = vec![];
         let mut at = 0;
         while at < behind.len() {
             let height = behind[at].1;
-            let group: BTreeSet<i64> = behind[at..].iter().take_while(|(_, h)| *h == height).map(|(a, _)| *a).collect();
+            let group: BTreeSet<i64> = behind[at..]
+                .iter()
+                .take_while(|(_, h)| *h == height)
+                .map(|(a, _)| *a)
+                .collect();
             at += group.len();
             if self.lanes.len() < most {
                 self.next_id += 1;
-                self.lanes.push(Lane { id: self.next_id, accounts: group, cursor: height, ready: false });
+                self.lanes.push(Lane {
+                    id: self.next_id,
+                    accounts: group,
+                    cursor: height,
+                    ready: false,
+                });
                 opened.push(self.next_id);
             } else if join == Join::Follow
-                && let Some(lane) = self.lanes.iter_mut().filter(|l| !l.ready && l.cursor <= height).max_by_key(|l| l.cursor)
+                && let Some(lane) = self
+                    .lanes
+                    .iter_mut()
+                    .filter(|l| !l.ready && l.cursor <= height)
+                    .max_by_key(|l| l.cursor)
             {
                 lane.accounts.extend(group);
             }
@@ -77,7 +94,9 @@ impl Plan {
     /// cursor, so is ready to merge and should fetch nothing more.
     pub fn reached(&mut self, id: u64, cursor: u64) -> bool {
         let live = self.live.unwrap_or(u64::MAX);
-        let Some(lane) = self.lanes.iter_mut().find(|l| l.id == id) else { return false };
+        let Some(lane) = self.lanes.iter_mut().find(|l| l.id == id) else {
+            return false;
+        };
         lane.cursor = cursor;
         lane.ready = cursor >= live;
         lane.ready
@@ -129,7 +148,10 @@ mod tests {
     use super::*;
 
     fn plan(live: u64) -> Plan {
-        Plan { live: Some(live), ..Plan::default() }
+        Plan {
+            live: Some(live),
+            ..Plan::default()
+        }
     }
 
     #[test]
@@ -137,18 +159,29 @@ mod tests {
         let mut p = plan(1000);
         let opened = p.place(&[(1, 100), (2, 500), (3, 100)], 2, Join::Follow);
         assert_eq!(opened, vec![1, 2]);
-        assert_eq!(p.lane(1).unwrap().accounts, BTreeSet::from([1, 3]), "one height, one lane");
+        assert_eq!(
+            p.lane(1).unwrap().accounts,
+            BTreeSet::from([1, 3]),
+            "one height, one lane"
+        );
         assert_eq!(p.lane(1).unwrap().cursor, 100);
         assert_eq!(p.lane(2).unwrap().accounts, BTreeSet::from([2]));
         assert_eq!(p.owner(3), Some(1));
-        assert_eq!(p.place(&[(1, 100)], 2, Join::Follow), Vec::<u64>::new(), "already in a lane");
+        assert_eq!(
+            p.place(&[(1, 100)], 2, Join::Follow),
+            Vec::<u64>::new(),
+            "already in a lane"
+        );
     }
 
     #[test]
     fn with_follow_a_late_account_joins_the_lane_nearest_below() {
         let mut p = plan(1000);
         p.place(&[(1, 100), (2, 400)], 2, Join::Follow);
-        assert!(p.place(&[(3, 450), (4, 300), (5, 50)], 2, Join::Follow).is_empty(), "no room for a new lane");
+        assert!(
+            p.place(&[(3, 450), (4, 300), (5, 50)], 2, Join::Follow).is_empty(),
+            "no room for a new lane"
+        );
         assert_eq!(p.owner(3), Some(2), "450 rides with the lane at 400");
         assert_eq!(p.owner(4), Some(1), "300 rides with the lane at 100");
         assert_eq!(p.owner(5), None, "below every cursor: it waits");
@@ -195,7 +228,10 @@ mod tests {
         p.place(&[(1, 100)], 1, Join::Follow);
         assert!(p.reached(1, 1000));
         p.advance(990);
-        assert!(p.lane(1).unwrap().ready, "its accounts were rewound too; the next step says");
+        assert!(
+            p.lane(1).unwrap().ready,
+            "its accounts were rewound too; the next step says"
+        );
         assert!(p.reached(1, 990));
         assert_eq!(p.merge_ready(), vec![1]);
     }

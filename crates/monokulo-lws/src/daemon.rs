@@ -98,7 +98,9 @@ impl Daemon {
     pub fn new(url: &str) -> Result<Daemon> {
         let base = url.trim_end_matches('/').to_string();
         if !(base.starts_with("http://") || base.starts_with("https://")) {
-            return Err(Error::Internal(format!("daemon URL must start with http:// or https://: {url}")));
+            return Err(Error::Internal(format!(
+                "daemon URL must start with http:// or https://: {url}"
+            )));
         }
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
@@ -130,24 +132,44 @@ impl Daemon {
         }
         let bytes = response.bytes().await?;
         if bytes.len() > limit {
-            return Err(Error::Daemon(format!("{route}: response of {} bytes is too large", bytes.len())));
+            return Err(Error::Daemon(format!(
+                "{route}: response of {} bytes is too large",
+                bytes.len()
+            )));
         }
         Ok(bytes.to_vec())
     }
 
     async fn rpc<T: for<'de> Deserialize<'de>>(&self, route: &str, params: Value) -> Result<T> {
-        let body = self.post(route, serde_json::to_vec(&params).expect("json"), true, MAX_JSON_RESPONSE).await?;
+        let body = self
+            .post(
+                route,
+                serde_json::to_vec(&params).expect("json"),
+                true,
+                MAX_JSON_RESPONSE,
+            )
+            .await?;
         serde_json::from_slice(&body).map_err(|e| Error::Daemon(format!("{route}: {e}")))
     }
 
     async fn json_rpc<T: for<'de> Deserialize<'de>>(&self, method: &str, params: Value) -> Result<T> {
         let request = json!({ "jsonrpc": "2.0", "id": "0", "method": method, "params": params });
-        let body = self.post("json_rpc", serde_json::to_vec(&request).expect("json"), true, MAX_JSON_RESPONSE).await?;
-        let response: JsonRpcResponse<T> = serde_json::from_slice(&body).map_err(|e| Error::Daemon(format!("{method}: {e}")))?;
+        let body = self
+            .post(
+                "json_rpc",
+                serde_json::to_vec(&request).expect("json"),
+                true,
+                MAX_JSON_RESPONSE,
+            )
+            .await?;
+        let response: JsonRpcResponse<T> =
+            serde_json::from_slice(&body).map_err(|e| Error::Daemon(format!("{method}: {e}")))?;
         if let Some(error) = response.error {
             return Err(Error::Daemon(format!("{method}: {error}")));
         }
-        response.result.ok_or_else(|| Error::Daemon(format!("{method}: no result")))
+        response
+            .result
+            .ok_or_else(|| Error::Daemon(format!("{method}: no result")))
     }
 
     pub async fn info(&self) -> Result<Info> {
@@ -164,7 +186,9 @@ impl Daemon {
         struct R {
             block_header: Header,
         }
-        let r: R = self.json_rpc("get_block_header_by_height", json!({ "height": height })).await?;
+        let r: R = self
+            .json_rpc("get_block_header_by_height", json!({ "height": height }))
+            .await?;
         hex32(&r.block_header.hash).ok_or_else(|| Error::Daemon("get_block_header_by_height: bad hash".into()))
     }
 
@@ -192,9 +216,16 @@ impl Daemon {
                 json!({ "amounts": [0], "cumulative": true, "from_height": 0, "binary": false, "compress": false }),
             )
             .await?;
-        let e = r.distributions.into_iter().next().ok_or_else(|| Error::Daemon("get_output_distribution: empty".into()))?;
+        let e = r
+            .distributions
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Daemon("get_output_distribution: empty".into()))?;
         let cumulative = e.distribution.into_iter().map(|d| d + e.base).collect();
-        Ok(Distribution { start_height: e.start_height, cumulative })
+        Ok(Distribution {
+            start_height: e.start_height,
+            cumulative,
+        })
     }
 
     /// Keys, commitments and lock state for RingCT outputs by global index.
@@ -207,7 +238,9 @@ impl Daemon {
             status: String,
         }
         let outputs: Vec<Value> = indexes.iter().map(|i| json!({ "amount": 0, "index": i })).collect();
-        let r: R = self.rpc("get_outs", json!({ "outputs": outputs, "get_txid": false })).await?;
+        let r: R = self
+            .rpc("get_outs", json!({ "outputs": outputs, "get_txid": false }))
+            .await?;
         if r.status != "OK" {
             return Err(Error::Daemon(format!("get_outs: {}", r.status)));
         }
@@ -218,7 +251,11 @@ impl Daemon {
     }
 
     pub async fn send_raw(&self, tx_hex: &str) -> Result<SendResult> {
-        self.rpc("send_raw_transaction", json!({ "tx_as_hex": tx_hex, "do_not_relay": false })).await
+        self.rpc(
+            "send_raw_transaction",
+            json!({ "tx_as_hex": tx_hex, "do_not_relay": false }),
+        )
+        .await
     }
 
     pub async fn pool_hashes(&self) -> Result<Vec<[u8; 32]>> {
@@ -250,11 +287,17 @@ impl Daemon {
             return Ok(vec![]);
         }
         let hex_hashes: Vec<String> = hashes.iter().map(hex::encode).collect();
-        let r: R = self.rpc("get_transactions", json!({ "txs_hashes": hex_hashes, "prune": true })).await?;
+        let r: R = self
+            .rpc("get_transactions", json!({ "txs_hashes": hex_hashes, "prune": true }))
+            .await?;
         let mut out = vec![];
         for tx in r.txs {
             let Some(hash) = hex32(&tx.tx_hash) else { continue };
-            let blob = if tx.pruned_as_hex.is_empty() { &tx.as_hex } else { &tx.pruned_as_hex };
+            let blob = if tx.pruned_as_hex.is_empty() {
+                &tx.as_hex
+            } else {
+                &tx.pruned_as_hex
+            };
             let bytes = hex::decode(blob).map_err(|e| Error::Daemon(format!("get_transactions: {e}")))?;
             let parsed = Transaction::<Pruned>::read(&mut bytes.as_slice())
                 .map_err(|e| Error::Daemon(format!("get_transactions: transaction: {e}")))?;
@@ -268,7 +311,9 @@ impl Daemon {
     /// first RingCT output index. The node may send fewer than asked.
     pub async fn blocks(&self, start: u64, count: u64) -> Result<Vec<Fetched>> {
         let start = start.max(1);
-        let response = self.post("get_blocks.bin", request(start, count), false, MAX_BLOCKS_RESPONSE).await?;
+        let response = self
+            .post("get_blocks.bin", request(start, count), false, MAX_BLOCKS_RESPONSE)
+            .await?;
         parse(&response)
     }
 }
@@ -416,7 +461,14 @@ fn parse(response: &[u8]) -> Result<Vec<Fetched>> {
             indexes = &indexes[outputs..];
         }
         let first_ringct = first_indexes.iter().flatten().next().copied();
-        res.push(Fetched { block: ScannableBlock { block, transactions, output_index_for_first_ringct_output: first_ringct }, first_indexes });
+        res.push(Fetched {
+            block: ScannableBlock {
+                block,
+                transactions,
+                output_index_for_first_ringct_output: first_ringct,
+            },
+            first_indexes,
+        });
     }
     if !indexes.is_empty() {
         return Err(invalid("get_blocks.bin sent more output indexes than outputs"));

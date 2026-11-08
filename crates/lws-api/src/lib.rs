@@ -39,7 +39,9 @@ impl<'de> Deserialize<'de> for Amount {
                 f.write_str("a decimal string or an unsigned integer")
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Amount, E> {
-                v.parse().map(Amount).map_err(|_| E::custom(format!("not an unsigned decimal: {v:?}")))
+                v.parse()
+                    .map(Amount)
+                    .map_err(|_| E::custom(format!("not an unsigned decimal: {v:?}")))
             }
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Amount, E> {
                 Ok(Amount(v))
@@ -99,7 +101,11 @@ impl<'de, const N: usize> Deserialize<'de> for Hex<N> {
         let s = <&str>::deserialize(d)?;
         let mut out = [0u8; N];
         if s.len() != 2 * N {
-            return Err(de::Error::custom(format!("expected {} hex characters, got {}", 2 * N, s.len())));
+            return Err(de::Error::custom(format!(
+                "expected {} hex characters, got {}",
+                2 * N,
+                s.len()
+            )));
         }
         hex::decode_to_slice(s, &mut out).map_err(de::Error::custom)?;
         Ok(Hex(out))
@@ -141,7 +147,12 @@ impl Timestamp {
         let days = (secs / 86_400) as i64;
         let rem = secs % 86_400;
         let (y, m, d) = civil_from_days(days);
-        Timestamp(format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60))
+        Timestamp(format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            rem / 3600,
+            (rem % 3600) / 60,
+            rem % 60
+        ))
     }
 }
 
@@ -227,6 +238,13 @@ pub struct ReceivedOutput {
     /// The unencrypted RingCT mask. Absent for a non-RingCT output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rct: Option<Hex32>,
+    /// The output's Pedersen commitment as it is on the chain (the
+    /// transaction's RingCT base `outPk`), so a client can check that
+    /// `mask·G + amount·H` is what the chain holds and not trust the
+    /// server's `amount` and `rct`. Absent for a non-RingCT output, and
+    /// from servers that do not serve it (monero-lws).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commitment: Option<Hex32>,
     pub recipient: AddressMeta,
 }
 
@@ -241,6 +259,10 @@ pub struct Transaction {
     pub total_received: Amount,
     /// The sum of the candidate spends' amounts.
     pub total_sent: Amount,
+    /// The fee the transaction paid, as monero-lws serves it. Absent from
+    /// servers that do not serve it, and for a coinbase transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<Amount>,
     pub unlock_time: u64,
     /// Absent while in the mempool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -584,7 +606,10 @@ mod tests {
 
     #[test]
     fn amounts_are_strings_but_read_numbers() {
-        assert_eq!(serde_json::to_string(&Amount(u64::MAX)).unwrap(), "\"18446744073709551615\"");
+        assert_eq!(
+            serde_json::to_string(&Amount(u64::MAX)).unwrap(),
+            "\"18446744073709551615\""
+        );
         assert_eq!(serde_json::from_str::<Amount>("\"12\"").unwrap(), Amount(12));
         assert_eq!(serde_json::from_str::<Amount>("12").unwrap(), Amount(12));
         assert!(serde_json::from_str::<Amount>("\"-1\"").is_err());
@@ -622,6 +647,7 @@ mod tests {
     #[test]
     fn mempool_transaction_leaves_out_height_and_time() {
         let t = Transaction {
+            fee: None,
             id: 1,
             hash: Hex([1; 32]),
             timestamp: None,
