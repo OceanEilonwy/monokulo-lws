@@ -2,6 +2,8 @@
 //! distribution the way wallet2 does (a gamma over output age), then
 //! fetched from the daemon and kept only if unlocked.
 
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -20,8 +22,10 @@ const FRESH_FOR: Duration = Duration::from_secs(120);
 /// Rounds of picking and asking the daemon before giving up on a ring.
 const MAX_ROUNDS: usize = 8;
 
+/// The distribution, fetched at most every two minutes and shared, not
+/// copied, between requests (on mainnet it is millions of entries).
 pub struct Picker {
-    distribution: Option<(Instant, Distribution)>,
+    distribution: tokio::sync::Mutex<Option<(Instant, Arc<Distribution>)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,86 +35,90 @@ pub struct Member {
     pub commitment: [u8; 32],
 }
 
+/// Outputs asked of the node in one `get_outs` (a restricted node takes up
+/// to 5,000).
+const OUTS_PER_REQUEST: usize = 1_000;
+
 impl Picker {
     pub fn new() -> Picker {
-        Picker { distribution: None }
+        Picker {
+            distribution: tokio::sync::Mutex::new(None),
+        }
     }
 
-    async fn distribution(&mut self, daemon: &Daemon) -> Result<&Distribution> {
-        let stale = self
-            .distribution
-            .as_ref()
-            .map(|(at, _)| at.elapsed() > FRESH_FOR)
-            .unwrap_or(true);
-        if stale {
-            let d = daemon.output_distribution().await?;
-            if d.cumulative.len() < SPENDABLE_AGE as usize + 2 {
-                return Err(Error::Daemon("the output distribution is too short".into()));
-            }
-            self.distribution = Some((Instant::now(), d));
+    async fn distribution(&self, daemon: &Daemon) -> Result<Arc<Distribution>> {
+        let mut cached = self.distribution.lock().await;
+        if let Some((at, d)) = cached.as_ref()
+            && at.elapsed() <= FRESH_FOR
+        {
+            return Ok(d.clone());
         }
-        Ok(&self.distribution.as_ref().expect("just set").1)
+        let d = daemon.output_distribution().await?;
+        if d.cumulative.len() < SPENDABLE_AGE as usize + 2 {
+            return Err(Error::Daemon("the output distribution is too short".into()));
+        }
+        let d = Arc::new(d);
+        *cached = Some((Instant::now(), d.clone()));
+        Ok(d)
     }
 
     /// `rings` rings of `count` unlocked RingCT outputs each, every ring
     /// drawn afresh. A ring short of members means the chain hasn't enough.
-    pub async fn rings(&mut self, daemon: &Daemon, count: usize, rings: usize) -> Result<Vec<Vec<Member>>> {
-        let d = self.distribution(daemon).await?.clone();
-        let mut out = Vec::with_capacity(rings);
-        for _ in 0..rings {
-            out.push(ring(&d, daemon, count).await?);
+    /// Each round asks the node once for every ring still short, so a
+    /// request costs a few `get_outs` however many rings it wants.
+    pub async fn rings(&self, daemon: &Daemon, count: usize, rings: usize) -> Result<Vec<Vec<Member>>> {
+        let d = self.distribution(daemon).await?;
+        let mut out: Vec<Vec<Member>> = vec![vec![]; rings];
+        let mut tried: Vec<HashSet<u64>> = vec![HashSet::new(); rings];
+        for _ in 0..MAX_ROUNDS {
+            let asked: Vec<(usize, u64)> = {
+                // The thread's generator doesn't cross an await.
+                let mut rng = rand::thread_rng();
+                let mut asked = vec![];
+                for (ring, members) in out.iter().enumerate() {
+                    if members.len() >= count {
+                        continue;
+                    }
+                    let wanted = (count - members.len()) * 2 + 4;
+                    let mut picked = 0;
+                    for _ in 0..wanted * 4 {
+                        if picked >= wanted {
+                            break;
+                        }
+                        if let Some(i) = pick(&d, &mut rng)
+                            && tried[ring].insert(i)
+                        {
+                            asked.push((ring, i));
+                            picked += 1;
+                        }
+                    }
+                }
+                asked
+            };
+            if asked.is_empty() {
+                break;
+            }
+            for chunk in asked.chunks(OUTS_PER_REQUEST) {
+                let indexes: Vec<u64> = chunk.iter().map(|(_, i)| *i).collect();
+                let outs = daemon.outs(&indexes).await?;
+                for (&(ring, index), o) in chunk.iter().zip(outs) {
+                    if out[ring].len() >= count || !o.unlocked {
+                        continue;
+                    }
+                    let (Some(key), Some(commitment)) = (crate::daemon::hex32(&o.key), crate::daemon::hex32(&o.mask))
+                    else {
+                        continue;
+                    };
+                    out[ring].push(Member {
+                        global_index: index,
+                        public_key: key,
+                        commitment,
+                    });
+                }
+            }
         }
         Ok(out)
     }
-}
-
-async fn ring(d: &Distribution, daemon: &Daemon, count: usize) -> Result<Vec<Member>> {
-    let mut members: Vec<Member> = vec![];
-    let mut tried = std::collections::HashSet::new();
-    for _ in 0..MAX_ROUNDS {
-        if members.len() >= count {
-            break;
-        }
-        let wanted = (count - members.len()) * 2 + 4;
-        let picks: Vec<u64> = {
-            // The thread's generator doesn't cross an await.
-            let mut rng = rand::thread_rng();
-            let mut picks = vec![];
-            for _ in 0..wanted * 4 {
-                if picks.len() >= wanted {
-                    break;
-                }
-                if let Some(i) = pick(d, &mut rng) {
-                    if tried.insert(i) {
-                        picks.push(i);
-                    }
-                }
-            }
-            picks
-        };
-        if picks.is_empty() {
-            break;
-        }
-        let outs = daemon.outs(&picks).await?;
-        for (index, out) in picks.iter().zip(outs) {
-            if !out.unlocked {
-                continue;
-            }
-            let (Some(key), Some(commitment)) = (crate::daemon::hex32(&out.key), crate::daemon::hex32(&out.mask))
-            else {
-                continue;
-            };
-            members.push(Member {
-                global_index: *index,
-                public_key: key,
-                commitment,
-            });
-            if members.len() >= count {
-                break;
-            }
-        }
-    }
-    Ok(members)
 }
 
 /// One global index, gamma-distributed over output age as wallet2's
