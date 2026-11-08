@@ -244,6 +244,64 @@ the monero-oxide fan-out) stays Fob's.
 Still planned: phase B (the view-tag Keccak, and returning only tag hits,
 on the GPU); incremental keyring updates.
 
+## Proofs of inclusion: what is kept, and what it costs
+
+Each mined transaction that pays an account is served with a proof (README,
+`docs/security.md`). What it is made of is kept at scan time, in the batch's
+SQLite transaction, and only where an account is paid:
+
+- `blocks_kept` (height, hash, blob): the block blob exactly as
+  `get_blocks.bin` sent it, for every block holding a transaction that pays
+  an account (the miner's included). One row however many accounts the
+  block pays.
+- `txs_kept` (hash, height, prefix, rct_base, prunable_hash): the pruned
+  transaction as the node sent it, split where its prefix ends, for every
+  transaction other than a miner's that pays an account. Again one row
+  however many accounts it pays.
+
+The reader keeps each block's and transaction's raw bytes beside the parsed
+ones (`daemon::RawBlock`), so the stored bytes hash to the chain's hashes
+rather than to a serialisation made again. A transaction is split only when
+its parts hash to the hash its block lists. `get_blocks.bin` comes without
+prunable hashes (all zeros, monero-project/monero#10120: the mainnet node
+the reader's fixture came from and the stagenet node the live check used
+both send zeros), so the row is written with `prunable_hash` empty and
+`Scanner::complete_proofs` fills it in after the batch from
+`get_transactions` (100 transactions a request, as a restricted node
+allows), keeping it only if the parts then hash to the transaction's hash.
+A row the node can't complete is dropped; a node that fails leaves the row
+for the next batch. Until then the transaction is served without a proof.
+
+A reorg drops both tables' rows from the fork on, with the outputs, spends
+and transactions; a rescan drops the rows from its height on that no
+account's transactions still need.
+
+Candidate spends are not given proofs: an invented one can't carry the key
+image the client computes, and since each output is a ring member about as
+often as there are members in a ring (16; inputs and outputs are about as
+many), an account has about sixteen candidate spends for each output it
+receives, most in a block that pays it nothing, so proving them would
+multiply the cost below by about sixteen.
+
+Sizes, from the mainnet fixture (`get_blocks.bin` for 3,300,000 to
+3,300,002) and the stagenet live check:
+
+| What | Bytes |
+|---|---|
+| Block: header and miner transaction | about 150 |
+| Block: each other transaction | 32 (its hash) |
+| A mainnet block of 36, 55 transactions | 1,302, 1,910 |
+| A typical kept block (30 to 300 transactions) | 1 to 10 KB |
+| A pruned transaction, 1 or 2 inputs and 2 outputs | 270 to 300 (prefix about 190, RingCT base about 85) |
+| A pruned transaction with many inputs | up to a few KB (about 100 a 16-member input) |
+| Per kept row, besides | about 70 (hashes, height, SQLite's own) |
+
+So an account that receives a payment costs about 2 to 10 KB more for it,
+and less when the block or transaction is shared with another account. A
+shop with 10,000 payments a year keeps about 20 to 100 MB a year for
+proofs. `/get_address_txs` serves each block once per transaction, as hex,
+so the response grows by about twice those sizes per paying transaction.
+
 ## Order of work
 
 1. `monokulo-8ar`: the keyring API, the digits buffer and the two push
