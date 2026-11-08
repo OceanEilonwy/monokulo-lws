@@ -328,6 +328,40 @@ impl Daemon {
         Ok(out)
     }
 
+    /// The prunable hash of each of these mined transactions the node has,
+    /// by transaction hash (`get_transactions`, pruned, which sends it where
+    /// `get_blocks.bin` sends zeros).
+    pub async fn prunable_hashes(&self, hashes: &[[u8; 32]]) -> Result<std::collections::HashMap<[u8; 32], [u8; 32]>> {
+        #[derive(Deserialize)]
+        struct Tx {
+            tx_hash: String,
+            #[serde(default)]
+            prunable_hash: String,
+        }
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(default)]
+            txs: Vec<Tx>,
+            #[serde(default)]
+            status: String,
+        }
+        if hashes.is_empty() {
+            return Ok(Default::default());
+        }
+        let hex_hashes: Vec<String> = hashes.iter().map(hex::encode).collect();
+        let r: R = self
+            .rpc("get_transactions", json!({ "txs_hashes": hex_hashes, "prune": true }))
+            .await?;
+        if r.status != "OK" {
+            return Err(Error::Daemon(format!("get_transactions: {}", r.status)));
+        }
+        Ok(r.txs
+            .iter()
+            .filter_map(|t| Some((hex32(&t.tx_hash)?, hex32(&t.prunable_hash)?)))
+            .filter(|(_, p)| *p != [0; 32])
+            .collect())
+    }
+
     /// Up to `count` blocks from `start` (at least 1: monerod ignores a zero
     /// start height), with their pruned transactions and each transaction's
     /// first RingCT output index. The node may send fewer than asked.
@@ -379,6 +413,27 @@ fn checked_cumulative(distribution: Vec<u64>, base: u64) -> Result<Vec<u64>> {
 pub struct Fetched {
     pub block: ScannableBlock,
     pub first_indexes: Vec<Option<u64>>,
+    /// The bytes the node sent, for proofs of inclusion.
+    pub raw: RawBlock,
+}
+
+/// A block's bytes exactly as the node sent them, kept so that a proof of
+/// inclusion hashes to what the chain holds rather than to a serialisation
+/// made again here: the block blob (header, miner transaction, the other
+/// transactions' hashes) and each other transaction pruned, in block order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RawBlock {
+    pub blob: Vec<u8>,
+    pub txs: Vec<RawTx>,
+}
+
+/// A transaction as `get_blocks.bin` sends it pruned: the prefix and the
+/// RingCT base in one blob, and the hash of the prunable part (all zeros
+/// from a node that doesn't send it, monero-project/monero#10120).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawTx {
+    pub pruned: Vec<u8>,
+    pub prunable_hash: [u8; 32],
 }
 
 pub fn hex32(s: &str) -> Option<[u8; 32]> {
@@ -422,7 +477,7 @@ fn request(start: u64, count: u64) -> Vec<u8> {
 /// error, never a panic. monero-epee reads without allocating and
 /// monero-oxide grows its vectors as it reads, so memory follows the bytes
 /// actually sent, which `post` caps.
-fn parse(response: &[u8], max_blocks: usize) -> Result<Vec<Fetched>> {
+pub(crate) fn parse(response: &[u8], max_blocks: usize) -> Result<Vec<Fetched>> {
     let mut epee = Epee::new(response).map_err(epee_err)?;
     let mut fields = epee.entry().map_err(epee_err)?.fields().map_err(epee_err)?;
     let mut blocks = vec![];
@@ -441,31 +496,50 @@ fn parse(response: &[u8], max_blocks: usize) -> Result<Vec<Fetched>> {
                     let mut entry = entry.map_err(epee_err)?.fields().map_err(epee_err)?;
                     let mut block = None;
                     let mut transactions = vec![];
+                    let mut raw = RawBlock::default();
                     while let Some(field) = entry.next() {
                         let (name, value) = field.map_err(epee_err)?;
                         match name.consume() {
                             b"block" => {
-                                let mut bytes = value.to_str().map_err(epee_err)?.consume();
-                                block = Some(Block::read(&mut bytes).map_err(|e| invalid(format!("block: {e:?}")))?);
+                                let bytes = value.to_str().map_err(epee_err)?.consume();
+                                raw.blob = bytes.to_vec();
+                                block =
+                                    Some(Block::read(&mut &bytes[..]).map_err(|e| invalid(format!("block: {e:?}")))?);
                             }
                             b"txs" => {
                                 let mut txs = value.iterate().map_err(epee_err)?;
                                 while let Some(tx) = txs.next() {
                                     let mut tx = tx.map_err(epee_err)?.fields().map_err(epee_err)?;
+                                    let mut pruned = None;
+                                    let mut prunable_hash = [0; 32];
                                     while let Some(field) = tx.next() {
                                         let (name, value) = field.map_err(epee_err)?;
-                                        if name.consume() == b"blob" {
-                                            if transactions.len() >= MAX_TXS_PER_BLOCK {
-                                                return Err(invalid(
-                                                    "get_blocks.bin: too many transactions in a block",
-                                                ));
+                                        match name.consume() {
+                                            b"blob" => {
+                                                if transactions.len() >= MAX_TXS_PER_BLOCK {
+                                                    return Err(invalid(
+                                                        "get_blocks.bin: too many transactions in a block",
+                                                    ));
+                                                }
+                                                let bytes = value.to_str().map_err(epee_err)?.consume();
+                                                transactions.push(
+                                                    Transaction::<Pruned>::read(&mut &bytes[..])
+                                                        .map_err(|e| invalid(format!("transaction: {e:?}")))?,
+                                                );
+                                                pruned = Some(bytes.to_vec());
                                             }
-                                            let mut bytes = value.to_str().map_err(epee_err)?.consume();
-                                            transactions.push(
-                                                Transaction::<Pruned>::read(&mut bytes)
-                                                    .map_err(|e| invalid(format!("transaction: {e:?}")))?,
-                                            );
+                                            b"prunable_hash" => {
+                                                let bytes = value.to_str().map_err(epee_err)?.consume();
+                                                // Anything but 32 bytes is as good as none.
+                                                if let Ok(hash) = <[u8; 32]>::try_from(bytes) {
+                                                    prunable_hash = hash;
+                                                }
+                                            }
+                                            _ => {}
                                         }
+                                    }
+                                    if let Some(pruned) = pruned {
+                                        raw.txs.push(RawTx { pruned, prunable_hash });
                                     }
                                 }
                             }
@@ -473,10 +547,10 @@ fn parse(response: &[u8], max_blocks: usize) -> Result<Vec<Fetched>> {
                         }
                     }
                     let block = block.ok_or_else(|| invalid("a block entry without its block"))?;
-                    if block.transactions.len() != transactions.len() {
+                    if block.transactions.len() != transactions.len() || raw.txs.len() != transactions.len() {
                         return Err(invalid("a block's transactions are missing"));
                     }
-                    blocks.push((block, transactions));
+                    blocks.push((block, transactions, raw));
                 }
             }
             b"output_indices" => {
@@ -520,7 +594,7 @@ fn parse(response: &[u8], max_blocks: usize) -> Result<Vec<Fetched>> {
     // block's first.
     let mut indexes = output_indexes.as_slice();
     let mut res = Vec::with_capacity(blocks.len());
-    for (block, transactions) in blocks {
+    for (block, transactions, raw) in blocks {
         let miner: Transaction<Pruned> = block.miner_transaction().clone().into();
         let mut first_indexes = Vec::with_capacity(transactions.len() + 1);
         for tx in std::iter::once(&miner).chain(&transactions) {
@@ -540,6 +614,7 @@ fn parse(response: &[u8], max_blocks: usize) -> Result<Vec<Fetched>> {
                 output_index_for_first_ringct_output: first_ringct,
             },
             first_indexes,
+            raw,
         });
     }
     if !indexes.is_empty() {
