@@ -4,6 +4,8 @@
 //! answers the light wallet REST API; `monokulo-lws admin ...` manages
 //! accounts and keys straight in the database.
 
+#[cfg(test)]
+mod correctness;
 mod crypto;
 mod daemon;
 mod db;
@@ -12,6 +14,8 @@ mod error;
 mod lanes;
 mod rest;
 mod scanner;
+#[cfg(test)]
+mod testkit;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -201,14 +205,14 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_context(|| format!("asking {} for get_info", args.daemon))?;
     let network = crypto::network_from_daemon(&info.nettype)
         .with_context(|| format!("the node's network is {:?}", info.nettype))?;
-    if let Some(wanted) = args.network {
-        if wanted != network {
-            bail!(
-                "the node is on {} but --network asks for {}",
-                crypto::network_name(network),
-                crypto::network_name(wanted)
-            );
-        }
+    if let Some(wanted) = args.network
+        && wanted != network
+    {
+        bail!(
+            "the node is on {} but --network asks for {}",
+            crypto::network_name(network),
+            crypto::network_name(wanted)
+        );
     }
     tracing::info!(
         "node {} on {} at height {} ({})",
