@@ -14,8 +14,10 @@ use zeroize::Zeroizing;
 use crate::error::{Error, Result, bad};
 
 /// A login checked: the address parses on this network, is a primary
-/// address, and the view key is its view key.
-#[derive(Clone, Debug)]
+/// address, and the view key is its view key. Its copy of the view key is
+/// wiped when it goes; `Debug` leaves the key and address out
+/// (`crate::redact`).
+#[derive(Clone)]
 pub struct Checked {
     pub address: String,
     pub spend_pub: [u8; 32],
@@ -40,6 +42,12 @@ pub fn check_login(network: Network, address: &str, view_key: &[u8; 32]) -> Resu
         view_pub,
         view_key: *view_key,
     })
+}
+
+impl Drop for Checked {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.view_key);
+    }
 }
 
 #[allow(non_snake_case)]

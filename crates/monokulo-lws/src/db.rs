@@ -4,7 +4,8 @@
 //! stands, every output received, every candidate spend (an input whose ring
 //! holds one of the account's outputs), the transactions those came in, and
 //! the subaddress ranges to watch. Globally: recent block hashes (to notice a
-//! reorg), pending account and import requests, and admin keys.
+//! reorg), pending account and import requests, and admin keys (hashed, see
+//! `admin_keys`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -134,7 +135,8 @@ impl Status {
     }
 }
 
-#[derive(Clone, Debug)]
+/// `Debug` leaves out the view key and the address (`crate::redact`).
+#[derive(Clone)]
 pub struct Account {
     pub id: i64,
     pub address: String,
@@ -148,8 +150,9 @@ pub struct Account {
     pub generated_locally: bool,
 }
 
-/// A new account or a pending request, before it has a row.
-#[derive(Clone, Debug)]
+/// A new account or a pending request, before it has a row. `Debug` leaves
+/// out the view key and the address (`crate::redact`).
+#[derive(Clone)]
 pub struct NewAccount {
     pub address: String,
     pub view_key: [u8; 32],
@@ -640,28 +643,6 @@ impl Db {
                         height: r.get::<_, i64>(4)? as u64,
                     })
                 })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-    }
-
-    // ---- admin ----
-
-    pub fn add_admin_key(&self, key: &[u8; 32]) -> Result<()> {
-        self.write(|tx| {
-            tx.execute(
-                "INSERT OR IGNORE INTO admin_keys (key, created) VALUES (?1, ?2)",
-                params![key.as_slice(), now() as i64],
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn admin_keys(&self) -> Result<Vec<[u8; 32]>> {
-        self.read(|c| {
-            let mut st = c.prepare("SELECT key FROM admin_keys")?;
-            let rows = st
-                .query_map([], |r| blob32(r.get(0)?))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
