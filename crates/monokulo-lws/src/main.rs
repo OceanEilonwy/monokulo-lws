@@ -17,6 +17,7 @@ mod decoys;
 mod error;
 mod lanes;
 mod limits;
+mod proof;
 mod redact;
 mod rest;
 mod scanner;

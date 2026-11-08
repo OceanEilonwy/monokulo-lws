@@ -20,7 +20,7 @@ use monero_wallet::{
 use tokio::sync::Mutex;
 
 use crate::crypto;
-use crate::daemon::{Daemon, FeeEstimate};
+use crate::daemon::{Daemon, FeeEstimate, RawBlock};
 use crate::db::{Account, Db, NewAccount, ScanWriter, Status};
 use crate::decoys::Picker;
 use crate::lanes::Join;
@@ -218,11 +218,18 @@ impl Tx {
         extra
     }
 
+    /// The transaction, with one input from a ring of a single far-off
+    /// output (nobody's here) when none was given, as a transaction without
+    /// inputs doesn't read.
     pub fn build(&self) -> Transaction<Pruned> {
+        let inputs = match self.inputs.is_empty() {
+            true => vec![ring(&[1 << 40], 0)],
+            false => self.inputs.clone(),
+        };
         Transaction::V2 {
             prefix: TransactionPrefix {
                 additional_timelock: self.unlock,
-                inputs: self.inputs.clone(),
+                inputs,
                 outputs: self.outs.iter().map(|o| o.output.clone()).collect(),
                 extra: self.extra(),
             },
@@ -273,8 +280,9 @@ pub fn ring(members: &[u64], key_image: u8) -> Input {
     }
 }
 
-/// A transaction hash for transaction `i` of block `number`.
-pub fn tx_hash(number: usize, i: usize, salt: u8) -> [u8; 32] {
+/// The prunable hash given transaction `i` of block `number` (the made
+/// transactions carry no prunable part to hash).
+pub fn prunable_hash(number: usize, i: usize, salt: u8) -> [u8; 32] {
     let mut data = b"tx".to_vec();
     data.extend((number as u64).to_le_bytes());
     data.extend((i as u64).to_le_bytes());
@@ -282,13 +290,22 @@ pub fn tx_hash(number: usize, i: usize, salt: u8) -> [u8; 32] {
     keccak256(&data)
 }
 
+/// The hash transaction `i` of block `number` gets: its real hash, from its
+/// prefix, its RingCT base and `prunable_hash`.
+pub fn tx_hash(tx: &Transaction<Pruned>, number: usize, i: usize, salt: u8) -> [u8; 32] {
+    tx.hash_with_prunable_hash(prunable_hash(number, i, salt))
+        .expect("a version 2 transaction")
+}
+
 /// Block `number` after `previous`: `miner`, then `txs`, output indexes from
 /// `first`. Returns the block and its transactions' first output indexes;
 /// the next block's `first` is the last output index plus one, as `next`.
+/// `raw` is the block's bytes, as a node would send them.
 pub struct Made {
     pub block: ScannableBlock,
     pub first_indexes: Vec<Option<u64>>,
     pub next: u64,
+    pub raw: Option<RawBlock>,
 }
 
 pub fn block(
@@ -314,14 +331,21 @@ pub fn block(
         previous,
         nonce: salt as u32,
     };
-    let hashes = (0..txs.len()).map(|i| tx_hash(number, i, salt)).collect();
+    let hashes = txs
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| tx_hash(tx, number, i, salt))
+        .collect();
+    let prunable: Vec<[u8; 32]> = (0..txs.len()).map(|i| prunable_hash(number, i, salt)).collect();
     let block = Block::new(header, miner, hashes).expect("a miner transaction");
+    let block = ScannableBlock {
+        block,
+        transactions: txs,
+        output_index_for_first_ringct_output: first_indexes.iter().flatten().next().copied(),
+    };
     Made {
-        block: ScannableBlock {
-            block,
-            transactions: txs,
-            output_index_for_first_ringct_output: first_indexes.iter().flatten().next().copied(),
-        },
+        raw: Some(crate::proof::raw_of(&block, &prunable)),
+        block,
         first_indexes,
         next,
     }
@@ -341,6 +365,7 @@ pub type HitsFor<'a> = Option<&'a dyn Fn(&Ring, &Batch) -> Vec<monokulo_8ar::Hit
 pub fn write(db: &Db, accounts: &[Account], blocks: Vec<Made>, start: u64, live: bool, hits: HitsFor) {
     let batch = Batch {
         first_indexes: blocks.iter().map(|m| m.first_indexes.clone()).collect(),
+        raw: blocks.iter().map(|m| m.raw.clone()).collect(),
         blocks: blocks.into_iter().map(|m| m.block).collect(),
     };
     let mut slot = None;

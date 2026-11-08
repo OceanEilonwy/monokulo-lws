@@ -230,6 +230,25 @@ pub async fn get_address_info(State(app): State<Arc<App>>, ApiJson(login): ApiJs
     }))
 }
 
+/// A stored proof as the wire carries it: the block, and the pruned parts
+/// for a transaction other than the miner's.
+fn proof_of(row: crate::db::ProofRow) -> Proof {
+    let (tx_prefix, rct_base, prunable_hash) = match row.parts {
+        Some(p) => (
+            Some(HexBytes(p.prefix)),
+            Some(HexBytes(p.rct_base)),
+            p.prunable_hash.map(Hex),
+        ),
+        None => (None, None, None),
+    };
+    Proof {
+        block: HexBytes(row.block),
+        tx_prefix,
+        rct_base,
+        prunable_hash,
+    }
+}
+
 pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<AddressTxs> {
     let account = authorize(&app, &login).await?;
     let chain = chain_height(&app);
@@ -249,6 +268,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
         });
     }
     let mut spends = spends_by_tx(&app, &account, &outputs)?;
+    let mut proofs = app.db.proofs(account.id)?;
     let mut total_received = outputs.values().map(|o| o.amount).fold(0u64, u64::saturating_add);
     let mined: std::collections::HashSet<[u8; 32]> = rows.iter().map(|t| t.hash).collect();
     let mut transactions: Vec<Transaction> = rows
@@ -257,6 +277,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
             let mut receives = receives_by_tx.remove(&t.id).unwrap_or_default();
             receives.sort_by_key(|r| r.index);
             Transaction {
+                proof: proofs.remove(&t.id).map(proof_of),
                 fee: fee_of(t.fee),
                 id: t.id as u64,
                 hash: Hex(t.hash),
@@ -317,6 +338,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
             (None, None) => continue,
         };
         transactions.push(Transaction {
+            proof: None,
             fee: Some(Amount(fee)),
             id: next_id + n as u64,
             hash: Hex(hash),

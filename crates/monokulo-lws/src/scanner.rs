@@ -36,7 +36,7 @@ use monokulo_8ar::{AccountId, Arena, Hit, Keyring};
 use tokio::sync::{Notify, Semaphore};
 
 use crate::crypto;
-use crate::daemon::{Daemon, Fetched};
+use crate::daemon::{Daemon, Fetched, RawBlock};
 use crate::db::{Account, Db, NewOutput, NewTx, OutputRow, ScanWriter, Status};
 use crate::error::{Error, Result};
 use crate::lanes::{Join, Plan};
@@ -289,17 +289,30 @@ impl Ring {
     }
 }
 
-/// What a step scans: the blocks, and each transaction's first RingCT output
-/// index (miner first) for stand-in blocks.
+/// What a step scans: the blocks, each transaction's first RingCT output
+/// index (miner first) for stand-in blocks, and each block's bytes as the
+/// node sent them, kept for proofs where a block pays an account (none for
+/// blocks made rather than fetched, as `replay` makes them: `raw` may be
+/// shorter than `blocks`, or hold `None`).
 pub struct Batch {
     pub blocks: Vec<ScannableBlock>,
     pub first_indexes: Vec<Vec<Option<u64>>>,
+    pub raw: Vec<Option<RawBlock>>,
 }
 
 impl Batch {
     pub fn new(fetched: Vec<Fetched>) -> Batch {
-        let (blocks, first_indexes) = fetched.into_iter().map(|f| (f.block, f.first_indexes)).unzip();
-        Batch { blocks, first_indexes }
+        let mut batch = Batch {
+            blocks: Vec::with_capacity(fetched.len()),
+            first_indexes: Vec::with_capacity(fetched.len()),
+            raw: Vec::with_capacity(fetched.len()),
+        };
+        for f in fetched {
+            batch.blocks.push(f.block);
+            batch.first_indexes.push(f.first_indexes);
+            batch.raw.push(Some(f.raw));
+        }
+        batch
     }
 }
 
@@ -508,6 +521,7 @@ impl Scanner {
                 self.reorg().await?;
                 return Ok(true);
             }
+            self.complete_proofs().await;
             self.scan_pool(&accounts).await?;
             return Ok(false);
         }
@@ -537,6 +551,7 @@ impl Scanner {
             tokio::task::block_in_place(|| self.scan_batch(&mut ring, &self.arenas[0], &accounts, &batch, start, true));
         *self.live_ring.lock().unwrap_or_else(|e| e.into_inner()) = ring;
         result?;
+        self.complete_proofs().await;
         *self.last_block.lock().unwrap_or_else(|e| e.into_inner()) = last;
         let next = start + fetched;
         if self.config.lanes.lanes > 0 {
@@ -670,6 +685,7 @@ impl Scanner {
         }
         let batch = Batch::new(fetched);
         tokio::task::block_in_place(|| self.scan_batch(&mut task.ring, &task.arena, &accounts, &batch, cursor, false))?;
+        self.complete_proofs().await;
         Ok(LaneStep::More)
     }
 
@@ -722,6 +738,50 @@ impl Scanner {
         }
         self.set_status(|s| s.scanner_height = fork);
         Ok(())
+    }
+
+    /// Fills in the prunable hashes `get_blocks.bin` left out (all zeros,
+    /// monero-project/monero#10120) for the transactions kept for proofs,
+    /// from `get_transactions`: a hash the parts hash to the transaction's
+    /// hash with is kept, and a transaction the node doesn't have, or whose
+    /// parts don't hash to it, is dropped. A node that fails leaves them
+    /// pending for the next step; the scan goes on regardless.
+    pub async fn complete_proofs(&self) {
+        if let Err(e) = self.try_complete_proofs().await {
+            tracing::warn!("proofs: {e}");
+        }
+    }
+
+    async fn try_complete_proofs(&self) -> Result<()> {
+        /// Transactions settled in one go, and asked for in one request
+        /// (a restricted node answers at most 100).
+        const AT_ONCE: usize = 1_000;
+        const PER_REQUEST: usize = 100;
+        loop {
+            let pending = self.db.pending_proofs(AT_ONCE)?;
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let mut found = vec![];
+            let mut dropped = vec![];
+            for chunk in pending.chunks(PER_REQUEST) {
+                let hashes: Vec<[u8; 32]> = chunk.iter().map(|p| p.0).collect();
+                let prunable = self.daemon.prunable_hashes(&hashes).await?;
+                for (hash, prefix, rct_base) in chunk {
+                    match prunable.get(hash) {
+                        Some(p) if crate::proof::tx_hash(prefix, rct_base, p) == *hash => found.push((*hash, *p)),
+                        _ => dropped.push(*hash),
+                    }
+                }
+            }
+            if !dropped.is_empty() {
+                tracing::warn!("proofs: {} transactions the node couldn't complete", dropped.len());
+            }
+            self.db.settle_proofs(&found, &dropped)?;
+            if pending.len() < AT_ONCE {
+                return Ok(());
+            }
+        }
     }
 
     /// The highest kept block the daemon still has; its successor is where
@@ -833,6 +893,7 @@ pub fn record_batch(
     }
     for (i, block) in batch.blocks.iter().enumerate() {
         let height = start + i as u64;
+        let raw = batch.raw.get(i).and_then(Option::as_ref);
         if hits.is_some() {
             let mut list = std::mem::take(&mut by_block[i]);
             // Transactions in block order, as the first output with a key counts;
@@ -859,12 +920,14 @@ pub fn record_batch(
                     stand_in(block, &batch.first_indexes[i], hit.tx)
                 };
                 let Some(target) = target else { continue };
-                scan_for(w, ring, lookahead, account, target, block, height, &mut spends)?;
+                let at = Place { block, raw, height };
+                scan_for(w, ring, lookahead, account, target, &at, &mut spends)?;
             }
         } else {
             for account in accounts {
                 if account.scan_height <= height {
-                    scan_for(w, ring, lookahead, account, block.clone(), block, height, &mut spends)?;
+                    let at = Place { block, raw, height };
+                    scan_for(w, ring, lookahead, account, block.clone(), &at, &mut spends)?;
                 }
             }
         }
@@ -882,17 +945,23 @@ pub fn record_batch(
     Ok(())
 }
 
-/// `target` (`block`, or a stand-in for part of it) scanned for `account`,
+/// A block being written: the block, its bytes as the node sent them (if it
+/// was fetched), and its height.
+struct Place<'a> {
+    block: &'a ScannableBlock,
+    raw: Option<&'a RawBlock>,
+    height: u64,
+}
+
+/// `target` (`at.block`, or a stand-in for part of it) scanned for `account`,
 /// and what it receives written.
-#[allow(clippy::too_many_arguments)]
 fn scan_for(
     w: &ScanWriter,
     ring: &mut Ring,
     lookahead: u32,
     account: &Account,
     target: ScannableBlock,
-    block: &ScannableBlock,
-    height: u64,
+    at: &Place,
     spends: &mut SpendMap,
 ) -> Result<()> {
     let outputs = ring
@@ -900,7 +969,26 @@ fn scan_for(
         .scan(target)
         .map_err(|e| Error::Internal(format!("scan: {e}")))?
         .ignore_additional_timelock();
-    record_received(w, account, outputs, block, height, spends)
+    record_received(w, account, outputs, at, spends)
+}
+
+/// Keeps what a proof of transaction `tx_hash` in `at` needs, once the
+/// transaction pays an account: the block's blob, and for a transaction
+/// other than the miner's (`index` among the block's others) its pruned
+/// parts, with its prunable hash if the node sent it (else it is pending,
+/// for `Scanner::complete_proofs`). Nothing for a block made rather than
+/// fetched, or a transaction that can't be split (pre-RingCT) or whose parts
+/// don't hash to it.
+fn keep_proof(w: &ScanWriter, at: &Place, tx_hash: &[u8; 32], index: Option<usize>) -> Result<()> {
+    let Some(raw) = at.raw else { return Ok(()) };
+    if let Some(index) = index {
+        let Some(parts) = raw.txs.get(index).and_then(|t| crate::proof::split(t, tx_hash)) else {
+            tracing::debug!("no proof for a transaction at {}: it can't be split", at.height);
+            return Ok(());
+        };
+        w.keep_tx(tx_hash, at.height, &parts)?;
+    }
+    w.keep_block(at.height, &at.block.block.hash(), &raw.blob)
 }
 
 /// What a transaction row needs, worked out once per transaction.
@@ -965,29 +1053,35 @@ fn record_received(
     w: &ScanWriter,
     account: &Account,
     outputs: Vec<WalletOutput>,
-    block: &ScannableBlock,
-    height: u64,
+    at: &Place,
     spends: &mut SpendMap,
 ) -> Result<()> {
+    let (block, height) = (at.block, at.height);
     let timestamp = block.block.header.timestamp;
     let miner_hash = block.block.miner_transaction().hash();
     let miner: Transaction<Pruned> = block.block.miner_transaction().clone().into();
-    let tx_of = |hash: [u8; 32]| -> Option<&Transaction<Pruned>> {
+    // The transaction with this hash: `None` for the miner's, else its index
+    // among the block's others.
+    let tx_of = |hash: [u8; 32]| -> Option<(Option<usize>, &Transaction<Pruned>)> {
         if hash == miner_hash {
-            return Some(&miner);
+            return Some((None, &miner));
         }
         block
             .block
             .transactions
             .iter()
             .position(|h| *h == hash)
-            .map(|i| &block.transactions[i])
+            .map(|i| (Some(i), &block.transactions[i]))
     };
+    let mut kept = HashSet::new();
     for output in outputs {
         let tx_hash = output.transaction();
-        let Some(tx) = tx_of(tx_hash) else { continue };
+        let Some((tx_index, tx)) = tx_of(tx_hash) else { continue };
         let meta = TxMeta::of(tx, &output, &account.view_key);
         let tx_id = w.tx_row(account.id, &meta.new_tx(tx_hash, height, timestamp))?;
+        if kept.insert(tx_hash) {
+            keep_proof(w, at, &tx_hash, tx_index)?;
+        }
         let mask: DScalar = output.commitment().mask.into();
         let rct = !matches!(tx, Transaction::V1 { .. });
         let index = output.index_in_transaction() as usize;
@@ -1553,6 +1647,7 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
             let batch = Batch {
                 blocks: part.to_vec(),
                 first_indexes: first_indexes[at * step..at * step + part.len()].to_vec(),
+                raw: vec![],
             };
             let t = Instant::now();
             let found = ring.keyring.flag_many(&batch.blocks, threads, 0);
@@ -1847,6 +1942,7 @@ mod tests {
         let batch = Batch {
             blocks: vec![pays, spends],
             first_indexes: vec![firsts_pays, firsts_spends],
+            raw: vec![],
         };
         let accounts = vec![a.clone(), b.clone()];
         let mut slot = None;

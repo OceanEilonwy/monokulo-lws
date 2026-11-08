@@ -161,11 +161,32 @@ Things beyond the community API worth knowing:
 - A new account made by `/login` starts at the chain's top block, which is
   scanned for it too. `/login` takes no start height (nor does monero-lws's);
   an operator gives one with `admin add-account --start-height` or `rescan`.
+- **Each mined transaction that pays the account carries a proof of
+  inclusion** (`proof`, an extension monero-lws does not have): the block as
+  Monero serialises it (header, miner transaction, the other transactions'
+  hashes) and, for a transaction other than the miner's, the pruned
+  transaction in three parts, `tx_prefix`, `rct_base` and `prunable_hash`.
+  A client recomputes the transaction's hash as keccak(keccak(`tx_prefix`) ‖
+  keccak(`rct_base`) ‖ `prunable_hash`) (the miner transaction's from the
+  block, which holds it whole), finds it in the block, works out the block's
+  hash and asks a node of its own choosing for the block hash at that
+  height. The prefix holds the transaction keys, the one-time keys and the
+  `unlock_time`; the RingCT base holds the commitments, the encrypted
+  amounts and the fee. So a server that holds the view key can no longer
+  invent an output: whatever it reports must be on the chain. Pool
+  transactions have no proof (`proof` is absent) until they are mined, and
+  neither do candidate spends (see below). The bytes are the node's own, as
+  `get_blocks.bin` sent them, and a transaction's parts are served only once
+  they hash to its hash.
 
 Spends are **candidates**: an input whose ring holds one of the account's
 outputs. The server can't tell a real spend from a decoy use; the client
 computes the key image of the output named (`tx_pub_key`, `out_index`) and
-compares.
+compares. A candidate spend comes without a proof: a server that invents
+one cannot give it the key image the client computes (that takes the spend
+key), so the client ignores it anyway, and an output turns up in about as
+many rings as there are ring members (16), so proving candidate spends would
+cost about sixteen times the storage of proving receives.
 
 ## How it works
 
@@ -203,6 +224,15 @@ compares.
   `/import_wallet_request`), rewound by a reorg or hidden while its blocks
   were fetched is left for the next batch, so no block is lost or written
   twice.
+- Proofs: when a transaction pays an account, the block's blob and the
+  transaction's pruned bytes, as the node sent them, are kept in the same
+  SQLite transaction as the output (`blocks_kept`, `txs_kept`). Nodes send
+  `get_blocks.bin` without prunable hashes (all zeros,
+  monero-project/monero#10120), so a kept transaction waits for its
+  prunable hash from `get_transactions`, asked for after each batch; until
+  then it is served without a proof. A reorg drops kept rows from the fork
+  on with everything else; a rescan drops those no account needs any more.
+  The cost is in `docs/scanning.md`.
 - Ring members for `/get_random_outs` are drawn from the RingCT output
   distribution with wallet2's gamma over age, fetched with `get_outs`, and
   kept only if unlocked.
@@ -235,6 +265,13 @@ from its stored mask and amount, which is the on-chain one, since the
 scanner only keeps an output whose `mask·G + amount·H` equals the
 transaction's `outPk`. No rescan is needed. Fees were stored from the
 start.
+
+Proofs are different: a database made before `blocks_kept` and `txs_kept`
+existed gains the two tables, empty, on opening, and what was scanned
+before is served with `proof` absent, since the block and transaction bytes
+were never kept and can't be worked out from the rows. New blocks get
+proofs at once; for the history, rescan the accounts (admin `rescan` with
+a height at or below their start height).
 
 ## Developing
 

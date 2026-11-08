@@ -144,6 +144,66 @@ node is fine for trying the server out, not for serving wallets. Don't put
 credentials in `--daemon` you would mind in a process list; they are kept
 out of the log.
 
+A fake incoming payment from a lying node reaches the server's clients with
+a proof of inclusion in a block the node made up; a client that checks the
+proof against a node of its own sees that the block hash isn't the chain's
+(see the next section). Hidden transactions and lies about decoys are not
+caught that way.
+
+### The server, as its clients see it
+
+A light wallet server holds every account's view key and public spend key,
+which is enough to make an output whole: a one-time key the account
+recognises, an encrypted amount, a mask and a commitment that all agree. The
+commitment check (`mask·G + amount·H` against the served `commitment`)
+cannot tell such an output from a real one, since the server chose all
+three. A server (or a node behind it) could show a wallet a payment that
+never happened, and a merchant might ship against it.
+
+**A client can now verify** that each received output is on the chain.
+Every mined transaction that pays an account is served with a `proof`
+(`lws_api::Proof`): the block as Monero serialises it and, for a transaction
+other than the miner's, the pruned transaction's prefix, RingCT base and
+prunable hash. The client recomputes the transaction's hash
+(keccak(keccak(prefix) ‖ keccak(base) ‖ prunable hash), or the miner
+transaction's from the block, which holds it whole), checks that the block
+lists it, recomputes the block's hash, and asks a node it trusts (not one
+the server names) for the hash of the block at the served height. If they
+match, the transaction is in the chain at that height, and everything the
+prefix and base hold is the chain's: the transaction keys and one-time keys
+(so the client can derive the output itself and check that it is its own),
+the `unlock_time`, the encrypted amounts, the commitments (so the commitment
+check is against the chain's `outPk`), and the fee. The block header gives
+the timestamp. Forging a proof means finding a Keccak collision or a block
+the network accepted.
+
+**A client still cannot verify:**
+
+- *Global indices.* An output's global index (the position in the chain's
+  output set that a ring refers to) is in neither the block nor the
+  transaction, so the proof says nothing about it. A server that lies about
+  it makes the client build a ring around the wrong output, and the node
+  refuses the transaction. A client can check an index with a node's
+  `get_outs` (the key and commitment at that index must be the output's
+  own).
+- *The tip height and the scanned height* (`blockchain_height`,
+  `scanned_height`): the server can claim to be behind or ahead; a client
+  that wants the chain's height asks its own node.
+- *What is left out.* A proof shows that what is reported is on the chain,
+  not that everything on the chain is reported: a server can still hide a
+  payment or a spend.
+- *Candidate spends*, which carry no proof. Little is lost: the client
+  confirms a spend by computing the key image, which the server cannot
+  produce without the spend key, so an invented candidate spend is ignored.
+- *Pool transactions*, which have no block yet; the proof comes when they
+  are mined.
+- *Transactions scanned before proofs were kept* (an older database), which
+  are served without one until the account is rescanned, and those whose
+  prunable hash the node has not given yet, served without one meanwhile.
+
+Because of the last point, a client that wants proofs should treat a mined
+receive without one as unverified rather than as false.
+
 ### Someone who reads the database file
 
 The view keys are stored in the clear, as monero-lws stores them: the
@@ -262,6 +322,7 @@ read the process's memory learns.
 | Security headers | None | `nosniff`, `no-store`, CSP, frame and referrer policy, HSTS with TLS |
 | View keys at rest | In the clear (LMDB) | In the clear (SQLite, 0600) |
 | Untrusted node | `--untrusted-daemon` (checks PoW) | Not built: the node is trusted |
+| Proof that a receive is on the chain | None | Block and pruned transaction on each mined transaction that pays, checked against the client's own node |
 | `create_account` refused | No such mode (always queued or accepted) | `--create off`: 501, as the community spec says |
 
 ## Audit of the code before these changes

@@ -4,8 +4,9 @@
 //! stands, every output received, every candidate spend (an input whose ring
 //! holds one of the account's outputs), the transactions those came in, and
 //! the subaddress ranges to watch. Globally: recent block hashes (to notice a
-//! reorg), pending account and import requests, and admin keys (hashed, see
-//! `admin_keys`).
+//! reorg), pending account and import requests, admin keys (hashed, see
+//! `admin_keys`), and for proofs of inclusion (`proof`) the blocks and the
+//! pruned transactions that pay an account, as the node sent them.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,7 +17,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::error::{Error, Result, bad};
 
-const SCHEMA: &str = r#"
+pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY,
@@ -98,6 +99,15 @@ CREATE TABLE IF NOT EXISTS requests (
     PRIMARY KEY(kind, address)
 );
 CREATE TABLE IF NOT EXISTS admin_keys (key BLOB PRIMARY KEY, created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS blocks_kept (height INTEGER PRIMARY KEY, hash BLOB NOT NULL, blob BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS txs_kept (
+    hash BLOB PRIMARY KEY,
+    height INTEGER NOT NULL,
+    prefix BLOB NOT NULL,
+    rct_base BLOB NOT NULL,
+    prunable_hash BLOB
+);
+CREATE INDEX IF NOT EXISTS txs_kept_height ON txs_kept(height);
 "#;
 
 pub fn now() -> u64 {
@@ -213,6 +223,18 @@ pub struct SpendRow {
     pub height: u64,
 }
 
+/// What a transaction is proved in: its block's blob, and for a transaction
+/// other than the miner's its pruned parts.
+#[derive(Clone, Debug)]
+pub struct ProofRow {
+    pub block: Vec<u8>,
+    pub parts: Option<crate::proof::TxParts>,
+}
+
+/// A transaction kept for proofs whose prunable hash is pending: its hash,
+/// prefix and RingCT base.
+pub type Pending = ([u8; 32], Vec<u8>, Vec<u8>);
+
 /// What a new transaction row carries. `total_received`/`total_sent` grow
 /// as outputs and spends are added to it.
 pub struct NewTx<'a> {
@@ -275,6 +297,11 @@ const ACCOUNT_COLS: &str =
 /// `mask·G + amount·H` equalled the transaction's `outPk` (a miner output's
 /// is `G + amount·H`, which is what the chain's output set holds for it), so
 /// the commitment worked out again is the on-chain one, without a rescan.
+///
+/// `blocks_kept` and `txs_kept` (what proofs of inclusion are made of) came
+/// later still; `SCHEMA` makes them empty in an older database. They can't
+/// be filled from what is stored, so transactions scanned before them are
+/// served without a proof until the account is rescanned.
 fn migrate(conn: &mut Connection) -> Result<()> {
     let has_commitment = conn
         .prepare("SELECT 1 FROM pragma_table_info('outputs') WHERE name = 'commitment'")?
@@ -430,6 +457,7 @@ impl Db {
                 )?;
                 done.push(a.clone());
             }
+            drop_unused_kept(tx, height)?;
             Ok(done)
         })
     }
@@ -637,6 +665,8 @@ impl Db {
             tx.execute("DELETE FROM outputs WHERE height >= ?1", [h])?;
             tx.execute("DELETE FROM txs WHERE height >= ?1", [h])?;
             tx.execute("DELETE FROM blocks WHERE height >= ?1", [h])?;
+            tx.execute("DELETE FROM blocks_kept WHERE height >= ?1", [h])?;
+            tx.execute("DELETE FROM txs_kept WHERE height >= ?1", [h])?;
             tx.execute("UPDATE accounts SET scan_height = MIN(scan_height, ?1)", [h])?;
             tx.execute("UPDATE txs SET total_received = (SELECT COALESCE(SUM(amount), 0) FROM outputs WHERE outputs.tx = txs.id)", [])?;
             tx.execute(
@@ -680,6 +710,101 @@ impl Db {
 
     pub fn outputs(&self, account: i64) -> Result<Vec<OutputRow>> {
         self.read(|c| outputs_in(c, account))
+    }
+
+    /// What each of the account's transactions can be proved in, by row id:
+    /// a miner transaction whose block is kept, or another whose block and
+    /// pruned parts are, its prunable hash included. Transactions scanned
+    /// before these were kept, those whose prunable hash is still pending,
+    /// and those the account only (maybe) spent in, have none.
+    pub fn proofs(&self, account: i64) -> Result<HashMap<i64, ProofRow>> {
+        self.read(|c| {
+            let mut st = c.prepare(
+                "SELECT t.id, b.blob, k.prefix, k.rct_base, k.prunable_hash FROM txs t
+                 JOIN blocks_kept b ON b.height = t.height
+                 LEFT JOIN txs_kept k ON k.hash = t.hash AND k.height = t.height
+                 WHERE t.account = ?1 AND (t.coinbase != 0 OR k.prunable_hash IS NOT NULL)",
+            )?;
+            let rows = st
+                .query_map([account], |r| {
+                    let prefix: Option<Vec<u8>> = r.get(2)?;
+                    let parts = match prefix {
+                        Some(prefix) => Some(crate::proof::TxParts {
+                            prefix,
+                            rct_base: r.get(3)?,
+                            prunable_hash: Some(blob32(r.get(4)?)?),
+                        }),
+                        None => None,
+                    };
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        ProofRow {
+                            block: r.get(1)?,
+                            parts,
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Kept transactions whose prunable hash isn't known yet (the node sent
+    /// zeros), at most `limit`: hash, prefix and RingCT base.
+    pub fn pending_proofs(&self, limit: usize) -> Result<Vec<Pending>> {
+        self.read(|c| {
+            let mut st =
+                c.prepare("SELECT hash, prefix, rct_base FROM txs_kept WHERE prunable_hash IS NULL LIMIT ?1")?;
+            let rows = st
+                .query_map([limit as i64], |r| Ok((blob32(r.get(0)?)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Settles pending proofs: each transaction's prunable hash where one was
+    /// found that its parts hash to it with, and the rest dropped (with
+    /// their blocks, if nothing else needs them).
+    pub fn settle_proofs(&self, found: &[([u8; 32], [u8; 32])], dropped: &[[u8; 32]]) -> Result<()> {
+        self.write(|tx| {
+            for (hash, prunable) in found {
+                tx.execute(
+                    "UPDATE txs_kept SET prunable_hash = ?1 WHERE hash = ?2",
+                    params![prunable.as_slice(), hash.as_slice()],
+                )?;
+            }
+            for hash in dropped {
+                tx.execute("DELETE FROM txs_kept WHERE hash = ?1", [hash.as_slice()])?;
+            }
+            if !dropped.is_empty() {
+                drop_unused_kept(tx, 0)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The block kept for proofs at `height`: its hash and blob.
+    #[cfg(test)]
+    pub fn kept_block(&self, height: u64) -> Result<Option<([u8; 32], Vec<u8>)>> {
+        self.read(|c| {
+            Ok(c.query_row(
+                "SELECT hash, blob FROM blocks_kept WHERE height = ?1",
+                [height as i64],
+                |r| Ok((blob32(r.get(0)?)?, r.get(1)?)),
+            )
+            .optional()?)
+        })
+    }
+
+    /// How many blocks and transactions are kept for proofs.
+    #[cfg(test)]
+    pub fn kept_counts(&self) -> Result<(u64, u64)> {
+        self.read(|c| {
+            Ok((
+                c.query_row("SELECT COUNT(*) FROM blocks_kept", [], |r| r.get::<_, i64>(0))? as u64,
+                c.query_row("SELECT COUNT(*) FROM txs_kept", [], |r| r.get::<_, i64>(0))? as u64,
+            ))
+        })
     }
 
     pub fn spends(&self, account: i64) -> Result<Vec<SpendRow>> {
@@ -775,6 +900,24 @@ fn delete_account_from(tx: &Transaction, account: i64, height: u64) -> Result<()
     Ok(())
 }
 
+/// Forgets what proofs were kept from `height` on that no transaction row
+/// needs any more (after a rescan dropped an account's rows; other accounts
+/// may still need the same block or transaction).
+fn drop_unused_kept(tx: &Transaction, height: u64) -> Result<()> {
+    let h = height as i64;
+    tx.execute(
+        "DELETE FROM txs_kept WHERE height >= ?1 AND hash NOT IN (SELECT hash FROM txs WHERE height >= ?1)",
+        [h],
+    )?;
+    tx.execute(
+        "DELETE FROM blocks_kept WHERE height >= ?1
+         AND height NOT IN (SELECT height FROM txs_kept WHERE height >= ?1)
+         AND height NOT IN (SELECT height FROM txs WHERE height >= ?1 AND coinbase != 0)",
+        [h],
+    )?;
+    Ok(())
+}
+
 /// Writes the scanner makes, inside one transaction per batch of blocks.
 pub struct ScanWriter<'a> {
     tx: &'a Transaction<'a>,
@@ -797,6 +940,36 @@ impl<'a> ScanWriter<'a> {
         self.tx.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('scanner_height', ?1)",
             [(height + 1).to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Keeps a block that pays an account, for proofs: its hash and its blob
+    /// as the node sent it.
+    pub fn keep_block(&self, height: u64, hash: &[u8; 32], blob: &[u8]) -> Result<()> {
+        self.tx.execute(
+            "INSERT OR REPLACE INTO blocks_kept (height, hash, blob) VALUES (?1, ?2, ?3)",
+            params![height as i64, hash.as_slice(), blob],
+        )?;
+        Ok(())
+    }
+
+    /// Keeps a transaction that pays an account (not a miner transaction,
+    /// which its block holds), for proofs: its pruned parts. A prunable hash
+    /// already settled stays when the same transaction comes again without.
+    pub fn keep_tx(&self, hash: &[u8; 32], height: u64, parts: &crate::proof::TxParts) -> Result<()> {
+        self.tx.execute(
+            "INSERT INTO txs_kept (hash, height, prefix, rct_base, prunable_hash) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(hash) DO UPDATE SET height = excluded.height, prefix = excluded.prefix,
+                 rct_base = excluded.rct_base,
+                 prunable_hash = COALESCE(excluded.prunable_hash, txs_kept.prunable_hash)",
+            params![
+                hash.as_slice(),
+                height as i64,
+                parts.prefix,
+                parts.rct_base,
+                parts.prunable_hash.as_ref().map(|h| h.as_slice())
+            ],
         )?;
         Ok(())
     }
