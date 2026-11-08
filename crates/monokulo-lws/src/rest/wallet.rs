@@ -12,7 +12,7 @@ use super::{ApiError, App, Policy};
 use crate::crypto;
 use crate::db::{Account, NewAccount, OutputRow, Status, TxRow};
 use crate::error::{Error, Result, bad};
-use crate::scanner::{PoolReceipt, unlocked};
+use crate::scanner::{PoolReceipt, PoolSpend, unlocked};
 
 type Reply<T> = std::result::Result<Json<T>, ApiError>;
 
@@ -45,19 +45,39 @@ fn chain_height(app: &App) -> u64 {
     app.scanner.status().chain_height
 }
 
+/// The chain height a new account starts below: the scanner's last word, or
+/// the node's if the scanner has not heard from it yet. Never 0 for want of
+/// an answer, which would mean a scan of the whole chain.
+async fn creation_height(app: &App) -> Result<u64> {
+    match chain_height(app) {
+        0 => Ok(app.daemon.info().await?.height),
+        h => Ok(h),
+    }
+}
+
+/// The fee served for a transaction: its fee, as monero-lws serves it (a
+/// `uint64-string`), but nothing for a coinbase transaction, which pays none.
+fn fee_of(coinbase: bool, fee: u64) -> Option<Amount> {
+    (!coinbase).then_some(Amount(fee))
+}
+
+fn spend_of(o: &OutputRow, key_image: [u8; 32], mixin: u32) -> Spend {
+    Spend {
+        amount: Amount(o.amount),
+        key_image: Hex(key_image),
+        tx_pub_key: Hex(o.tx_pub_key),
+        out_index: o.out_index,
+        mixin,
+        sender: Some(meta(o.maj, o.min)),
+    }
+}
+
 /// Candidate spends of an account's outputs, by the spending transaction.
 fn spends_by_tx(app: &App, account: &Account, outputs: &HashMap<i64, OutputRow>) -> Result<HashMap<i64, Vec<Spend>>> {
     let mut by_tx: HashMap<i64, Vec<Spend>> = HashMap::new();
     for s in app.db.spends(account.id)? {
         let Some(o) = outputs.get(&s.output) else { continue };
-        by_tx.entry(s.tx).or_default().push(Spend {
-            amount: Amount(o.amount),
-            key_image: Hex(s.key_image),
-            tx_pub_key: Hex(o.tx_pub_key),
-            out_index: o.out_index,
-            mixin: s.mixin,
-            sender: Some(meta(o.maj, o.min)),
-        });
+        by_tx.entry(s.tx).or_default().push(spend_of(o, s.key_image, s.mixin));
     }
     Ok(by_tx)
 }
@@ -79,7 +99,7 @@ pub async fn login(State(app): State<Arc<App>>, Json(req): Json<LoginRequest>) -
     if !req.create_account {
         return Err(Error::Forbidden.into());
     }
-    let height = chain_height(&app);
+    let height = creation_height(&app).await?;
     let new = NewAccount {
         address: checked.address.clone(),
         view_key: checked.view_key,
@@ -168,7 +188,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, Json(login): Json<Logi
     let mut receives_by_tx: HashMap<i64, Vec<ReceivedOutput>> = HashMap::new();
     for o in outputs.values() {
         receives_by_tx.entry(o.tx).or_default().push(ReceivedOutput {
-            commitment: None,
+            commitment: o.commitment.map(Hex),
             amount: Amount(o.amount),
             public_key: Hex(o.public_key),
             index: o.out_index,
@@ -179,14 +199,15 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, Json(login): Json<Logi
         });
     }
     let mut spends = spends_by_tx(&app, &account, &outputs)?;
-    let total_received = outputs.values().map(|o| o.amount).fold(0u64, u64::saturating_add);
+    let mut total_received = outputs.values().map(|o| o.amount).fold(0u64, u64::saturating_add);
+    let mined: std::collections::HashSet<[u8; 32]> = rows.iter().map(|t| t.hash).collect();
     let mut transactions: Vec<Transaction> = rows
         .into_iter()
         .map(|t| {
             let mut receives = receives_by_tx.remove(&t.id).unwrap_or_default();
             receives.sort_by_key(|r| r.index);
             Transaction {
-                fee: None,
+                fee: fee_of(t.coinbase, t.fee),
                 id: t.id as u64,
                 hash: Hex(t.hash),
                 timestamp: Some(Timestamp::from_unix(t.timestamp)),
@@ -203,37 +224,62 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, Json(login): Json<Logi
             }
         })
         .collect();
-    // What is still in the pool, one transaction per pool transaction.
-    let pool = app
-        .scanner
-        .mempool
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .for_account(account.id);
-    let mut pooled: Vec<([u8; 32], Vec<PoolReceipt>)> = vec![];
-    for r in pool {
-        match pooled.iter_mut().find(|(h, _)| *h == r.tx_hash) {
-            Some((_, list)) => list.push(r),
-            None => pooled.push((r.tx_hash, vec![r])),
+    // What is still in the pool, one transaction per pool transaction. One
+    // mined since the pool was last looked at is listed mined only.
+    let (pool, pool_spends) = {
+        let pool = app.scanner.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        (pool.for_account(account.id), pool.spends_for(account.id))
+    };
+    let mut pooled: Vec<([u8; 32], Vec<PoolReceipt>, Vec<PoolSpend>)> = vec![];
+    let entry = |pooled: &mut Vec<([u8; 32], Vec<PoolReceipt>, Vec<PoolSpend>)>, hash: [u8; 32]| -> usize {
+        match pooled.iter().position(|(h, _, _)| *h == hash) {
+            Some(i) => i,
+            None => {
+                pooled.push((hash, vec![], vec![]));
+                pooled.len() - 1
+            }
         }
+    };
+    for r in pool.into_iter().filter(|r| !mined.contains(&r.tx_hash)) {
+        let i = entry(&mut pooled, r.tx_hash);
+        pooled[i].1.push(r);
     }
-    let next_id = transactions.last().map(|t| t.id + 1).unwrap_or(1);
-    for (n, (hash, receipts)) in pooled.into_iter().enumerate() {
-        let first = &receipts[0];
+    for s in pool_spends.into_iter().filter(|s| !mined.contains(&s.tx_hash)) {
+        if !outputs.contains_key(&s.output) {
+            continue;
+        }
+        let i = entry(&mut pooled, s.tx_hash);
+        pooled[i].2.push(s);
+    }
+    let next_id = transactions.iter().map(|t| t.id + 1).max().unwrap_or(1);
+    for (n, (hash, mut receipts, spent)) in pooled.into_iter().enumerate() {
+        receipts.sort_by_key(|r| r.out_index);
+        let received = receipts.iter().map(|r| r.amount).fold(0, u64::saturating_add);
+        // As monero-lws: a pool transaction's outputs count in the total.
+        total_received = total_received.saturating_add(received);
+        let spent_outputs: Vec<Spend> = spent
+            .iter()
+            .map(|s| spend_of(&outputs[&s.output], s.key_image, s.mixin))
+            .collect();
+        let (unlock_time, mixin, fee, payment_id) = match (receipts.first(), spent.first()) {
+            (Some(r), _) => (r.unlock_time, r.mixin, r.fee, r.payment_id.clone()),
+            (None, Some(s)) => (s.unlock_time, s.mixin, s.fee, None),
+            (None, None) => continue,
+        };
         transactions.push(Transaction {
-            fee: None,
+            fee: Some(Amount(fee)),
             id: next_id + n as u64,
             hash: Hex(hash),
             timestamp: None,
-            total_received: Amount(receipts.iter().map(|r| r.amount).fold(0, u64::saturating_add)),
-            total_sent: Amount(0),
-            unlock_time: first.unlock_time,
+            total_received: Amount(received),
+            total_sent: Amount(spent_outputs.iter().map(|s| s.amount.0).fold(0, u64::saturating_add)),
+            unlock_time,
             height: None,
-            spent_outputs: vec![],
+            spent_outputs,
             receives: receipts
                 .iter()
                 .map(|r| ReceivedOutput {
-                    commitment: None,
+                    commitment: r.commitment.map(Hex),
                     amount: Amount(r.amount),
                     public_key: Hex(r.public_key),
                     index: r.out_index,
@@ -243,10 +289,10 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, Json(login): Json<Logi
                     recipient: meta(r.maj, r.min),
                 })
                 .collect(),
-            payment_id: first.payment_id.clone().map(HexBytes),
+            payment_id: payment_id.map(HexBytes),
             coinbase: false,
             mempool: true,
-            mixin: first.mixin,
+            mixin,
         });
     }
     Ok(Json(AddressTxs {
@@ -283,14 +329,23 @@ pub async fn get_unspent_outs(State(app): State<Arc<App>>, Json(req): Json<Unspe
             continue;
         }
         total = total.saturating_add(o.amount);
-        let rct = match (o.mask, tx.coinbase) {
-            (Some(mask), false) => {
-                crypto::legacy_rct(&account.view_key, &o.tx_pub_key, o.out_index as u64, &mask, o.amount)
-                    .map(|b| HexBytes(b.to_vec()))
+        // The blob starts with the commitment the chain holds for the output.
+        let rct = o.mask.and_then(|mask| {
+            let commitment = o.commitment.unwrap_or_else(|| crypto::commit(&mask, o.amount));
+            if tx.coinbase {
+                Some(crypto::plain_rct(&commitment, o.amount))
+            } else {
+                crypto::legacy_rct(
+                    &account.view_key,
+                    &o.tx_pub_key,
+                    o.out_index as u64,
+                    &commitment,
+                    &mask,
+                    o.amount,
+                )
             }
-            (Some(_), true) => Some(HexBytes(crypto::plain_rct(o.amount).to_vec())),
-            (None, _) => None,
-        };
+            .map(|b| HexBytes(b.to_vec()))
+        });
         listed.push(Output {
             tx_id: o.tx as u64,
             amount: Amount(o.amount),
@@ -399,7 +454,7 @@ pub async fn import_wallet_request(State(app): State<Arc<App>>, Json(login): Jso
     match app.config.import {
         Policy::Off => Err(Error::NoCreate.into()),
         Policy::Auto => {
-            app.db.rescan(&[account.address.clone()], 0)?;
+            app.db.rescan(std::slice::from_ref(&account.address), 0)?;
             app.scanner.wake.notify_one();
             tracing::info!("import for {}: scanning from 0", short(&account.address));
             Ok(reply(true, true, "Approved"))
