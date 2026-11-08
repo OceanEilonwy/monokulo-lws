@@ -4,7 +4,8 @@
 //! stands, every output received, every candidate spend (an input whose ring
 //! holds one of the account's outputs), the transactions those came in, and
 //! the subaddress ranges to watch. Globally: recent block hashes (to notice a
-//! reorg), pending account and import requests, and admin keys.
+//! reorg), pending account and import requests, and admin keys (hashed, see
+//! `admin_keys`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS outputs (
     height INTEGER NOT NULL,
     maj INTEGER NOT NULL,
     min INTEGER NOT NULL,
+    commitment BLOB,
     UNIQUE(account, public_key)
 );
 CREATE INDEX IF NOT EXISTS outputs_account ON outputs(account, global_index);
@@ -134,7 +136,8 @@ impl Status {
     }
 }
 
-#[derive(Clone, Debug)]
+/// `Debug` leaves out the view key and the address (`crate::redact`).
+#[derive(Clone)]
 pub struct Account {
     pub id: i64,
     pub address: String,
@@ -148,8 +151,9 @@ pub struct Account {
     pub generated_locally: bool,
 }
 
-/// A new account or a pending request, before it has a row.
-#[derive(Clone, Debug)]
+/// A new account or a pending request, before it has a row. `Debug` leaves
+/// out the view key and the address (`crate::redact`).
+#[derive(Clone)]
 pub struct NewAccount {
     pub address: String,
     pub view_key: [u8; 32],
@@ -193,6 +197,10 @@ pub struct OutputRow {
     pub height: u64,
     pub maj: u32,
     pub min: u32,
+    /// The Pedersen commitment the chain holds for the output (the RingCT
+    /// base's `outPk`; `G + amount·H` for a miner output); `None` for a
+    /// pre-RingCT output.
+    pub commitment: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -230,6 +238,7 @@ pub struct NewOutput {
     pub height: u64,
     pub maj: u32,
     pub min: u32,
+    pub commitment: Option<[u8; 32]>,
 }
 
 pub struct Db {
@@ -258,18 +267,53 @@ fn account_row(r: &rusqlite::Row) -> rusqlite::Result<Account> {
 const ACCOUNT_COLS: &str =
     "id, address, view_key, spend_pub, view_pub, status, start_height, scan_height, access_time, generated_locally";
 
+/// Brings a database made by an earlier version up to `SCHEMA`.
+///
+/// `outputs.commitment` (the output's on-chain Pedersen commitment) came
+/// after the first release. Rows written before it are filled from their
+/// stored mask and amount: the scanner only ever kept an output whose
+/// `mask·G + amount·H` equalled the transaction's `outPk` (a miner output's
+/// is `G + amount·H`, which is what the chain's output set holds for it), so
+/// the commitment worked out again is the on-chain one, without a rescan.
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let has_commitment = conn
+        .prepare("SELECT 1 FROM pragma_table_info('outputs') WHERE name = 'commitment'")?
+        .exists([])?;
+    let tx = conn.transaction()?;
+    if !has_commitment {
+        tx.execute("ALTER TABLE outputs ADD COLUMN commitment BLOB", [])?;
+    }
+    let missing: Vec<(i64, Vec<u8>, i64)> = tx
+        .prepare("SELECT id, mask, amount FROM outputs WHERE commitment IS NULL AND mask IS NOT NULL")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, mask, amount) in missing {
+        let mask = blob32(mask)?;
+        let commitment = crate::crypto::commit(&mask, amount as u64);
+        tx.execute(
+            "UPDATE outputs SET commitment = ?1 WHERE id = ?2",
+            params![commitment.as_slice(), id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&mut conn)?;
         Ok(Db { conn: Mutex::new(conn) })
     }
 
     #[cfg(test)]
     pub fn in_memory() -> Db {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         conn.execute_batch(SCHEMA).unwrap();
+        migrate(&mut conn).unwrap();
         Db { conn: Mutex::new(conn) }
     }
 
@@ -388,6 +432,19 @@ impl Db {
             }
             Ok(done)
         })
+    }
+
+    /// An accepted import: the accounts start at block 0 and scan again
+    /// from it, as monero-lws's import does.
+    pub fn import(&self, addresses: &[String]) -> Result<Vec<String>> {
+        let done = self.rescan(addresses, 0)?;
+        self.write(|tx| {
+            for a in &done {
+                tx.execute("UPDATE accounts SET start_height = 0 WHERE address = ?1", [a])?;
+            }
+            Ok(())
+        })?;
+        Ok(done)
     }
 
     // ---- requests ----
@@ -542,7 +599,7 @@ impl Db {
                     r.get::<_, Vec<u8>>(0)
                 })
                 .optional()?
-                .map(|v| blob32(v))
+                .map(blob32)
                 .transpose()?,
             )
         })
@@ -644,28 +701,6 @@ impl Db {
             Ok(rows)
         })
     }
-
-    // ---- admin ----
-
-    pub fn add_admin_key(&self, key: &[u8; 32]) -> Result<()> {
-        self.write(|tx| {
-            tx.execute(
-                "INSERT OR IGNORE INTO admin_keys (key, created) VALUES (?1, ?2)",
-                params![key.as_slice(), now() as i64],
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn admin_keys(&self) -> Result<Vec<[u8; 32]>> {
-        self.read(|c| {
-            let mut st = c.prepare("SELECT key FROM admin_keys")?;
-            let rows = st
-                .query_map([], |r| blob32(r.get(0)?))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-    }
 }
 
 fn merge(mut ranges: Vec<[u32; 2]>) -> Vec<[u32; 2]> {
@@ -700,7 +735,7 @@ fn subaddrs_in(c: &Connection, account: i64) -> Result<Vec<lws_api::SubaddrRange
 
 fn outputs_in(c: &Connection, account: i64) -> Result<Vec<OutputRow>> {
     let mut st = c.prepare(
-        "SELECT id, tx, out_index, global_index, amount, public_key, tx_pub_key, mask, height, maj, min FROM outputs WHERE account = ?1 ORDER BY height, id",
+        "SELECT id, tx, out_index, global_index, amount, public_key, tx_pub_key, mask, height, maj, min, commitment FROM outputs WHERE account = ?1 ORDER BY height, id",
     )?;
     let rows = st
         .query_map([account], |r| {
@@ -716,6 +751,7 @@ fn outputs_in(c: &Connection, account: i64) -> Result<Vec<OutputRow>> {
                 height: r.get::<_, i64>(8)? as u64,
                 maj: r.get(9)?,
                 min: r.get(10)?,
+                commitment: r.get::<_, Option<Vec<u8>>>(11)?.map(blob32).transpose()?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -765,6 +801,21 @@ impl<'a> ScanWriter<'a> {
         Ok(())
     }
 
+    /// Where `account` stands now, and whether it is still scanned: what a
+    /// batch checks before writing, as the account may have been rescanned,
+    /// rewound or hidden while the batch was fetched.
+    pub fn standing(&self, account: i64) -> Result<Option<(u64, Status)>> {
+        Ok(self
+            .tx
+            .query_row(
+                "SELECT scan_height, status FROM accounts WHERE id = ?1",
+                [account],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(h, s)| (h, Status::parse(&s).unwrap_or(Status::Hidden))))
+    }
+
     pub fn set_scan_height(&self, account: i64, height: u64) -> Result<()> {
         self.tx.execute(
             "UPDATE accounts SET scan_height = ?1 WHERE id = ?2",
@@ -803,7 +854,7 @@ impl<'a> ScanWriter<'a> {
     /// already here (the burning bug: only the first counts).
     pub fn add_output(&self, account: i64, tx: i64, o: &NewOutput) -> Result<Option<i64>> {
         let changed = self.tx.execute(
-            "INSERT OR IGNORE INTO outputs (account, tx, out_index, global_index, amount, public_key, tx_pub_key, mask, height, maj, min) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT OR IGNORE INTO outputs (account, tx, out_index, global_index, amount, public_key, tx_pub_key, mask, height, maj, min, commitment) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 account,
                 tx,
@@ -815,7 +866,8 @@ impl<'a> ScanWriter<'a> {
                 o.mask.as_ref().map(|m| m.as_slice()),
                 o.height as i64,
                 o.maj,
-                o.min
+                o.min,
+                o.commitment.as_ref().map(|c| c.as_slice())
             ],
         )?;
         if changed == 0 {
@@ -828,6 +880,7 @@ impl<'a> ScanWriter<'a> {
         Ok(Some(self.tx.last_insert_rowid()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_spend(
         &self,
         account: i64,
@@ -1015,7 +1068,8 @@ mod tests {
                         mask: Some([5; 32]),
                         height: 12,
                         maj: 0,
-                        min: 0
+                        min: 0,
+                        commitment: None
                     }
                 )?
                 .is_some()
@@ -1033,7 +1087,8 @@ mod tests {
                         mask: Some([5; 32]),
                         height: 12,
                         maj: 0,
-                        min: 0
+                        min: 0,
+                        commitment: None
                     }
                 )?
                 .is_none()
@@ -1075,5 +1130,35 @@ mod tests {
         db.rescan(&["A".into()], 0).unwrap();
         assert!(db.outputs(a.id).unwrap().is_empty());
         assert_eq!(db.account("A").unwrap().unwrap().scan_height, 0);
+    }
+
+    #[test]
+    fn an_old_database_gains_commitments_from_its_masks() {
+        // The outputs table as the first release made it: no commitment.
+        let old = SCHEMA.replace("    commitment BLOB,\n", "");
+        assert!(!old.contains("commitment"));
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&old).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, address, view_key, spend_pub, view_pub, start_height, scan_height, created, access_time) VALUES (1, 'A', x'00', x'00', x'00', 0, 0, 0, 0);
+             INSERT INTO txs (id, account, hash, prefix_hash, height, timestamp, unlock_time, coinbase, mixin, fee, tx_pub_key) VALUES (1, 1, x'01', x'01', 5, 0, 0, 0, 15, 0, x'01');",
+        )
+        .unwrap();
+        let mask = [7u8; 32];
+        conn.execute(
+            "INSERT INTO outputs (account, tx, out_index, global_index, amount, public_key, tx_pub_key, mask, height, maj, min) VALUES (1, 1, 0, 9, 1234, randomblob(32), zeroblob(32), ?1, 5, 0, 0)",
+            [mask.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO outputs (account, tx, out_index, global_index, amount, public_key, tx_pub_key, mask, height, maj, min) VALUES (1, 1, 1, 10, 99, randomblob(32), zeroblob(32), NULL, 5, 0, 0)",
+            [],
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        let outputs = outputs_in(&conn, 1).unwrap();
+        assert_eq!(outputs[0].commitment, Some(crate::crypto::commit(&mask, 1234)));
+        assert_eq!(outputs[1].commitment, None, "a pre-RingCT output has none");
     }
 }

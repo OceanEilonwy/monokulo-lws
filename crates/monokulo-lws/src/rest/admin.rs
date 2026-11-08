@@ -1,6 +1,10 @@
 //! The admin API: `POST /<command>` with `{"auth": key, "params": {...}}`.
 //! Commands and shapes follow monero-lws's admin REST API; webhooks aren't
 //! built yet and answer 501.
+//!
+//! It is served only on the admin listener (`--admin-listen`); the wallet
+//! listener has no route to it. The key is checked against the stored
+//! hashes in constant time (`admin_keys`).
 
 use std::sync::Arc;
 
@@ -13,33 +17,33 @@ use axum::{
 use lws_api::admin::*;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use subtle::ConstantTimeEq;
 
-use super::{ApiError, App};
-use crate::crypto;
+use super::{ApiError, ApiJson, App, parse_value};
 use crate::db::{NewAccount, Status};
 use crate::error::{Error, Result, bad};
+use crate::{admin_keys, crypto};
 
 fn authorize(app: &App, auth: Option<&lws_api::Hex32>) -> Result<()> {
     if !app.config.admin_auth {
         return Ok(());
     }
     let Some(auth) = auth else { return Err(Error::Forbidden) };
-    let mut ok = 0u8;
-    for key in app.db.admin_keys()? {
-        ok |= key.ct_eq(&auth.0).unwrap_u8();
+    if admin_keys::verify(&app.db, &auth.0)? {
+        Ok(())
+    } else {
+        tracing::warn!("an admin request with a wrong key");
+        Err(Error::Forbidden)
     }
-    if ok == 1 { Ok(()) } else { Err(Error::Forbidden) }
 }
 
 fn params<P: DeserializeOwned>(value: &Value) -> Result<P> {
-    serde_json::from_value(value.clone()).map_err(|e| bad(format!("params: {e}")))
+    parse_value(value.clone())
 }
 
 pub async fn command(
     State(app): State<Arc<App>>,
     Path(command): Path<String>,
-    Json(req): Json<Request<Value>>,
+    ApiJson(req): ApiJson<Request<Value>>,
 ) -> std::result::Result<Response, ApiError> {
     authorize(&app, req.auth.as_ref())?;
     let out = match command.as_str() {
@@ -68,7 +72,7 @@ fn accept(app: &App, p: Requests) -> Result<Value> {
                 app.db.add_account(&new, Status::Active)?;
             }
             "import" => {
-                app.db.rescan(&[new.address.clone()], 0)?;
+                app.db.import(std::slice::from_ref(&new.address))?;
             }
             _ => return Err(bad("type must be \"create\" or \"import\"")),
         }
@@ -99,7 +103,7 @@ fn add_account(app: &App, p: AddAccount) -> Result<Value> {
     };
     app.db.add_account(&new, Status::Active)?;
     app.scanner.wake.notify_one();
-    Ok(json!({ "updated": [checked.address] }))
+    Ok(json!({ "updated": [checked.address.clone()] }))
 }
 
 fn list_accounts(app: &App) -> Result<Value> {

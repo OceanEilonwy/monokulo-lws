@@ -1,0 +1,13 @@
+# cargo audit's configuration. Each ignored advisory says why it doesn't
+# reach this server; docs/security.md lists them too.
+
+[advisories]
+ignore = [
+    # crypto-bigint 0.5.5: branches in operations meant to be constant time.
+    # It comes in through monero-ed25519 (monero-oxide), which uses it only
+    # for hash-to-point (`biased_hash`), on public data: output keys. No
+    # secret of this server goes through it, and there is no 0.5 release
+    # with the fix (it is in 0.7.6, which monero-oxide doesn't use yet).
+    # Drop this when monero-oxide moves off 0.5.
+    "RUSTSEC-2026-0387",
+]

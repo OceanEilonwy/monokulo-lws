@@ -222,6 +222,25 @@ the monero-oxide fan-out) stays Fob's.
   scanner, 100 blocks a step: 9,960, 3,400, 461 and 47 blocks/s. So the
   budget's first line, 1,000 accounts and a day of mainnet, is about 15 s.
 
+- Correctness, held by tests that need neither a node nor a GPU
+  (`src/correctness.rs`): a stand-in block numbers outputs exactly as the
+  whole block does, wherever the transaction sits (the miner transaction, the
+  last of sixteen, after one with no outputs), checked on made blocks and on
+  the mainnet fixture with payments planted; a block's hits are taken once
+  per transaction and account, and an account whose block is read whole is
+  not also scanned per transaction. Each found output's commitment is taken
+  from the transaction's RingCT base (`outPk`; `G + amount·H` for a miner
+  output) and stored with it, as is the fee. A batch is one SQLite
+  transaction and writes only for the accounts still at the height it was
+  planned from, so an admin `rescan`, an import, a reorg's rewind or a
+  status change made while the batch was being fetched is never undone by
+  it. The pool's scan finds candidate spends as well as outputs (one map of
+  the live accounts' outputs), is redone whenever the live lane's accounts
+  change or a reorg happens, never adds a transaction twice, and a pool
+  transaction already mined is served mined. Once caught up, the live lane
+  compares the node's top block hash with the one it kept, so a reorg that
+  replaces the top block without lengthening the chain is noticed at once.
+
 Still planned: phase B (the view-tag Keccak, and returning only tag hits,
 on the GPU); incremental keyring updates.
 
