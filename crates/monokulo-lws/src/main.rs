@@ -4,14 +4,21 @@
 //! answers the light wallet REST API; `monokulo-lws admin ...` manages
 //! accounts and keys straight in the database.
 
+#![forbid(unsafe_code)]
+
+mod admin_keys;
+mod at_rest;
 mod crypto;
 mod daemon;
 mod db;
 mod decoys;
 mod error;
 mod lanes;
+mod limits;
+mod redact;
 mod rest;
 mod scanner;
+mod server;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -25,8 +32,10 @@ use tokio::sync::Mutex;
 
 use crate::daemon::Daemon;
 use crate::db::{Db, NewAccount, Status};
+use crate::limits::{Cidr, ClientIpConfig, Limits};
 use crate::rest::{App, Config, Policy};
 use crate::scanner::{LaneConfig, ScanConfig, Scanner};
+use crate::server::ListenerConfig;
 
 #[derive(Parser)]
 #[command(name = "monokulo-lws", version, about)]
@@ -38,7 +47,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Scan and serve.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Manage accounts and admin keys in the database directly.
     Admin {
         #[command(subcommand)]
@@ -77,9 +86,58 @@ struct ServeArgs {
     /// Where the admin API listens; off unless given.
     #[arg(long, env = "LWS_ADMIN_LISTEN")]
     admin_listen: Option<SocketAddr>,
-    /// Skip the admin key check (only behind something else that checks).
+    /// Allow a listener on an address other than loopback (as monero-lws's
+    /// --confirm-external-bind).
+    #[arg(long, env = "LWS_CONFIRM_EXTERNAL_BIND")]
+    confirm_external_bind: bool,
+    /// Skip the admin key check. Taken only for a loopback --admin-listen,
+    /// unless --confirm-unauthenticated-admin is given too.
     #[arg(long)]
     disable_admin_auth: bool,
+    /// Let --disable-admin-auth apply to an admin listener that isn't on
+    /// loopback (only behind something else that checks).
+    #[arg(long, requires = "disable_admin_auth")]
+    confirm_unauthenticated_admin: bool,
+    /// PEM certificate chain: the listeners speak TLS themselves (TLS 1.2 and
+    /// 1.3). A reverse proxy in front is still the recommended setup.
+    #[arg(long, env = "LWS_TLS_CERT", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key for --tls-cert.
+    #[arg(long, env = "LWS_TLS_KEY", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// Reverse proxies (addresses or CIDR ranges, comma-separated) whose
+    /// client-address header is believed. Without it the header is ignored.
+    #[arg(long, env = "LWS_TRUSTED_PROXIES", value_delimiter = ',')]
+    trusted_proxies: Vec<Cidr>,
+    /// The header a trusted proxy puts the client's address in.
+    #[arg(long, env = "LWS_CLIENT_IP_HEADER", default_value = "X-Forwarded-For")]
+    client_ip_header: String,
+    /// Requests a minute from one client (an IPv4 address or IPv6 /64); 0 is
+    /// no limit.
+    #[arg(long, default_value_t = 300)]
+    rate_limit: u32,
+    /// Requests a minute from one client for account creation, imports,
+    /// /submit_raw_tx and /get_random_outs; 0 is no limit.
+    #[arg(long, default_value_t = 12)]
+    strict_rate_limit: u32,
+    /// New accounts and import requests an hour across all clients; 0 is no
+    /// limit.
+    #[arg(long, default_value_t = 1000)]
+    max_new_accounts_per_hour: u32,
+    /// Pending create and import requests at most (monero-lws's
+    /// --create-queue-max).
+    #[arg(long, default_value_t = 10_000)]
+    max_pending_requests: u64,
+    /// Open connections at most, per listener.
+    #[arg(long, default_value_t = 1024)]
+    max_connections: usize,
+    /// Open connections from one address at most (a trusted proxy is
+    /// exempt); 0 is no limit.
+    #[arg(long, default_value_t = 64)]
+    max_connections_per_ip: usize,
+    /// Seconds a request may take, reading its body and answering included.
+    #[arg(long, default_value_t = 30)]
+    request_timeout: u64,
     /// What `/login` with `create_account` does.
     #[arg(long, value_enum, default_value = "auto")]
     create: Policy,
@@ -145,9 +203,11 @@ enum AdminCommand {
         network: Network,
         #[arg(long)]
         address: String,
-        /// The private view key, hex.
-        #[arg(long)]
-        view_key: String,
+        /// The private view key, hex. Read from standard input when not
+        /// given (better: a key on the command line is in `ps` and the
+        /// shell's history).
+        #[arg(long, env = "LWS_VIEW_KEY", hide_env_values = true)]
+        view_key: Option<String>,
         /// The block to start from.
         #[arg(long, default_value_t = 0)]
         start_height: u64,
@@ -168,13 +228,32 @@ fn parse_network(s: &str) -> Result<Network, String> {
     }
 }
 
+/// A panic is logged with where it happened, and its message only when the
+/// message is a literal: a formatted one could carry anything the code had
+/// in hand. Request handlers' panics become a bare 500 (`rest::finish`).
+fn panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "an unknown place".into());
+        let message = info
+            .payload()
+            .downcast_ref::<&'static str>()
+            .copied()
+            .unwrap_or("(message withheld)");
+        tracing::error!("panic at {location}: {message}");
+    }));
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    panic_hook();
     match Cli::parse().command {
-        Command::Serve(args) => serve(args).await,
+        Command::Serve(args) => serve(*args).await,
         Command::Admin { command } => admin(command),
         Command::Replay {
             fixture,
@@ -192,27 +271,69 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Opens the database: made 0600 if new, tightened and warned about if
+/// open to others, plain admin keys from an older version hashed.
+fn open_db(path: &std::path::Path) -> anyhow::Result<Db> {
+    at_rest::prepare_db_file(path).with_context(|| format!("preparing {}", path.display()))?;
+    let db = Db::open(path).with_context(|| format!("opening {}", path.display()))?;
+    admin_keys::migrate(&db)?;
+    Ok(db)
+}
+
+/// The listeners' safety checks, before anything starts.
+fn check_listeners(args: &ServeArgs) -> anyhow::Result<()> {
+    for addr in std::iter::once(args.listen).chain(args.admin_listen) {
+        if !addr.ip().is_loopback() && !args.confirm_external_bind {
+            bail!(
+                "{addr} isn't a loopback address: give --confirm-external-bind to listen there (and put TLS in \
+                 front, or give --tls-cert and --tls-key)"
+            );
+        }
+    }
+    if let Some(admin) = args.admin_listen {
+        if admin == args.listen {
+            bail!("the admin API needs a listener of its own, not the wallet API's {admin}");
+        }
+        if args.disable_admin_auth && !admin.ip().is_loopback() && !args.confirm_unauthenticated_admin {
+            bail!(
+                "--disable-admin-auth with the admin API on {admin}, which isn't loopback: anyone who reaches it \
+                 could read every account. Give --confirm-unauthenticated-admin as well if something in front \
+                 checks."
+            );
+        }
+    }
+    if args.client_ip_header.parse::<axum::http::HeaderName>().is_err() {
+        bail!("--client-ip-header {:?} isn't a header name", args.client_ip_header);
+    }
+    Ok(())
+}
+
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
-    let db = Arc::new(Db::open(&args.db).with_context(|| format!("opening {}", args.db.display()))?);
+    check_listeners(&args)?;
+    let tls = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => Some(server::tls_acceptor(cert, key)?),
+        _ => None,
+    };
+    let db = Arc::new(open_db(&args.db)?);
     let daemon = Daemon::new(&args.daemon)?;
     let info = daemon
         .info()
         .await
-        .with_context(|| format!("asking {} for get_info", args.daemon))?;
+        .with_context(|| format!("asking {} for get_info", daemon.display_url()))?;
     let network = crypto::network_from_daemon(&info.nettype)
         .with_context(|| format!("the node's network is {:?}", info.nettype))?;
-    if let Some(wanted) = args.network {
-        if wanted != network {
-            bail!(
-                "the node is on {} but --network asks for {}",
-                crypto::network_name(network),
-                crypto::network_name(wanted)
-            );
-        }
+    if let Some(wanted) = args.network
+        && wanted != network
+    {
+        bail!(
+            "the node is on {} but --network asks for {}",
+            crypto::network_name(network),
+            crypto::network_name(wanted)
+        );
     }
     tracing::info!(
         "node {} on {} at height {} ({})",
-        args.daemon,
+        daemon.display_url(),
         crypto::network_name(network),
         info.height,
         info.version
@@ -232,7 +353,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let lanes = LaneConfig {
         lanes: args.catch_up_lanes,
         join: args.catch_up_join,
-        blocks: args.catch_up_blocks.max(1),
+        blocks: args.catch_up_blocks.clamp(1, daemon::MAX_BLOCKS_PER_REQUEST),
         in_flight: args.catch_up_in_flight.max(1),
         arenas: arenas.max(1),
     };
@@ -257,31 +378,60 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             lookahead: args.lookahead,
             admin_auth: !args.disable_admin_auth,
             access_control_origins: args.access_control_origins,
+            request_timeout: Duration::from_secs(args.request_timeout.max(1)),
+            tls: tls.is_some(),
         },
+        limits: Limits::new(
+            ClientIpConfig {
+                trusted_proxies: args.trusted_proxies.clone(),
+                header: args.client_ip_header.to_ascii_lowercase(),
+            },
+            args.rate_limit,
+            args.strict_rate_limit,
+            args.max_new_accounts_per_hour,
+            args.max_pending_requests,
+        ),
         fee: Mutex::new(None),
-        picker: Mutex::new(decoys::Picker::new()),
+        info: Mutex::new(None),
+        picker: decoys::Picker::new(),
     });
+    let listener_config = ListenerConfig {
+        tls,
+        max_connections: args.max_connections,
+        max_connections_per_ip: args.max_connections_per_ip,
+        trusted_proxies: args.trusted_proxies,
+    };
+    let scheme = if listener_config.tls.is_some() { "https" } else { "http" };
 
     let scan_task = tokio::spawn(scanner.run());
 
     let wallet = tokio::net::TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("listening on {}", args.listen))?;
-    tracing::info!("wallet API on http://{}", args.listen);
-    let wallet_task = tokio::spawn(axum::serve(wallet, rest::wallet_router(app.clone())).into_future());
+    tracing::info!("wallet API on {scheme}://{}", args.listen);
+    let wallet_task = tokio::spawn(server::serve(
+        wallet,
+        rest::wallet_router(app.clone()),
+        listener_config.clone(),
+    ));
 
     let admin_task = match args.admin_listen {
         Some(addr) => {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("listening on {addr}"))?;
-            if app.config.admin_auth && app.db.admin_keys()?.is_empty() {
+            if app.config.admin_auth && admin_keys::count(&app.db)? == 0 {
                 tracing::warn!("admin API on but no admin key yet: run `monokulo-lws admin create-key`");
             }
-            tracing::info!("admin API on http://{addr}");
-            Some(tokio::spawn(
-                axum::serve(listener, rest::admin_router(app.clone())).into_future(),
-            ))
+            if !app.config.admin_auth {
+                tracing::warn!("admin API on {addr} without a key check (--disable-admin-auth)");
+            }
+            tracing::info!("admin API on {scheme}://{addr}");
+            Some(tokio::spawn(server::serve(
+                listener,
+                rest::admin_router(app.clone()),
+                listener_config,
+            )))
         }
         None => None,
     };
@@ -301,11 +451,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 fn admin(command: AdminCommand) -> anyhow::Result<()> {
     match command {
         AdminCommand::CreateKey { db } => {
-            let db = Db::open(&db)?;
-            let mut key = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
-            db.add_admin_key(&key)?;
-            println!("{}", hex::encode(key));
+            let db = open_db(&db)?;
+            let key = admin_keys::create(&db)?;
+            // Shown once: only its hash is kept.
+            println!("{}", zeroize::Zeroizing::new(hex::encode(*key)).as_str());
         }
         AdminCommand::AddAccount {
             db,
@@ -314,12 +463,22 @@ fn admin(command: AdminCommand) -> anyhow::Result<()> {
             view_key,
             start_height,
         } => {
-            let db = Db::open(&db)?;
-            let key = daemon::hex32(&view_key).context("the view key must be 64 hex characters")?;
+            let db = open_db(&db)?;
+            let view_key = match view_key {
+                Some(k) => zeroize::Zeroizing::new(k),
+                None => {
+                    eprintln!("the private view key (64 hex characters):");
+                    let mut line = zeroize::Zeroizing::new(String::new());
+                    std::io::stdin().read_line(&mut line)?;
+                    zeroize::Zeroizing::new(line.trim().to_string())
+                }
+            };
+            let key =
+                zeroize::Zeroizing::new(daemon::hex32(&view_key).context("the view key must be 64 hex characters")?);
             let checked = crypto::check_login(network, &address, &key)?;
             let account = db.add_account(
                 &NewAccount {
-                    address: checked.address,
+                    address: checked.address.clone(),
                     view_key: checked.view_key,
                     spend_pub: checked.spend_pub,
                     view_pub: checked.view_pub,
@@ -331,7 +490,7 @@ fn admin(command: AdminCommand) -> anyhow::Result<()> {
             println!("added {} from height {}", account.address, account.start_height);
         }
         AdminCommand::List { db } => {
-            let db = Db::open(&db)?;
+            let db = open_db(&db)?;
             for a in db.accounts(None)? {
                 println!("{:<8} {:>9} {}", a.status.as_str(), a.scan_height, a.address);
             }

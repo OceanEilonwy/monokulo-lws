@@ -3,21 +3,30 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    extract::{Extension, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
 use lws_api::*;
 use serde_json::json;
 use subtle::ConstantTimeEq;
 
-use super::{ApiError, App, Policy};
+use super::{ApiError, ApiJson, App, MAX_TX_BYTES, Policy};
 use crate::crypto;
 use crate::db::{Account, NewAccount, OutputRow, Status, TxRow};
 use crate::error::{Error, Result, bad};
+use crate::limits::ClientIp;
 use crate::scanner::{PoolReceipt, unlocked};
 
 type Reply<T> = std::result::Result<Json<T>, ApiError>;
 
 /// The account a login names, once the address parses, the key fits it and
-/// the account is here and not hidden. Hidden and unknown look the same.
+/// the account is here and not hidden. Hidden, unknown, pending and a key
+/// that doesn't fit all look the same: 403 and the same body. A wrong key
+/// is refused by `check_login` before the database is asked, so neither the
+/// answer nor its timing says whether an address has an account.
 async fn authorize(app: &App, login: &Login) -> Result<Account> {
     let checked = crypto::check_login(app.scanner.config.network, &login.address, &login.view_key.0)?;
     let Some(account) = app.db.account(&checked.address)? else {
@@ -28,6 +37,42 @@ async fn authorize(app: &App, login: &Login) -> Result<Account> {
     }
     app.db.touch(account.id)?;
     Ok(account)
+}
+
+/// As [`authorize`], for a call that changes the account (an import, new
+/// subaddresses): an inactive account is served what was scanned but not
+/// changed.
+async fn authorize_active(app: &App, login: &Login) -> Result<Account> {
+    let account = authorize(app, login).await?;
+    if account.status != Status::Active {
+        return Err(Error::Forbidden);
+    }
+    Ok(account)
+}
+
+/// The strict per-client limit, for a call that would make an account or a
+/// request, and the global one on new accounts and requests.
+fn creation_allowed(app: &App, client: Option<&Extension<ClientIp>>) -> Result<()> {
+    if let Some(Extension(ClientIp(ip))) = client {
+        app.limits.strict.check(*ip).map_err(Error::RateLimited)?;
+    }
+    app.limits.creation.check().map_err(|wait| {
+        tracing::warn!("the limit on new accounts and requests an hour was reached");
+        Error::RateLimited(wait)
+    })
+}
+
+/// Refuses a new create or import request when the queue is full
+/// (monero-lws's `--create-queue-max`).
+fn queue_has_room(app: &App) -> Result<()> {
+    let pending = app
+        .db
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM requests", [], |r| r.get::<_, i64>(0))? as u64))?;
+    if pending >= app.limits.max_pending_requests {
+        tracing::warn!("the queue of pending requests is full ({pending}): accept or reject some");
+        return Err(Error::Busy("too many pending requests; try again later"));
+    }
+    Ok(())
 }
 
 fn lookahead(app: &App) -> Option<AddressMeta> {
@@ -62,7 +107,15 @@ fn spends_by_tx(app: &App, account: &Account, outputs: &HashMap<i64, OutputRow>)
     Ok(by_tx)
 }
 
-pub async fn login(State(app): State<Arc<App>>, Json(req): Json<LoginRequest>) -> Reply<LoginResponse> {
+/// `/login`. The view key must fit the address (`check_login`) before
+/// anything is looked up or stored. With `--create off` a new address gets
+/// 501, as the community spec says; monero-lws has no such mode (it always
+/// queues or accepts). Logs name accounts by row id, never by address.
+pub async fn login(
+    State(app): State<Arc<App>>,
+    client: Option<Extension<ClientIp>>,
+    ApiJson(req): ApiJson<LoginRequest>,
+) -> Reply<LoginResponse> {
     let checked = crypto::check_login(app.scanner.config.network, &req.login.address, &req.login.view_key.0)?;
     if let Some(account) = app.db.account(&checked.address)? {
         if account.status == Status::Hidden || account.view_key.ct_eq(&checked.view_key).unwrap_u8() == 0 {
@@ -79,6 +132,10 @@ pub async fn login(State(app): State<Arc<App>>, Json(req): Json<LoginRequest>) -
     if !req.create_account {
         return Err(Error::Forbidden.into());
     }
+    if app.config.create == Policy::Off {
+        return Err(Error::NoCreate.into());
+    }
+    creation_allowed(&app, client.as_ref())?;
     let height = chain_height(&app);
     let new = NewAccount {
         address: checked.address.clone(),
@@ -91,9 +148,9 @@ pub async fn login(State(app): State<Arc<App>>, Json(req): Json<LoginRequest>) -
     match app.config.create {
         Policy::Off => Err(Error::NoCreate.into()),
         Policy::Auto => {
-            app.db.add_account(&new, Status::Active)?;
+            let account = app.db.add_account(&new, Status::Active)?;
             app.scanner.wake.notify_one();
-            tracing::info!("new account {} from height {}", short(&new.address), new.start_height);
+            tracing::info!("new account #{} from height {}", account.id, new.start_height);
             Ok(Json(LoginResponse {
                 new_address: true,
                 generated_locally: Some(req.generated_locally),
@@ -102,11 +159,12 @@ pub async fn login(State(app): State<Arc<App>>, Json(req): Json<LoginRequest>) -
             }))
         }
         Policy::Approve => {
+            queue_has_room(&app)?;
             if !app.db.add_request("create", &new)? {
                 // Asked before and not yet accepted.
                 return Err(Error::Forbidden.into());
             }
-            tracing::info!("account request from {}", short(&new.address));
+            tracing::info!("a new account request is waiting for approval");
             Ok(Json(LoginResponse {
                 new_address: true,
                 generated_locally: Some(req.generated_locally),
@@ -117,15 +175,7 @@ pub async fn login(State(app): State<Arc<App>>, Json(req): Json<LoginRequest>) -
     }
 }
 
-fn short(address: &str) -> String {
-    format!(
-        "{}…{}",
-        &address[..8.min(address.len())],
-        &address[address.len().saturating_sub(4)..]
-    )
-}
-
-pub async fn get_address_info(State(app): State<Arc<App>>, Json(login): Json<Login>) -> Reply<AddressInfo> {
+pub async fn get_address_info(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<AddressInfo> {
     let account = authorize(&app, &login).await?;
     let chain = chain_height(&app);
     let now = crate::db::now();
@@ -160,7 +210,7 @@ pub async fn get_address_info(State(app): State<Arc<App>>, Json(login): Json<Log
     }))
 }
 
-pub async fn get_address_txs(State(app): State<Arc<App>>, Json(login): Json<Login>) -> Reply<AddressTxs> {
+pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<AddressTxs> {
     let account = authorize(&app, &login).await?;
     let chain = chain_height(&app);
     let rows = app.db.txs(account.id)?;
@@ -261,7 +311,10 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, Json(login): Json<Logi
     }))
 }
 
-pub async fn get_unspent_outs(State(app): State<Arc<App>>, Json(req): Json<UnspentOutsRequest>) -> Reply<UnspentOuts> {
+pub async fn get_unspent_outs(
+    State(app): State<Arc<App>>,
+    ApiJson(req): ApiJson<UnspentOutsRequest>,
+) -> Reply<UnspentOuts> {
     let account = authorize(&app, &req.login).await?;
     let fee = app.fee().await?;
     let txs: HashMap<i64, TxRow> = app.db.txs(account.id)?.into_iter().map(|t| (t.id, t)).collect();
@@ -319,20 +372,27 @@ pub async fn get_unspent_outs(State(app): State<Arc<App>>, Json(req): Json<Unspe
     }))
 }
 
-pub async fn get_random_outs(State(app): State<Arc<App>>, Json(req): Json<RandomOutsRequest>) -> Reply<RandomOuts> {
-    if req.count == 0 || req.count > 64 {
-        return Err(bad("count must be 1 to 64").into());
+/// Ring members a ring and rings a request, at most: monero-lws's limits.
+pub const MAX_RING_SIZE: u32 = 20;
+pub const MAX_RINGS: usize = 150;
+
+pub async fn get_random_outs(
+    State(app): State<Arc<App>>,
+    ApiJson(req): ApiJson<RandomOutsRequest>,
+) -> Reply<RandomOuts> {
+    if req.count == 0 || req.count > MAX_RING_SIZE {
+        return Err(bad(format!("count must be 1 to {MAX_RING_SIZE}")).into());
     }
-    if req.amounts.is_empty() || req.amounts.len() > 128 {
-        return Err(bad("1 to 128 amounts").into());
+    if req.amounts.is_empty() || req.amounts.len() > MAX_RINGS {
+        return Err(bad(format!("1 to {MAX_RINGS} amounts")).into());
     }
     if req.amounts.iter().any(|a| a.0 != 0) {
         return Err(bad("only RingCT (amount 0) outputs are served").into());
     }
-    let rings = {
-        let mut picker = app.picker.lock().await;
-        picker.rings(&app.daemon, req.count as usize, req.amounts.len()).await?
-    };
+    let rings = app
+        .picker
+        .rings(&app.daemon, req.count as usize, req.amounts.len())
+        .await?;
     Ok(Json(RandomOuts {
         amount_outs: rings
             .into_iter()
@@ -353,10 +413,13 @@ pub async fn get_random_outs(State(app): State<Arc<App>>, Json(req): Json<Random
 
 pub async fn submit_raw_tx(
     State(app): State<Arc<App>>,
-    Json(req): Json<SubmitRequest>,
+    ApiJson(req): ApiJson<SubmitRequest>,
 ) -> std::result::Result<axum::response::Response, ApiError> {
     if req.tx.0.is_empty() {
         return Err(bad("an empty transaction").into());
+    }
+    if req.tx.0.len() > MAX_TX_BYTES {
+        return Err(bad(format!("a transaction is at most {MAX_TX_BYTES} bytes")).into());
     }
     let result = app.daemon.send_raw(&hex::encode(&req.tx.0)).await?;
     if result.status == "OK" {
@@ -384,8 +447,12 @@ pub async fn submit_raw_tx(
         .into_response())
 }
 
-pub async fn import_wallet_request(State(app): State<Arc<App>>, Json(login): Json<Login>) -> Reply<ImportResponse> {
-    let account = authorize(&app, &login).await?;
+pub async fn import_wallet_request(
+    State(app): State<Arc<App>>,
+    client: Option<Extension<ClientIp>>,
+    ApiJson(login): ApiJson<Login>,
+) -> Reply<ImportResponse> {
+    let account = authorize_active(&app, &login).await?;
     let reply = |new_request, request_fulfilled, status: &str| {
         Json(ImportResponse {
             payment_address: None,
@@ -399,9 +466,15 @@ pub async fn import_wallet_request(State(app): State<Arc<App>>, Json(login): Jso
     match app.config.import {
         Policy::Off => Err(Error::NoCreate.into()),
         Policy::Auto => {
-            app.db.rescan(&[account.address.clone()], 0)?;
+            // Nothing to do for an account that starts at 0, or whose
+            // import hasn't got past block 0 yet.
+            if account.start_height == 0 || account.scan_height == 0 {
+                return Ok(reply(false, true, "Approved"));
+            }
+            creation_allowed(&app, client.as_ref())?;
+            app.db.rescan(std::slice::from_ref(&account.address), 0)?;
             app.scanner.wake.notify_one();
-            tracing::info!("import for {}: scanning from 0", short(&account.address));
+            tracing::info!("import for account #{}: scanning from 0", account.id);
             Ok(reply(true, true, "Approved"))
         }
         Policy::Approve => {
@@ -413,6 +486,16 @@ pub async fn import_wallet_request(State(app): State<Arc<App>>, Json(login): Jso
                 start_height: 0,
                 generated_locally: account.generated_locally,
             };
+            if app
+                .db
+                .requests()?
+                .iter()
+                .any(|(k, r)| k == "import" && r.address == new.address)
+            {
+                return Ok(reply(false, false, "Already requested"));
+            }
+            queue_has_room(&app)?;
+            creation_allowed(&app, client.as_ref())?;
             let added = app.db.add_request("import", &new)?;
             Ok(reply(added, false, if added { "Pending" } else { "Already requested" }))
         }
@@ -426,7 +509,34 @@ fn subaddresses_on(app: &App) -> Result<u64> {
     Ok(u64::from(app.config.max_subaddresses))
 }
 
-pub async fn get_subaddrs(State(app): State<Arc<App>>, Json(login): Json<Login>) -> Reply<Subaddrs> {
+/// Ranges an `/upsert_subaddrs` may carry, at most, in all majors.
+const MAX_RANGES: usize = 1_000;
+
+/// An `/upsert_subaddrs` request's ranges, checked before the database sees
+/// them: not too many, each the right way round, and not more minors in all
+/// than an account may have (the database then checks the total with what
+/// the account already has).
+fn check_ranges(ranges: &[SubaddrRanges], max: u64) -> Result<()> {
+    let count: usize = ranges.iter().map(|r| r.value.len()).sum();
+    if count > MAX_RANGES {
+        return Err(bad(format!("at most {MAX_RANGES} ranges a request")));
+    }
+    let mut minors = 0u64;
+    for r in ranges {
+        for &[lo, hi] in &r.value {
+            if lo > hi {
+                return Err(bad("a subaddress range runs backwards"));
+            }
+            minors += u64::from(hi - lo) + 1;
+        }
+    }
+    if minors > max {
+        return Err(Error::Conflict(format!("asking for more than the limit of {max}")));
+    }
+    Ok(())
+}
+
+pub async fn get_subaddrs(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<Subaddrs> {
     let max = subaddresses_on(&app)?;
     let account = authorize(&app, &login).await?;
     Ok(Json(Subaddrs {
@@ -437,10 +547,11 @@ pub async fn get_subaddrs(State(app): State<Arc<App>>, Json(login): Json<Login>)
 
 pub async fn upsert_subaddrs(
     State(app): State<Arc<App>>,
-    Json(req): Json<UpsertSubaddrsRequest>,
+    ApiJson(req): ApiJson<UpsertSubaddrsRequest>,
 ) -> Reply<NewSubaddrs> {
     let max = subaddresses_on(&app)?;
-    let account = authorize(&app, &req.login).await?;
+    check_ranges(&req.subaddrs, max)?;
+    let account = authorize_active(&app, &req.login).await?;
     let new_subaddrs = app.db.upsert_subaddrs(account.id, &req.subaddrs, max)?;
     let all_subaddrs = req.get_all.then(|| app.db.subaddrs(account.id)).transpose()?;
     Ok(Json(NewSubaddrs {
@@ -451,10 +562,10 @@ pub async fn upsert_subaddrs(
 
 pub async fn provision_subaddrs(
     State(app): State<Arc<App>>,
-    Json(req): Json<ProvisionSubaddrsRequest>,
+    ApiJson(req): ApiJson<ProvisionSubaddrsRequest>,
 ) -> Reply<NewSubaddrs> {
     let max = subaddresses_on(&app)?;
-    let account = authorize(&app, &req.login).await?;
+    let account = authorize_active(&app, &req.login).await?;
     let maj_i = req.maj_i.unwrap_or(0);
     let n_maj = req.n_maj.unwrap_or(1).max(1);
     let n_min = req.n_min.unwrap_or(1).max(1);
@@ -485,7 +596,7 @@ pub async fn provision_subaddrs(
 
 pub async fn get_version(State(app): State<Arc<App>>) -> Reply<Version> {
     let status = app.scanner.status();
-    let info = app.daemon.info().await.ok();
+    let info = app.info().await.ok();
     let network = app.scanner.config.network;
     Ok(Json(Version {
         server_type: "monokulo-lws".into(),
@@ -500,19 +611,21 @@ pub async fn get_version(State(app): State<Arc<App>>) -> Reply<Version> {
     }))
 }
 
-/// Not in any spec: how the scanner and the daemon are doing.
+/// Not in any spec: how the scanner and the daemon are doing. Public, so it
+/// says nothing of where the node is.
 pub async fn daemon_status(State(app): State<Arc<App>>) -> Reply<serde_json::Value> {
     let status = app.scanner.status();
-    let info = app.daemon.info().await;
+    let info = app.info().await;
     Ok(Json(json!({
         "server": env!("CARGO_PKG_VERSION"),
         "network": crypto::network_name(app.scanner.config.network),
-        "daemon": app.daemon.url(),
         "daemon_reachable": info.is_ok(),
         "daemon_height": info.as_ref().map(|i| i.height).unwrap_or(status.chain_height),
         "daemon_synced": info.as_ref().map(|i| i.synchronized).unwrap_or(false),
         "scanner_height": status.scanner_height,
-        "scanner_error": status.last_error,
+        // Whether the last step failed; what failed is in the server's log
+        // (it can name the node, which a public endpoint shouldn't).
+        "scanner_error": status.last_error.as_ref().map(|_| "the last scan step failed; see the server log"),
         "scanner_seconds_ago": status.last_step.map(|t| t.elapsed().as_secs()),
         // What finds the outputs: the GPU's prefilter, or monero-oxide alone and why.
         "scanner_engine": match monokulo_8ar::engine() {
