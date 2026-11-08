@@ -93,17 +93,38 @@ now.
 `/get_subaddrs`, `/upsert_subaddrs`, `/provision_subaddrs`, `/get_version`,
 and `/daemon_status` (not in any spec: how the scanner and node are doing).
 
-Two things beyond the community API worth knowing:
+Things beyond the community API worth knowing:
 
-- **The mempool is reported.** monero-lws never lists pool transactions over
-  REST. Here a pool transaction to the account appears in `/get_address_txs`
-  with `mempool: true` and no height, and goes away when mined (and comes
-  back with a height) or dropped.
+- **The mempool is reported**, as monero-lws does. A pool transaction that
+  pays the account, or whose ring holds one of its outputs, appears in
+  `/get_address_txs` with `mempool: true`, no height and no timestamp (its
+  outputs counted in `total_received`, its candidate spends in
+  `spent_outputs`), and goes away when dropped. Once mined it is listed
+  once, mined, with its height, even before the pool is looked at again.
 - **Outputs come on each transaction** (`receives`, as monero-lws 1.0 adds):
   amount, one-time key, index, global index, the transaction key the output
-  was derived from (the additional one for a subaddress), the RingCT mask
-  and the subaddress. A client can build a spendable output from these
-  without `/get_unspent_outs`.
+  was derived from (the additional one for a subaddress), the RingCT mask,
+  the subaddress, and the output's **commitment as the chain holds it**
+  (the RingCT base's `outPk`; `G + amount·H` for a miner output, which is
+  what the chain's output set holds for it). A client can check `mask·G +
+  amount·H` against it rather than trust the server's amount and mask, and
+  build a spendable output without `/get_unspent_outs`. monero-lws does not
+  send `commitment`.
+- **Each transaction carries its fee** (`fee`, a decimal string, as
+  monero-lws writes it): the RingCT base's fee, or inputs less outputs for a
+  pre-RingCT transaction. A coinbase transaction has none, and the field is
+  left out (monero-lws writes `"0"`). Pool transactions carry theirs too.
+- `/get_unspent_outs`'s 96-byte `rct` starts with that same on-chain
+  commitment, then the mask and the amount encrypted the original way. As
+  with monero-lws, every received output is listed, locked ones included
+  (by age, by `unlock_time`, or a coinbase not yet 60 blocks deep): the
+  client decides from the transaction's `unlock_time` in
+  `/get_address_txs`. `/get_address_info`'s `locked_funds` counts them by
+  wallet2's rules (10 blocks; an `unlock_time` below 500,000,000 is a
+  height, else a time with 120 s of leeway).
+- A new account made by `/login` starts at the chain's top block, which is
+  scanned for it too. `/login` takes no start height (nor does monero-lws's);
+  an operator gives one with `admin add-account --start-height` or `rescan`.
 
 Spends are **candidates**: an input whose ring holds one of the account's
 outputs. The server can't tell a real spend from a decoy use; the client
@@ -134,8 +155,18 @@ compares.
 - Candidate spends: every RingCT input's ring, resolved to global indices,
   looked up once per ring member in one map of every account's outputs.
 - 200 block hashes are kept; a batch whose first block doesn't follow the
-  last kept one means a reorg, and everything from the fork on is dropped
-  and scanned again.
+  last kept one, or (once caught up) a top block whose hash isn't the one
+  kept for that height, means a reorg: outputs, candidate spends and
+  transactions from the fork on are dropped for every account, accounts
+  past it move back to it, what the pool held is forgotten and looked at
+  again, and the new blocks are scanned with the node's global indices.
+- One SQLite transaction per batch: outputs, spends, block hashes and scan
+  heights land together or not at all, so a kill mid-batch leaves every
+  account at a height it really scanned to. A batch writes only for the
+  accounts still where it was planned from: one rescanned (admin `rescan`,
+  `/import_wallet_request`), rewound by a reorg or hidden while its blocks
+  were fetched is left for the next batch, so no block is lost or written
+  twice.
 - Ring members for `/get_random_outs` are drawn from the RingCT output
   distribution with wallet2's gamma over age, fetched with `get_outs`, and
   kept only if unlocked.
@@ -157,7 +188,17 @@ GPU the cost is accounts × blocks of monero-oxide scans: fine for a shop, a
 family or a few dozen wallets. See `docs/scanning.md`.
 
 Not built yet: webhooks, the `/feed` websocket, fiat `rates`, pre-RingCT
-spends, import fees, remote scanning, `get_tree_path`, TLS on the listener.
+outputs and spends (monero-oxide's `Scanner` reads only RingCT
+transactions, so outputs from before 2017's RingCT fork are not found and
+`rct` is never left out for that reason), import fees, remote scanning,
+`get_tree_path`, TLS on the listener.
+
+A database made before `outputs.commitment` existed is brought up to date
+on opening: the column is added and each output's commitment is worked out
+from its stored mask and amount, which is the on-chain one, since the
+scanner only keeps an output whose `mask·G + amount·H` equals the
+transaction's `outPk`. No rescan is needed. Fees were stored from the
+start.
 
 ## Developing
 
@@ -168,6 +209,14 @@ RUST_LOG=debug cargo run -- serve --daemon http://stagenet.xmr-tw.org:38081 --db
 cargo test -p monokulo-lws -- --ignored the_gpu   # the keyring on a real GPU
 cargo run --release -- replay ../monokulo-8ar/prototypes/fixtures/mainnet-3797000-2000.bin --accounts 1,10,100,1000
 ```
+
+`cargo test` needs neither a node nor a GPU: `src/testkit.rs` makes blocks
+with real one-time keys, view tags, encrypted amounts and commitments, and
+`src/correctness.rs` puts them through the scanner (unfiltered, and as
+stand-in blocks for every transaction, which must write the same rows) and
+calls the wallet handlers on the result. One test plants payments in
+monokulo-8ar's mainnet fixture (`../monokulo-8ar/prototypes/fixtures/`, or
+`LWS_FIXTURE`) and is skipped when it is absent.
 
 `replay` rebuilds blocks from monokulo-8ar's 2,000-block mainnet fixture
 (each transaction key with its outputs' view tags and keys, one transaction
