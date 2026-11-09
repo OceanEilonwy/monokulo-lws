@@ -2,3 +2,8 @@ target/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# scripts/build-openwrt.sh: the binary it drops into the package, the
+# package and the repository.
+/openwrt/monokulo-lws/files/monokulo-lws
+/dist/

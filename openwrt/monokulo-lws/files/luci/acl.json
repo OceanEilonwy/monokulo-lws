@@ -1,0 +1,18 @@
+{
+	"luci-app-monokulo-lws": {
+		"description": "Grant access to the light wallet server's settings and wallets",
+		"read": {
+			"ubus": {
+				"monokulo-lws": [ "status", "accounts" ]
+			},
+			"uci": [ "monokulo-lws" ]
+		},
+		"write": {
+			"ubus": {
+				"monokulo-lws": [ "add_account", "set_status", "rescan", "remove_accounts", "requests", "restart", "reload", "new_admin_key" ],
+				"uci": [ "commit" ]
+			},
+			"uci": [ "monokulo-lws" ]
+		}
+	}
+}

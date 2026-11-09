@@ -219,6 +219,13 @@ enum AdminCommand {
         #[arg(long, default_value_t = 0)]
         start_height: u64,
     },
+    /// Forget an account and everything scanned for it.
+    RemoveAccount {
+        #[arg(long, env = "LWS_DB", default_value = "monokulo-lws.sqlite")]
+        db: PathBuf,
+        #[arg(long)]
+        address: String,
+    },
     /// List accounts and pending requests.
     List {
         #[arg(long, env = "LWS_DB", default_value = "monokulo-lws.sqlite")]
@@ -495,6 +502,13 @@ fn admin(command: AdminCommand) -> anyhow::Result<()> {
                 Status::Active,
             )?;
             println!("added {} from height {}", account.address, account.start_height);
+        }
+        AdminCommand::RemoveAccount { db, address } => {
+            let db = open_db(&db)?;
+            if db.remove_accounts(std::slice::from_ref(&address))?.is_empty() {
+                bail!("no account with that address");
+            }
+            println!("removed {address}");
         }
         AdminCommand::List { db } => {
             let db = open_db(&db)?;

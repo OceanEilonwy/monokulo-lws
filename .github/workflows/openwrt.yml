@@ -1,0 +1,155 @@
+# The OpenWrt package: monokulo-lws with its LuCI page, a signed .apk, and
+# a signed apk repository holding it, for each OpenWrt release and CPU
+# architecture in the build matrix below (25.12 on the GL.iNet Flint 2,
+# mediatek/filogic, aarch64_cortex-a53; and 25.12 on x86_64). The build is
+# scripts/build-openwrt.sh.
+#
+# Every push to main builds it; a pull request builds it when it changes
+# the package, the server or the build. Each matrix entry uploads as
+# artifacts
+#   monokulo-lws-openwrt-<release>-<arch>   the .apk, the repository index
+#                                           (packages.adb), the public key
+#                                           (monokulo.pem) and SHA256SUMS
+#   openwrt-repo-<release>-<arch>           the signed apk repository (the
+#                                           .apk and packages.adb)
+# The test job then boots OpenWrt's x86_64 rootfs in Docker and installs,
+# runs, drives, upgrades and removes the x86_64 package there
+# (scripts/test-openwrt.sh). There is no aarch64_cortex-a53 rootfs image:
+# that build's proof is its static-link check, and the router.
+#
+# Needs the repository secret APK_SIGNING_KEY: the private key matching
+# openwrt/keys/monokulo.pem (the same key signs monokulo and kringle). Pull
+# requests from forks (no secret access) still build, with a throwaway key.
+
+name: openwrt package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'openwrt/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/build-openwrt.sh'
+      - 'scripts/test-openwrt.sh'
+      - '.github/workflows/openwrt.yml'
+  workflow_dispatch:
+
+# A newer push to the same pull request replaces its run still going.
+concurrency:
+  group: openwrt-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # One build per OpenWrt release and CPU architecture. A release or
+    # architecture is supported by adding an entry here.
+    name: build the openwrt package (${{ matrix.release }}, ${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The GL.iNet Flint 2 (mediatek/filogic).
+          - release: '25.12'
+            arch: aarch64_cortex-a53
+            sdk_image: openwrt/sdk:mediatek-filogic-25.12.5
+            rust_target: aarch64-unknown-linux-musl
+            toolchain_prefix: aarch64-openwrt-linux-musl
+          # PCs, and x86_64 virtual machines (the test job boots this one).
+          - release: '25.12'
+            arch: x86_64
+            sdk_image: openwrt/sdk:x86-64-25.12.5
+            rust_target: x86_64-unknown-linux-musl
+            toolchain_prefix: x86_64-openwrt-linux-musl
+    env:
+      SDK_IMAGE: ${{ matrix.sdk_image }}
+      OPENWRT_ARCH: ${{ matrix.arch }}
+      RUST_TARGET: ${{ matrix.rust_target }}
+      TOOLCHAIN_PREFIX: ${{ matrix.toolchain_prefix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The package's release number is the commit count.
+          fetch-depth: 0
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.rust_target }} && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: openwrt-${{ matrix.release }}-${{ matrix.arch }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the package and repository
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+          SDK_VOLUME: "" # fresh runner every time, no point keeping SDK state
+        run: |
+          if [ -z "$APK_SIGNING_KEY" ] && [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "::error::Set the APK_SIGNING_KEY secret; routers won't trust a package signed with a throwaway key."
+            exit 1
+          fi
+          scripts/build-openwrt.sh
+      - name: Summary
+        env:
+          SIGNED: ${{ secrets.APK_SIGNING_KEY != '' }}
+        run: |
+          {
+            echo "## OpenWrt package (${{ matrix.release }}, ${{ matrix.arch }})"
+            echo
+            echo "| File | Size |"
+            echo "| --- | ---: |"
+            for f in dist/*.apk dist/packages.adb dist/monokulo.pem; do
+              echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
+            done
+            echo
+            if [ "$SIGNED" = true ]; then
+              echo "Signed with the key in \`openwrt/keys/monokulo.pem\`."
+            else
+              echo "Signed with a **throwaway key**: for testing only."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: monokulo-lws-openwrt-${{ matrix.release }}-${{ matrix.arch }}
+          path: |
+            dist/*.apk
+            dist/packages.adb
+            dist/monokulo.pem
+            dist/SHA256SUMS
+            dist/throwaway.pem
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@v7
+        with:
+          name: openwrt-repo-${{ matrix.release }}-${{ matrix.arch }}
+          path: dist/repo/
+          if-no-files-found: error
+          retention-days: 90
+
+  test:
+    # The x86_64 package on OpenWrt itself: its official rootfs image booted
+    # in Docker (procd, ubus, rpcd, uhttpd), the package installed by name
+    # from the signed repository, started against a stand-in node, driven
+    # through the LuCI page's backend, upgraded and removed.
+    name: test the openwrt package (25.12, x86_64)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: monokulo-lws-openwrt-25.12-x86_64
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: openwrt-repo-25.12-x86_64
+          path: dist/repo
+      - name: Install, run, drive, upgrade and remove it in OpenWrt
+        run: scripts/test-openwrt.sh dist

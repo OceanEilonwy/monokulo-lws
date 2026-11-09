@@ -703,3 +703,84 @@ async fn the_listener_speaks_tls() {
     assert!(crate::server::tls_acceptor(&dir.join("missing.pem"), &dir.join("key.pem")).is_err());
     assert!(crate::server::tls_acceptor(&dir.join("key.pem"), &dir.join("key.pem")).is_err());
 }
+
+/// `remove_accounts`, ours: the accounts named go whole, with their rows
+/// and a request waiting under their address; the others stay; an address
+/// that isn't an account is passed over. And `add_account` with a key that
+/// isn't the address's is a 400 that says so, not the admin key's 403.
+#[tokio::test]
+async fn remove_accounts_forgets_the_accounts_whole() {
+    let app = app(Setup {
+        create: Policy::Approve,
+        ..Setup::default()
+    });
+    let wallets = wallet_router(app.clone());
+    let admin = admin_router(app.clone());
+    let auth = hex::encode(*crate::admin_keys::create(&app.db).unwrap());
+    let (address, key) = wallet(40);
+    let (kept, kept_key) = wallet(41);
+    let (asking, asking_key) = wallet(42);
+    for (a, k) in [(&address, &key), (&kept, &kept_key)] {
+        let r = call(
+            &admin,
+            "/add_account",
+            &json!({ "auth": auth, "params": { "address": a, "key": hex::encode(k) } }),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    }
+    let r = call(
+        &admin,
+        "/add_account",
+        &json!({ "auth": auth, "params": { "address": asking, "key": hex::encode(key) } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.body, "the view key doesn't belong to the address");
+    let mut create = login_body(&asking, &asking_key);
+    create["create_account"] = json!(true);
+    assert_eq!(call(&wallets, "/login", &create).await.status, StatusCode::OK);
+    let listed: Value =
+        serde_json::from_str(&call(&admin, "/list_requests", &json!({ "auth": auth })).await.body).unwrap();
+    assert_eq!(listed["create"].as_array().unwrap().len(), 1);
+
+    let r = call(
+        &admin,
+        "/remove_accounts",
+        &json!({ "auth": auth, "params": { "addresses": [address, asking, "not an account"] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let removed: Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(removed["removed"], json!([address]));
+
+    let accounts: Value =
+        serde_json::from_str(&call(&admin, "/list_accounts", &json!({ "auth": auth })).await.body).unwrap();
+    let active: Vec<&str> = accounts["active"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(active, [kept.as_str()]);
+    let listed: Value =
+        serde_json::from_str(&call(&admin, "/list_requests", &json!({ "auth": auth })).await.body).unwrap();
+    // An empty list is left out of the answer.
+    assert!(
+        listed.get("create").is_none(),
+        "the request under the address went too: {listed}"
+    );
+    assert!(app.db.account(&address).unwrap().is_none());
+    // The removed wallet asks afresh, as any new one.
+    let mut create = login_body(&address, &key);
+    create["create_account"] = json!(true);
+    assert_eq!(call(&wallets, "/login", &create).await.status, StatusCode::OK);
+    // Without the admin key, nothing.
+    let r = call(
+        &admin,
+        "/remove_accounts",
+        &json!({ "params": { "addresses": [kept] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+}

@@ -1,0 +1,19 @@
+#!/bin/sh
+# shellcheck shell=ash
+# A traffic rule that lets the internet reach the wallet API's port, made
+# off: turn it on in Network > Firewall > Traffic Rules once the server
+# listens off loopback with TLS (every request carries a view key). Behind
+# a TLS proxy on this router, open the proxy's 443 instead.
+[ -f /etc/config/firewall ] || exit 0
+uci -q get firewall.monokulo_lws >/dev/null && exit 0
+uci -q batch <<-'UCI'
+	set firewall.monokulo_lws=rule
+	set firewall.monokulo_lws.name='Allow-monokulo-lws'
+	set firewall.monokulo_lws.src='wan'
+	set firewall.monokulo_lws.proto='tcp'
+	set firewall.monokulo_lws.dest_port='8443'
+	set firewall.monokulo_lws.target='ACCEPT'
+	set firewall.monokulo_lws.enabled='0'
+	commit firewall
+UCI
+exit 0
