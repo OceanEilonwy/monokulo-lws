@@ -1,0 +1,14 @@
+{
+	"admin/services/monokulo-lws": {
+		"title": "Light Wallet Server",
+		"order": 93,
+		"action": {
+			"type": "view",
+			"path": "monokulo-lws"
+		},
+		"depends": {
+			"acl": [ "luci-app-monokulo-lws" ],
+			"uci": { "monokulo-lws": true }
+		}
+	}
+}

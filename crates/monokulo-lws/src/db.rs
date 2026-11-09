@@ -462,6 +462,31 @@ impl Db {
         })
     }
 
+    /// Forgets these accounts whole: the account, its view key, its
+    /// transactions, outputs, spends and subaddresses, any request pending
+    /// under its address, and the proofs kept for it alone. Not monero-lws's
+    /// (it only hides); an operator's choice, for a wallet that has moved on.
+    pub fn remove_accounts(&self, addresses: &[String]) -> Result<Vec<String>> {
+        self.write(|tx| {
+            let mut done = vec![];
+            for a in addresses {
+                let id: Option<i64> = tx
+                    .query_row("SELECT id FROM accounts WHERE address = ?1", [a], |r| r.get(0))
+                    .optional()?;
+                tx.execute("DELETE FROM requests WHERE address = ?1", [a])?;
+                let Some(id) = id else { continue };
+                delete_account_from(tx, id, 0)?;
+                tx.execute("DELETE FROM subaddrs WHERE account = ?1", [id])?;
+                tx.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
+                done.push(a.clone());
+            }
+            if !done.is_empty() {
+                drop_unused_kept(tx, 0)?;
+            }
+            Ok(done)
+        })
+    }
+
     /// An accepted import: the accounts start at block 0 and scan again
     /// from it, as monero-lws's import does.
     pub fn import(&self, addresses: &[String]) -> Result<Vec<String>> {

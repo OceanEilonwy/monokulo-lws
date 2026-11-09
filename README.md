@@ -34,6 +34,11 @@ The wallet API is then at `http://127.0.0.1:8443`. Put TLS in front of it
 `--tls-cert` and `--tls-key`: every request carries a view key in its body.
 Listening anywhere but loopback takes `--confirm-external-bind`.
 
+On an OpenWrt router, install the package instead: every push to main
+builds `monokulo-lws` for aarch64 and x86_64 with a LuCI page, Services >
+Light Wallet Server, that holds every setting below and the wallets the
+server scans ([docs/openwrt.md](docs/openwrt.md)).
+
 Options that matter:
 
 | Option | Default | What |
@@ -119,7 +124,10 @@ curl -X POST http://127.0.0.1:8444/list_accounts -H 'Content-Type: application/j
 Commands: `accept_requests`, `reject_requests` (`{"type":"create"|"import",
 "addresses":[...]}`), `add_account`, `list_accounts`, `list_requests`,
 `modify_account_status` (`active`, `inactive`, `hidden`), `rescan`
-(`{"height":..., "addresses":[...]}`), `validate`. Webhooks answer 501 for
+(`{"height":..., "addresses":[...]}`), `validate`; and one of its own,
+`remove_accounts` (`{"addresses":[...]}`), which forgets the accounts and
+everything scanned for them, where monero-lws only hides (`admin
+remove-account` does the same on the command line). Webhooks answer 501 for
 now.
 
 ## What it answers

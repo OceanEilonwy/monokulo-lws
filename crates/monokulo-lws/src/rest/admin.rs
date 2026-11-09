@@ -54,6 +54,7 @@ pub async fn command(
         "list_requests" => list_requests(&app)?,
         "modify_account_status" => modify_status(&app, params(&req.params)?)?,
         "rescan" => rescan(&app, params(&req.params)?)?,
+        "remove_accounts" => remove(&app, params(&req.params)?)?,
         "validate" => validate(&app, params(&req.params)?)?,
         "webhook_add" | "webhook_delete" | "webhook_delete_uuid" | "webhook_list" => {
             return Ok((StatusCode::NOT_IMPLEMENTED, "webhooks aren't built yet").into_response());
@@ -91,7 +92,12 @@ fn reject(app: &App, p: Requests) -> Result<Value> {
 }
 
 fn add_account(app: &App, p: AddAccount) -> Result<Value> {
-    let checked = crypto::check_login(app.scanner.config.network, &p.address, &p.key.0)?;
+    // A key that isn't the address's is the operator's mistake, not a
+    // failed login: a 400 with the reason, and 403 stays the admin key's.
+    let checked = crypto::check_login(app.scanner.config.network, &p.address, &p.key.0).map_err(|e| match e {
+        Error::Forbidden => bad("the view key doesn't belong to the address"),
+        other => other,
+    })?;
     let height = app.scanner.status().chain_height;
     let new = NewAccount {
         address: checked.address.clone(),
@@ -150,6 +156,14 @@ fn rescan(app: &App, p: Rescan) -> Result<Value> {
     let done = app.db.rescan(&p.addresses, p.height)?;
     app.scanner.wake.notify_one();
     Ok(json!({ "updated": done }))
+}
+
+/// Not in monero-lws's API, which only hides an account: forgets these
+/// accounts and everything scanned for them.
+fn remove(app: &App, p: Addresses) -> Result<Value> {
+    let done = app.db.remove_accounts(&p.addresses)?;
+    app.scanner.wake.notify_one();
+    Ok(json!({ "removed": done }))
 }
 
 fn validate(app: &App, p: Validate) -> Result<Value> {

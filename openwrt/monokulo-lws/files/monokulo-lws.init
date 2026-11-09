@@ -1,0 +1,333 @@
+#!/bin/sh /etc/rc.common
+# shellcheck shell=ash
+# shellcheck disable=SC2034,SC3043
+# monokulo-lws, the Monero light wallet server. Its settings are in
+# /etc/config/monokulo-lws, or LuCI: Services > Light Wallet Server. The
+# server takes options on its command line, not a file, so each start
+# turns the settings into one (`monokulo-lws serve --help` names them all);
+# only what is set is passed, and the server's own defaults rule the rest.
+#
+# The admin API is always on, on this router alone (127.0.0.1), for the
+# LuCI page: its key is made with the database at the first start and kept
+# in /etc/monokulo-lws/secrets/, root's alone (the server keeps only its
+# hash). A bad setting never stops a running server: a reload (a save in
+# LuCI, `uci commit`) whose settings this script refuses leaves it running
+# on its earlier ones, and the reason is in /tmp/monokulo-lws.check for
+# LuCI to show. What the server itself refuses is in its log (logread).
+
+START=99
+STOP=10
+USE_PROCD=1
+EXTRA_COMMANDS="admin_key"
+EXTRA_HELP="	admin_key	Make a new admin key for the LuCI page (stops and starts the server)"
+
+NAME=monokulo-lws
+BIN=/usr/bin/monokulo-lws
+RUN_AS=monokulo-lws
+PAGE="Services > Light Wallet Server"
+SECRETS_DIR=/etc/monokulo-lws/secrets
+KEY_FILE=$SECRETS_DIR/MONOKULO_LWS_ADMIN_KEY
+DEFAULT_DATA_DIR=/srv/monokulo-lws
+DB_FILE=lws.sqlite
+# What the last start refused, for LuCI.
+CHECK_FILE=/tmp/monokulo-lws.check
+# Which build the package installed (its Makefile writes it).
+VERSION_FILE=/usr/share/monokulo-lws/version
+
+# The settings passed through as they are: "<option> <UCI option> <kind>".
+# value: --option VALUE. list: a UCI list, comma separated. repeat: the
+# option once per entry of a UCI list. The wallet listener, the admin
+# listener, the database and the shader cache are set apart, from port,
+# listen, admin_port and data_dir.
+OPTIONS='
+--daemon daemon value
+--network network value
+--create create value
+--import import value
+--max-subaddresses max_subaddresses value
+--lookahead lookahead value
+--scan-interval scan_interval value
+--tls-cert tls_cert value
+--tls-key tls_key value
+--trusted-proxies trusted_proxy list
+--client-ip-header client_ip_header value
+--access-control-origin access_control_origin repeat
+--rate-limit rate_limit value
+--strict-rate-limit strict_rate_limit value
+--max-new-accounts-per-hour max_new_accounts_per_hour value
+--max-pending-requests max_pending_requests value
+--max-connections max_connections value
+--max-connections-per-ip max_connections_per_ip value
+--request-timeout request_timeout value
+--catch-up-lanes catch_up_lanes value
+--catch-up-join catch_up_join value
+--catch-up-blocks catch_up_blocks value
+--catch-up-in-flight catch_up_in_flight value
+--gpu-arenas gpu_arenas value
+--gpu-memory-mb gpu_memory_mb value
+'
+
+log() {
+	logger -t "$NAME" "$*"
+}
+
+# refuse <why>: logged, and kept for LuCI.
+refuse() {
+	log "$1"
+	printf '%s\n' "$1" >"$CHECK_FILE"
+}
+
+# Whether procd runs the server now. Not procd_running, which would reset
+# the service description start_service is in the middle of.
+running_now() {
+	ubus call service list "{\"name\":\"$NAME\"}" 2>/dev/null |
+		jsonfilter -q -e "@['$NAME'].instances.*.running" | grep -q true
+}
+
+# The address to listen on: this router's, the LAN's or every interface's.
+listen_addr() {
+	local addr
+	case "$1" in
+	all) addr=0.0.0.0 ;;
+	loopback) addr=127.0.0.1 ;;
+	lan)
+		. /lib/functions/network.sh
+		network_get_ipaddr addr lan || return 1
+		;;
+	*) return 1 ;;
+	esac
+	echo "$addr"
+}
+
+# Use the data folder only if it is the server's own: new, empty, or
+# already owned by its user. Never take over some other directory. A
+# refusal says why on stdout.
+prepare_data_dir() {
+	local dir="$1"
+	case "$dir" in
+	/tmp/* | /var/*) echo "the data folder $dir is in memory and would be lost on reboot: choose one on storage in $PAGE"; return 1 ;;
+	/*) ;;
+	*) echo "the data folder must be an absolute path, not '$dir'"; return 1 ;;
+	esac
+	[ -e "$dir" ] || mkdir -p "$dir" || return 1
+	if [ ! -d "$dir" ]; then
+		echo "the data folder $dir is not a folder: choose another in $PAGE"
+		return 1
+	fi
+	if [ "$(ls -ldn "$dir" | awk '{ print $3 }')" != "$(id -u "$RUN_AS")" ] && [ -n "$(ls -A "$dir")" ]; then
+		echo "not using the data folder $dir: it holds other files and isn't $NAME's own; choose a new or empty folder in $PAGE"
+		return 1
+	fi
+	chown -R "$RUN_AS:$RUN_AS" "$dir"
+	chmod 700 "$dir"
+}
+
+# The admin key for the LuCI page, made with the database (the server
+# keeps its hash there) and kept root's alone. Made again when the
+# database is new: a key the database doesn't know is no use. The server
+# must not be running (the database is written).
+ensure_admin_key() {
+	local db="$1" key
+	mkdir -p "$SECRETS_DIR" || return 1
+	chown root:root "${SECRETS_DIR%/*}" "$SECRETS_DIR"
+	chmod 700 "${SECRETS_DIR%/*}" "$SECRETS_DIR"
+	if [ ! -s "$db" ] || [ ! -s "$KEY_FILE" ]; then
+		key=$("$BIN" admin create-key --db "$db" 2>/dev/null) || {
+			echo "couldn't make an admin key in $db: logread -e $NAME says why"
+			return 1
+		}
+		case "$key" in
+		*[!0-9a-f]* | '') echo "couldn't make an admin key: the server printed something else"; return 1 ;;
+		esac
+		(
+			umask 077
+			printf '%s\n' "$key" >"$KEY_FILE.new"
+		) && mv "$KEY_FILE.new" "$KEY_FILE" || return 1
+		log "made the admin key for $PAGE, $KEY_FILE"
+	fi
+	chown root:root "$KEY_FILE"
+	chmod 600 "$KEY_FILE"
+}
+
+# append_options: the settings of OPTIONS that are set, onto the command.
+append_option() {
+	procd_append_param command "$2" "$1"
+}
+append_options() {
+	local option name kind value
+	while read -r option name kind; do
+		[ -n "$option" ] || continue
+		case "$kind" in
+		repeat)
+			config_list_foreach main "$name" append_option "$option"
+			;;
+		list)
+			config_get value main "$name"
+			[ -n "$value" ] && procd_append_param command "$option" "$(echo "$value" | sed 's/  */,/g')"
+			;;
+		*)
+			config_get value main "$name"
+			[ -n "$value" ] && procd_append_param command "$option" "$value"
+			;;
+		esac
+	done <<-EOF
+		$OPTIONS
+	EOF
+}
+
+# prepare: reads the settings (config_load first) into the variables the
+# instance is made from, readies the data folder and the admin key, and
+# succeeds; or sets REASON and fails. WAITING=1 marks a LAN address not
+# there yet, which isn't a refusal: the interface trigger starts it.
+prepare() {
+	local tls_cert tls_key
+	REASON=
+	WAITING=0
+	config_get PORT main port 8443
+	config_get LISTEN main listen loopback
+	config_get ADMIN_PORT main admin_port 8444
+	config_get DATA_DIR main data_dir "$DEFAULT_DATA_DIR"
+	config_get LOG_LEVEL main log_level info
+	config_get NICE main nice 10
+	config_get CPUS main cpus
+	config_get tls_cert main tls_cert
+	config_get tls_key main tls_key
+	DB=$DATA_DIR/$DB_FILE
+
+	case "$LISTEN" in
+	all | loopback | lan) ;;
+	*)
+		REASON="listen must be loopback, lan or all, not '$LISTEN'"
+		return 1
+		;;
+	esac
+	if ! ADDR=$(listen_addr "$LISTEN"); then
+		WAITING=1
+		REASON="waiting for the lan interface's address: it starts once the LAN is up"
+		return 1
+	fi
+	case "$PORT$ADMIN_PORT" in
+	*[!0-9]* | '')
+		REASON="the ports must be numbers: port '$PORT', admin_port '$ADMIN_PORT'"
+		return 1
+		;;
+	esac
+	if [ "$PORT" = "$ADMIN_PORT" ]; then
+		REASON="the admin API needs a port of its own, not the wallet API's $PORT"
+		return 1
+	fi
+	if [ -n "$tls_cert$tls_key" ]; then
+		if [ ! -s "$tls_cert" ] || [ ! -s "$tls_key" ]; then
+			REASON="TLS needs both files on this router, the certificate chain '$tls_cert' and the key '$tls_key'; the data folder is a good place for them"
+			return 1
+		fi
+	fi
+	REASON=$(prepare_data_dir "$DATA_DIR" 2>&1) || return 1
+	REASON=$(ensure_admin_key "$DB" 2>&1) || return 1
+	# The database the key was made with belongs to the server.
+	chown -R "$RUN_AS:$RUN_AS" "$DATA_DIR"
+
+	# The scanner's CPUs, as taskset takes them; a list this router can't
+	# honour is dropped. Its niceness, 0 to 19.
+	if [ -n "$CPUS" ] && ! taskset -c "$CPUS" true 2>/dev/null; then
+		log "can't keep the server to CPUs '$CPUS' (no such CPUs here); it may use all of them"
+		CPUS=
+	fi
+	case "$NICE" in
+	'' | *[!0-9]*) NICE=0 ;;
+	esac
+	[ "$NICE" -le 19 ] || NICE=19
+	return 0
+}
+
+start_service() {
+	local enabled
+
+	# Each start says afresh what refuses it.
+	rm -f "$CHECK_FILE"
+	config_load "$NAME"
+	config_get_bool enabled main enabled 1
+	[ "$enabled" = 1 ] || return 0
+
+	if ! prepare; then
+		if [ "$WAITING" = 1 ]; then
+			log "$REASON"
+			return 0
+		fi
+		refuse "$REASON"
+		return 1
+	fi
+
+	procd_open_instance "$NAME"
+	if [ -n "$CPUS" ]; then
+		procd_set_param command taskset -c "$CPUS" "$BIN"
+	else
+		procd_set_param command "$BIN"
+	fi
+	procd_append_param command serve \
+		--db "$DB" \
+		--cache-dir "$DATA_DIR/cache" \
+		--listen "$ADDR:$PORT" \
+		--admin-listen "127.0.0.1:$ADMIN_PORT"
+	# Listening anywhere but loopback is the operator's choice (listen),
+	# made with TLS or a proxy in front, as the page says.
+	[ "$ADDR" = 127.0.0.1 ] || procd_append_param command --confirm-external-bind
+	append_options
+	procd_set_param env RUST_LOG="$LOG_LEVEL"
+	procd_set_param user "$RUN_AS"
+	procd_set_param nice "$NICE"
+	# The build, kept with the instance so LuCI reports the one running,
+	# not only the one installed. A new build changes it, as new settings
+	# change the command line, so procd restarts the instance onto them.
+	procd_set_param data \
+		version="$(sed -n 's/^version=//p' "$VERSION_FILE" 2>/dev/null)" \
+		commit="$(sed -n 's/^commit=//p' "$VERSION_FILE" 2>/dev/null)"
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+# A reload (a save in LuCI, `uci commit`, the LAN coming up) of a running
+# server keeps it on its last good settings if the new ones are refused
+# here; a start (a restart's included) doesn't start it.
+reload_service() {
+	local enabled
+	config_load "$NAME"
+	config_get_bool enabled main enabled 1
+	if [ "$enabled" = 1 ] && ! prepare && [ "$WAITING" = 0 ] && running_now; then
+		refuse "$REASON"
+		log "keeps running on its earlier settings"
+		return 0
+	fi
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$NAME"
+	# In "LAN only" mode the listen address follows the LAN interface.
+	procd_add_interface_trigger "interface.*.up" lan "/etc/init.d/$NAME" reload
+}
+
+# A new admin key for the LuCI page, for a database that doesn't know the
+# key in the secrets folder any more (restored from a backup, say): the
+# server is stopped while the key is made, and started again.
+admin_key() {
+	local data_dir i=0
+	config_load "$NAME"
+	config_get data_dir main data_dir "$DEFAULT_DATA_DIR"
+	stop
+	while running_now && [ $i -lt 15 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	rm -f "$KEY_FILE"
+	if ! REASON=$(ensure_admin_key "$data_dir/$DB_FILE" 2>&1); then
+		log "$REASON"
+		echo "$REASON" >&2
+		start
+		return 1
+	fi
+	chown -R "$RUN_AS:$RUN_AS" "$data_dir"
+	start
+}
