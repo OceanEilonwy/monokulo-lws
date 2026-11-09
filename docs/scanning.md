@@ -246,7 +246,7 @@ on the GPU); incremental keyring updates.
 
 ## Proofs of inclusion: what is kept, and what it costs
 
-Each mined transaction that pays an account is served with a proof (README,
+Each mined transaction that pays an account is served with a proof (`docs/api.md`,
 `docs/security.md`). What it is made of is kept at scan time, in the batch's
 SQLite transaction, and only where an account is paid:
 
