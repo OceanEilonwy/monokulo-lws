@@ -578,7 +578,7 @@ return view.extend({
 
 		// -- networks --
 		s = m.section(form.TableSection, 'network', _('Networks'),
-			_('A server for each network turned on, side by side, each with its own node, ports and data folder (its database, every wallet’s view key in it; back it up). A server refuses to start on a node of another network. Each network needs ports and a data folder of its own.'));
+			_('A server for each network turned on, side by side, each with its own node, ports and data folder (its database, every wallet’s view key in it; back it up). A server refuses to start on a node of another network. Each network needs ports and a data folder of its own. Its firewall rule (Network › Firewall › Traffic Rules, off until you turn it on) follows its wallet port.'));
 		s.anonymous = false;
 		s.addremove = false;
 		s.sortable = false;
@@ -700,7 +700,7 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('general', form.ListValue, 'listen', _('Listen on'),
-			_('Where every network’s wallet API listens. Every request carries a wallet’s private view key: off this router, serve TLS (Access) or put a TLS proxy in front, and open the port in the firewall (the rule Allow-monokulo-lws, off, is for mainnet’s 8443) only if wallets reach it from the internet.'));
+			_('Where every network’s wallet API listens. Every request carries a wallet’s private view key: off this router, serve TLS (Access) or put a TLS proxy in front, and open the port in the firewall (each network has a rule, Allow-monokulo-lws for mainnet and Allow-monokulo-lws-stagenet or -testnet, off, whose port follows the network’s) only if wallets reach it from the internet.'));
 		o.value('loopback', _('This router only (127.0.0.1)'));
 		o.value('lan', _('LAN only'));
 		o.value('all', _('All interfaces'));

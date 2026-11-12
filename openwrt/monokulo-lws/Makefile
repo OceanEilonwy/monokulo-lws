@@ -95,12 +95,16 @@ endef
 
 # Removal leaves the data folder (the database holds every wallet's view
 # key: the operator's to delete), the admin key and the settings, and
-# takes the firewall rule the package made.
+# takes the firewall rules the package made.
 define Package/monokulo-lws/postrm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
-if [ "$${PKG_UPGRADE}" != 1 ] && uci -q get firewall.monokulo_lws >/dev/null; then
-	uci -q delete firewall.monokulo_lws && uci -q commit firewall
+if [ "$${PKG_UPGRADE}" != 1 ]; then
+	changed=0
+	for rule in monokulo_lws monokulo_lws_stagenet monokulo_lws_testnet; do
+		uci -q get firewall.$$rule >/dev/null && uci -q delete firewall.$$rule && changed=1
+	done
+	[ "$$changed" = 1 ] && uci -q commit firewall
 fi
 rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* /var/run/monokulo-lws/check /var/run/monokulo-lws/check.* 2>/dev/null
 /etc/init.d/rpcd reload 2>/dev/null

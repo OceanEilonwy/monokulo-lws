@@ -34,8 +34,9 @@ apk add monokulo-lws
 [openwrt package run](https://github.com/OceanEilonwy/monokulo-lws/actions/workflows/openwrt.yml)
 holds the same package, for `apk add ./monokulo-lws-*.apk`.
 
-Installing makes the user `monokulo-lws`, a firewall rule
-`Allow-monokulo-lws` (off, for mainnet's port 8443), and starts mainnet's
+Installing makes the user `monokulo-lws`, a firewall rule per network
+(`Allow-monokulo-lws` for mainnet, `Allow-monokulo-lws-stagenet`,
+`Allow-monokulo-lws-testnet`; all off), and starts mainnet's
 server with the settings in `/etc/config/monokulo-lws`. The first start of
 each network's server makes its data folder (the database, every wallet's
 view key in it; back it up) and the admin key the LuCI page uses, in
@@ -71,6 +72,13 @@ policies, limits and scanning) are shared by every server, and its
 `enabled` turns them all off. `service monokulo-lws admin_key stagenet`
 makes a new admin key for one network's server, leaving the others
 running.
+
+Each network's firewall rule follows its wallet port: every start, and
+every reload whose settings are taken, sets the rule's port to the
+network's, and reloads the firewall if that rule is on. Whether a rule is
+on is yours to choose, and a rule you delete stays deleted (an upgrade
+makes it again, off). A reload refused leaves the rules on the ports the
+servers still listen on.
 
 Settings from a version with one server (the node, ports and data folder
 in the main section) move to a network's section at the first start: the
@@ -145,9 +153,10 @@ Every request to the wallet API carries a wallet's private view key, so by
 default the server listens on `127.0.0.1` alone, for a TLS reverse proxy
 on the router in front of it. For wallets on your own network, "LAN only"
 over plain HTTP is a reasonable choice; for wallets on the internet, give
-the server TLS (Access) or a proxy, and turn on the firewall rule
-`Allow-monokulo-lws` (Network > Firewall > Traffic Rules), or open the
-proxy's port instead. Read [security.md](security.md) before that.
+the server TLS (Access) or a proxy, and turn on that network's firewall
+rule (`Allow-monokulo-lws` for mainnet, `Allow-monokulo-lws-stagenet`,
+`Allow-monokulo-lws-testnet`; Network > Firewall > Traffic Rules), whose
+port follows the network's, or open the proxy's port instead. Read [security.md](security.md) before that.
 
 ## How it is built
 
