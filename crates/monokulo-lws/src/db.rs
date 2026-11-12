@@ -460,8 +460,18 @@ impl Db {
 
     // ---- requests ----
 
-    pub fn add_request(&self, kind: RequestKind, new: &NewAccount) -> Result<bool> {
+    /// Queues a request, unless one of the kind is already pending for the
+    /// address or `max_pending` requests are. The count and the insert are
+    /// one transaction, so concurrent callers can't pass the cap together.
+    pub fn add_request(&self, kind: RequestKind, new: &NewAccount, max_pending: u64) -> Result<Queued> {
         self.write(|tx| {
+            if request_exists(tx, kind, &new.address)? {
+                return Ok(Queued::Duplicate);
+            }
+            let pending = tx.query_row("SELECT COUNT(*) FROM requests", [], |r| r.get::<_, i64>(0))?;
+            if u64::try_from(pending).unwrap_or(u64::MAX) >= max_pending {
+                return Ok(Queued::Full(pending as u64));
+            }
             let changed = tx.execute(
                 "INSERT OR IGNORE INTO requests (kind, address, view_key, spend_pub, view_pub, start_height, generated_locally, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
@@ -475,8 +485,13 @@ impl Db {
                     now() as i64
                 ],
             )?;
-            Ok(changed > 0)
+            Ok(if changed > 0 { Queued::Added } else { Queued::Duplicate })
         })
+    }
+
+    /// Whether a request of the kind is pending for the address.
+    pub fn has_request(&self, kind: RequestKind, address: &str) -> Result<bool> {
+        self.read(|c| request_exists(c, kind, address))
     }
 
     pub fn requests(&self) -> Result<Vec<(RequestKind, NewAccount)>> {
@@ -821,6 +836,24 @@ impl Db {
             Ok(rows)
         })
     }
+}
+
+/// What [`Db::add_request`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Queued {
+    Added,
+    /// One of the kind was already pending for the address.
+    Duplicate,
+    /// The queue was full, with this many.
+    Full(u64),
+}
+
+fn request_exists(c: &Connection, kind: RequestKind, address: &str) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM requests WHERE kind = ?1 AND address = ?2)",
+        params![kind.as_str(), address],
+        |r| r.get(0),
+    )?)
 }
 
 /// What [`Db::accept_requests`] did.

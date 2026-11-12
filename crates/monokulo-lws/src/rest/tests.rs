@@ -821,6 +821,72 @@ async fn remove_accounts_forgets_the_accounts_whole() {
     assert_eq!(r.status, StatusCode::FORBIDDEN);
 }
 
+/// A repeated create request is refused before it takes a token from the
+/// global bucket, so it can't drain it for everyone.
+#[tokio::test]
+async fn a_repeated_request_spends_no_global_token() {
+    let app = app(Setup {
+        create: Policy::Approve,
+        limits: Limits::new(ClientIpConfig::default(), 0, 0, 2, u64::MAX),
+        ..Setup::default()
+    });
+    let router = wallet_router(app.clone());
+    let (a, ka) = wallet(90);
+    let mut create = login_body(&a, &ka);
+    create["create_account"] = json!(true);
+    assert_eq!(call(&router, "/login", &create).await.status, StatusCode::OK);
+    for _ in 0..5 {
+        assert_eq!(call(&router, "/login", &create).await.status, StatusCode::FORBIDDEN);
+    }
+    let (b, kb) = wallet(91);
+    let mut create = login_body(&b, &kb);
+    create["create_account"] = json!(true);
+    let r = call(&router, "/login", &create).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(app.db.requests().unwrap().len(), 2);
+}
+
+/// The queue's cap holds under concurrent requests: the count and the
+/// insert are one transaction.
+#[test]
+fn the_request_queue_cap_is_exact_under_concurrency() {
+    use crate::db::Queued;
+    use lws_api::admin::RequestKind;
+    let db = Arc::new(Db::in_memory());
+    let new = |seed: u64| {
+        let (address, key) = wallet(seed);
+        let checked = crate::crypto::check_login(Network::Stagenet, &address, &key).unwrap();
+        NewAccount {
+            address: checked.address.clone(),
+            view_key: checked.view_key,
+            spend_pub: checked.spend_pub,
+            view_pub: checked.view_pub,
+            start_height: 0,
+            generated_locally: false,
+        }
+    };
+    let threads: Vec<_> = (0..16u64)
+        .map(|i| {
+            let db = db.clone();
+            let n = new(100 + i);
+            std::thread::spawn(move || db.add_request(RequestKind::Create, &n, 5).unwrap())
+        })
+        .collect();
+    let outcomes: Vec<Queued> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(outcomes.iter().filter(|q| **q == Queued::Added).count(), 5);
+    assert_eq!(db.requests().unwrap().len(), 5);
+    let first = new(200);
+    let db = Db::in_memory();
+    assert_eq!(db.add_request(RequestKind::Import, &first, 1).unwrap(), Queued::Added);
+    assert_eq!(
+        db.add_request(RequestKind::Import, &first, 1).unwrap(),
+        Queued::Duplicate
+    );
+    assert!(db.has_request(RequestKind::Import, &first.address).unwrap());
+    assert!(!db.has_request(RequestKind::Create, &first.address).unwrap());
+    assert_eq!(db.add_request(RequestKind::Create, &first, 1).unwrap(), Queued::Full(1));
+}
+
 /// `accept_requests` is all or nothing: one address that already has an
 /// account means 409 naming it, and no request is taken or accepted. An
 /// unknown type is refused before anything is looked at.

@@ -16,7 +16,7 @@ use subtle::ConstantTimeEq;
 
 use super::{ApiError, ApiJson, App, MAX_TX_BYTES, Policy};
 use crate::crypto;
-use crate::db::{Account, NewAccount, OutputRow, Status, TxRow};
+use crate::db::{Account, NewAccount, OutputRow, Queued, Status, TxRow};
 use crate::error::{Error, Result, bad};
 use crate::limits::ClientIp;
 use crate::scanner::{PoolReceipt, PoolSpend, unlocked};
@@ -52,28 +52,41 @@ async fn authorize_active(app: &App, login: &Login) -> Result<Account> {
 }
 
 /// The strict per-client limit, for a call that would make an account or a
-/// request, and the global one on new accounts and requests.
-fn creation_allowed(app: &App, client: Option<&Extension<ClientIp>>) -> Result<()> {
+/// request.
+fn strict_allowed(app: &App, client: Option<&Extension<ClientIp>>) -> Result<()> {
     if let Some(Extension(ClientIp(ip))) = client {
         app.limits.strict.check(*ip).map_err(Error::RateLimited)?;
     }
+    Ok(())
+}
+
+/// The global limit on new accounts and requests, taken last, once nothing
+/// else will refuse the call.
+fn global_allowed(app: &App) -> Result<()> {
     app.limits.creation.check().map_err(|wait| {
         tracing::warn!("the limit on new accounts and requests an hour was reached");
         Error::RateLimited(wait)
     })
 }
 
-/// Refuses a new create or import request when the queue is full
-/// (monero-lws's `--create-queue-max`).
-fn queue_has_room(app: &App) -> Result<()> {
-    let pending = app
-        .db
-        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM requests", [], |r| r.get::<_, i64>(0))? as u64))?;
-    if pending >= app.limits.max_pending_requests {
-        tracing::warn!("the queue of pending requests is full ({pending}): accept or reject some");
-        return Err(Error::Busy("too many pending requests; try again later"));
+/// Both creation limits.
+fn creation_allowed(app: &App, client: Option<&Extension<ClientIp>>) -> Result<()> {
+    strict_allowed(app, client)?;
+    global_allowed(app)
+}
+
+/// Queues a create or import request: `Ok(false)` if one is already
+/// pending, `Busy` when the queue is full (monero-lws's
+/// `--create-queue-max`).
+fn queue(app: &App, kind: RequestKind, new: &NewAccount) -> Result<bool> {
+    match app.db.add_request(kind, new, app.limits.max_pending_requests)? {
+        Queued::Added => Ok(true),
+        Queued::Duplicate => Ok(false),
+        Queued::Full(pending) => {
+            tracing::warn!("the queue of pending requests is full ({pending}): accept or reject some");
+            Err(Error::Busy("too many pending requests; try again later"))
+        }
     }
-    Ok(())
 }
 
 fn lookahead(app: &App) -> Option<AddressMeta> {
@@ -158,7 +171,13 @@ pub async fn login(
         Policy::Auto => false,
         Policy::Approve => true,
     };
-    creation_allowed(&app, client.as_ref())?;
+    strict_allowed(&app, client.as_ref())?;
+    // Asked before and not yet accepted: refused before it can spend the
+    // global token.
+    if approve && app.db.has_request(RequestKind::Create, &checked.address)? {
+        return Err(Error::Forbidden.into());
+    }
+    global_allowed(&app)?;
     let height = creation_height(&app).await?;
     let new = NewAccount {
         address: checked.address.clone(),
@@ -169,9 +188,7 @@ pub async fn login(
         generated_locally: req.generated_locally,
     };
     if approve {
-        queue_has_room(&app)?;
-        if !app.db.add_request(RequestKind::Create, &new)? {
-            // Asked before and not yet accepted.
+        if !queue(&app, RequestKind::Create, &new)? {
             return Err(Error::Forbidden.into());
         }
         tracing::info!("a new account request is waiting for approval");
@@ -652,17 +669,11 @@ pub async fn import_wallet_request(
                 start_height: 0,
                 generated_locally: account.generated_locally,
             };
-            if app
-                .db
-                .requests()?
-                .iter()
-                .any(|(k, r)| *k == RequestKind::Import && r.address == new.address)
-            {
+            if app.db.has_request(RequestKind::Import, &new.address)? {
                 return Ok(reply(false, false, "Already requested"));
             }
-            queue_has_room(&app)?;
             creation_allowed(&app, client.as_ref())?;
-            let added = app.db.add_request(RequestKind::Import, &new)?;
+            let added = queue(&app, RequestKind::Import, &new)?;
             Ok(reply(added, false, if added { "Pending" } else { "Already requested" }))
         }
     }
