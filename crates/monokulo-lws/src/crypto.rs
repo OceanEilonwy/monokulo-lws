@@ -6,12 +6,13 @@ use curve25519_dalek::{constants::ED25519_BASEPOINT_TABLE, edwards::EdwardsPoint
 use lws_api::PrivateViewKey;
 use monero_wallet::{
     ViewPair,
-    address::{AddressType, MoneroAddress, Network},
+    address::Network,
     ed25519::{Commitment, CompressedPoint, Scalar},
 };
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use crate::address::Address;
 use crate::db::NewAccount;
 use crate::error::{Error, Result, bad};
 
@@ -21,14 +22,12 @@ use crate::error::{Error, Result, bad};
 /// constructor), so holding one is proof the check was made. `Debug` leaves
 /// the key and address out (`crate::redact`); the key wipes itself.
 pub struct Checked {
-    address: String,
-    spend_pub: [u8; 32],
-    view_pub: [u8; 32],
+    address: Address,
     view_key: PrivateViewKey,
 }
 
 impl Checked {
-    pub fn address(&self) -> &str {
+    pub fn address(&self) -> &Address {
         &self.address
     }
 
@@ -41,8 +40,6 @@ impl Checked {
         NewAccount {
             address: self.address,
             view_key: self.view_key,
-            spend_pub: self.spend_pub,
-            view_pub: self.view_pub,
             start_height,
             generated_locally,
         }
@@ -50,36 +47,26 @@ impl Checked {
 
     /// A `Checked` without the check, for tests that need one by hand.
     #[cfg(test)]
-    pub fn unchecked(address: String, spend_pub: [u8; 32], view_pub: [u8; 32], view_key: PrivateViewKey) -> Checked {
-        Checked {
-            address,
-            spend_pub,
-            view_pub,
-            view_key,
-        }
+    pub fn unchecked(address: Address, view_key: PrivateViewKey) -> Checked {
+        Checked { address, view_key }
     }
 }
 
-/// Checks that `view_key` is the view key of `address`, a primary address on
-/// `network`. The key is taken, not borrowed: the `Checked` keeps it, and no
-/// copy is left behind.
+/// Checks that `view_key` is the view key of `address`, which must parse as
+/// a primary address on `network`. The key is taken, not borrowed: the
+/// `Checked` keeps it, and no copy is left behind.
 pub fn check_login(network: Network, address: &str, view_key: PrivateViewKey) -> Result<Checked> {
-    let parsed = MoneroAddress::from_str(network, address).map_err(|e| bad(format!("address: {e}")))?;
-    if !matches!(parsed.kind(), AddressType::Legacy) {
-        return Err(bad("only a primary address can log in"));
-    }
+    check_key(Address::parse(network, address)?, view_key)
+}
+
+/// As [`check_login`], for an address already parsed.
+pub fn check_key(address: Address, view_key: PrivateViewKey) -> Result<Checked> {
     let scalar = view_scalar(&view_key)?;
     let derived = Point_mul_base(&scalar);
-    let view_pub = parsed.view().compress().to_bytes();
-    if derived.ct_eq(&view_pub).unwrap_u8() == 0 {
+    if derived.ct_eq(address.view_pub()).unwrap_u8() == 0 {
         return Err(Error::Forbidden);
     }
-    Ok(Checked {
-        address: parsed.to_string(),
-        spend_pub: parsed.spend().compress().to_bytes(),
-        view_pub,
-        view_key,
-    })
+    Ok(Checked { address, view_key })
 }
 
 /// The view key as a scalar, refused unless canonical.
@@ -235,6 +222,7 @@ pub fn coinbase_rct() -> [u8; 96] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use monero_wallet::address::{AddressType, MoneroAddress};
 
     fn address_of(spend: u64, view: u64, network: Network) -> String {
         MoneroAddress::new(
@@ -278,10 +266,10 @@ mod tests {
         let view = DScalar::from(123_456u64);
         let address = address_of(7, 123_456, Network::Stagenet);
         let checked = check_login(Network::Stagenet, &address, key(&view)).unwrap();
-        assert_eq!(checked.address(), address);
+        assert_eq!(checked.address().as_str(), address);
         assert!(*checked.view_key() == key(&view));
         let new = checked.into_new_account(0, false);
-        assert!(view_pair(&new.spend_pub, &new.view_key).is_ok());
+        assert!(view_pair(new.address.spend_pub(), &new.view_key).is_ok());
     }
 
     #[test]
@@ -319,6 +307,7 @@ mod tools {
     //! `cargo test -p monokulo-lws fresh_stagenet_wallet -- --ignored --nocapture`
     //! prints a throwaway stagenet wallet to try the server with.
     use super::*;
+    use monero_wallet::address::{AddressType, MoneroAddress};
 
     #[test]
     #[ignore = "a tool, not a test"]

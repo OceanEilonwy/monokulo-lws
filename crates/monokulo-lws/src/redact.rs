@@ -54,13 +54,11 @@ mod tests {
     #[test]
     fn debug_leaves_out_keys_and_addresses() {
         let key = [0xab; 32];
-        let address = "5AddressThatMustNotBePrinted".to_string();
+        let address = crate::testkit::Wallet::new(1).address();
         let account = Account {
             id: 7,
             address: address.clone(),
             view_key: PrivateViewKey::from_bytes(&key),
-            spend_pub: [1; 32],
-            view_pub: [2; 32],
             status: Status::Active,
             start_height: 1,
             scan_height: 2,
@@ -70,12 +68,10 @@ mod tests {
         let new = NewAccount {
             address: address.clone(),
             view_key: PrivateViewKey::from_bytes(&key),
-            spend_pub: [1; 32],
-            view_pub: [2; 32],
             start_height: 1,
             generated_locally: true,
         };
-        let checked = Checked::unchecked(address.clone(), [1; 32], [2; 32], PrivateViewKey::from_bytes(&key));
+        let checked = Checked::unchecked(address.clone(), PrivateViewKey::from_bytes(&key));
         let hex_key = hex::encode(key);
         for printed in [
             format!("{account:?}"),
@@ -83,7 +79,7 @@ mod tests {
             format!("{checked:?}"),
             format!("{account:#?}"),
         ] {
-            assert!(!printed.contains(&address), "{printed}");
+            assert!(!printed.contains(&address.as_str()[..12]), "{printed}");
             assert!(!printed.contains(&hex_key), "{printed}");
             assert!(!printed.contains("171, 171"), "{printed}");
         }

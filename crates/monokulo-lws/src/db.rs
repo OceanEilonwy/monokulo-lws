@@ -25,6 +25,7 @@ use lws_api::PrivateViewKey;
 use lws_api::admin::RequestKind;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
+use crate::address::Address;
 use crate::error::{Error, Result, bad};
 
 pub(crate) const SCHEMA: &str = r#"
@@ -160,10 +161,9 @@ impl Status {
 /// `Clone`: the view key isn't, so an account is passed by reference.
 pub struct Account {
     pub id: i64,
-    pub address: String,
+    /// Its public keys too (stored in their own columns as well).
+    pub address: Address,
     pub view_key: PrivateViewKey,
-    pub spend_pub: [u8; 32],
-    pub view_pub: [u8; 32],
     pub status: Status,
     pub start_height: u64,
     pub scan_height: u64,
@@ -175,10 +175,8 @@ pub struct Account {
 /// out the view key and the address (`crate::redact`). Not `Clone`, as
 /// the view key isn't.
 pub struct NewAccount {
-    pub address: String,
+    pub address: Address,
     pub view_key: PrivateViewKey,
-    pub spend_pub: [u8; 32],
-    pub view_pub: [u8; 32],
     pub start_height: u64,
     pub generated_locally: bool,
 }
@@ -353,18 +351,16 @@ fn account_row(r: &rusqlite::Row) -> rusqlite::Result<Account> {
         id: r.get(0)?,
         address: r.get(1)?,
         view_key: view_key_col(r, 2)?,
-        spend_pub: blob32(r.get(3)?)?,
-        view_pub: blob32(r.get(4)?)?,
-        status: Status::parse(&r.get::<_, String>(5)?).unwrap_or(Status::Hidden),
-        start_height: r.get::<_, i64>(6)? as u64,
-        scan_height: r.get::<_, i64>(7)? as u64,
-        access_time: r.get::<_, i64>(8)? as u64,
-        generated_locally: r.get::<_, i64>(9)? != 0,
+        status: Status::parse(&r.get::<_, String>(3)?).unwrap_or(Status::Hidden),
+        start_height: r.get::<_, i64>(4)? as u64,
+        scan_height: r.get::<_, i64>(5)? as u64,
+        access_time: r.get::<_, i64>(6)? as u64,
+        generated_locally: r.get::<_, i64>(7)? != 0,
     })
 }
 
-const ACCOUNT_COLS: &str =
-    "id, address, view_key, spend_pub, view_pub, status, start_height, scan_height, access_time, generated_locally";
+/// The public keys are not read back: the address holds them.
+const ACCOUNT_COLS: &str = "id, address, view_key, status, start_height, scan_height, access_time, generated_locally";
 
 /// Brings a database made by an earlier version up to `SCHEMA`.
 ///
@@ -588,7 +584,7 @@ impl Db {
 
     // ---- accounts ----
 
-    pub fn account(&self, address: &str) -> Result<Option<Account>> {
+    pub fn account(&self, address: &Address) -> Result<Option<Account>> {
         self.read(|c| {
             Ok(c.query_row(
                 &format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE address = ?1"),
@@ -619,7 +615,7 @@ impl Db {
         self.write(|tx| insert_account(tx, new, status))
     }
 
-    pub fn set_status(&self, addresses: &[String], status: Status) -> Result<Vec<String>> {
+    pub fn set_status(&self, addresses: &[Address], status: Status) -> Result<Vec<Address>> {
         self.write(|tx| {
             let mut done = vec![];
             for a in addresses {
@@ -665,7 +661,7 @@ impl Db {
     }
 
     /// Scan these accounts again from `height`: their rows from there on go.
-    pub fn rescan(&self, addresses: &[String], height: u64) -> Result<Vec<String>> {
+    pub fn rescan(&self, addresses: &[Address], height: u64) -> Result<Vec<Address>> {
         self.write(|tx| rescan_in(tx, addresses, height))
     }
 
@@ -673,7 +669,7 @@ impl Db {
     /// transactions, outputs, spends and subaddresses, any request pending
     /// under its address, and the proofs kept for it alone. Not monero-lws's
     /// (it only hides); an operator's choice, for a wallet that has moved on.
-    pub fn remove_accounts(&self, addresses: &[String]) -> Result<Vec<String>> {
+    pub fn remove_accounts(&self, addresses: &[Address]) -> Result<Vec<Address>> {
         self.write(|tx| {
             let mut done = vec![];
             for a in addresses {
@@ -696,7 +692,7 @@ impl Db {
 
     /// An accepted import: the accounts start at block 0 and scan again
     /// from it, as monero-lws's import does. One transaction.
-    pub fn import(&self, addresses: &[String]) -> Result<Vec<String>> {
+    pub fn import(&self, addresses: &[Address]) -> Result<Vec<Address>> {
         self.write(|tx| import_in(tx, addresses))
     }
 
@@ -721,8 +717,8 @@ impl Db {
                     kind.as_str(),
                     new.address,
                     new.view_key.as_bytes().as_slice(),
-                    new.spend_pub.as_slice(),
-                    new.view_pub.as_slice(),
+                    new.address.spend_pub().as_slice(),
+                    new.address.view_pub().as_slice(),
                     start_height,
                     new.generated_locally as i64,
                     now() as i64
@@ -733,7 +729,7 @@ impl Db {
     }
 
     /// Whether a request of the kind is pending for the address.
-    pub fn has_request(&self, kind: RequestKind, address: &str) -> Result<bool> {
+    pub fn has_request(&self, kind: RequestKind, address: &Address) -> Result<bool> {
         self.read(|c| request_exists(c, kind, address))
     }
 
@@ -747,7 +743,7 @@ impl Db {
 
     /// Removes the named requests of a kind, returning what they were. One
     /// transaction, so two callers can't both take the same request.
-    pub fn take_requests(&self, kind: RequestKind, addresses: &[String]) -> Result<Vec<NewAccount>> {
+    pub fn take_requests(&self, kind: RequestKind, addresses: &[Address]) -> Result<Vec<NewAccount>> {
         self.write(|tx| {
             let taken = named_requests(tx, kind, addresses)?;
             for new in &taken {
@@ -763,7 +759,7 @@ impl Db {
     /// request's address already has an account, nothing is changed and
     /// those addresses are returned. An import request whose account has
     /// gone since is dropped and not counted as done.
-    pub fn accept_requests(&self, kind: RequestKind, addresses: &[String]) -> Result<Accepted> {
+    pub fn accept_requests(&self, kind: RequestKind, addresses: &[Address]) -> Result<Accepted> {
         self.write(|tx| {
             let taken = named_requests(tx, kind, addresses)?;
             if kind == RequestKind::Create {
@@ -1140,7 +1136,7 @@ pub enum Queued {
     Full(u64),
 }
 
-fn request_exists(c: &Connection, kind: RequestKind, address: &str) -> Result<bool> {
+fn request_exists(c: &Connection, kind: RequestKind, address: &Address) -> Result<bool> {
     Ok(c.query_row(
         "SELECT EXISTS(SELECT 1 FROM requests WHERE kind = ?1 AND address = ?2)",
         params![kind.as_str(), address],
@@ -1152,12 +1148,12 @@ fn request_exists(c: &Connection, kind: RequestKind, address: &str) -> Result<bo
 #[derive(Debug, PartialEq, Eq)]
 pub enum Accepted {
     /// These addresses were accepted.
-    Done(Vec<String>),
+    Done(Vec<Address>),
     /// Nothing was: these addresses already have an account.
-    Exists(Vec<String>),
+    Exists(Vec<Address>),
 }
 
-fn account_id(c: &Connection, address: &str) -> Result<Option<i64>> {
+fn account_id(c: &Connection, address: &Address) -> Result<Option<i64>> {
     Ok(
         c.query_row("SELECT id FROM accounts WHERE address = ?1", [address], |r| r.get(0))
             .optional()?,
@@ -1179,8 +1175,8 @@ fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<
         params![
             new.address,
             new.view_key.as_bytes().as_slice(),
-            new.spend_pub.as_slice(),
-            new.view_pub.as_slice(),
+            new.address.spend_pub().as_slice(),
+            new.address.view_pub().as_slice(),
             status.as_str(),
             start_height,
             n as i64,
@@ -1199,7 +1195,7 @@ fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<
 }
 
 /// [`Db::rescan`] inside `tx`.
-fn rescan_in(tx: &Transaction, addresses: &[String], height: u64) -> Result<Vec<String>> {
+fn rescan_in(tx: &Transaction, addresses: &[Address], height: u64) -> Result<Vec<Address>> {
     let h = sql_height(height)?;
     let mut done = vec![];
     for a in addresses {
@@ -1216,7 +1212,7 @@ fn rescan_in(tx: &Transaction, addresses: &[String], height: u64) -> Result<Vec<
 }
 
 /// [`Db::import`] inside `tx`.
-fn import_in(tx: &Transaction, addresses: &[String]) -> Result<Vec<String>> {
+fn import_in(tx: &Transaction, addresses: &[Address]) -> Result<Vec<Address>> {
     let done = rescan_in(tx, addresses, 0)?;
     for a in &done {
         tx.execute("UPDATE accounts SET start_height = 0 WHERE address = ?1", [a])?;
@@ -1224,7 +1220,8 @@ fn import_in(tx: &Transaction, addresses: &[String]) -> Result<Vec<String>> {
     Ok(done)
 }
 
-const REQUEST_COLS: &str = "kind, address, view_key, spend_pub, view_pub, start_height, generated_locally";
+/// The public keys are not read back: the address holds them.
+const REQUEST_COLS: &str = "kind, address, view_key, start_height, generated_locally";
 
 fn request_row(r: &rusqlite::Row) -> rusqlite::Result<(RequestKind, NewAccount)> {
     Ok((
@@ -1232,16 +1229,14 @@ fn request_row(r: &rusqlite::Row) -> rusqlite::Result<(RequestKind, NewAccount)>
         NewAccount {
             address: r.get(1)?,
             view_key: view_key_col(r, 2)?,
-            spend_pub: blob32(r.get(3)?)?,
-            view_pub: blob32(r.get(4)?)?,
-            start_height: r.get::<_, i64>(5)? as u64,
-            generated_locally: r.get::<_, i64>(6)? != 0,
+            start_height: r.get::<_, i64>(3)? as u64,
+            generated_locally: r.get::<_, i64>(4)? != 0,
         },
     ))
 }
 
 /// The pending requests of a kind under these addresses, each address once.
-fn named_requests(c: &Connection, kind: RequestKind, addresses: &[String]) -> Result<Vec<NewAccount>> {
+fn named_requests(c: &Connection, kind: RequestKind, addresses: &[Address]) -> Result<Vec<NewAccount>> {
     let mut st = c.prepare(&format!(
         "SELECT {REQUEST_COLS} FROM requests WHERE kind = ?1 AND address = ?2"
     ))?;
@@ -1258,7 +1253,7 @@ fn named_requests(c: &Connection, kind: RequestKind, addresses: &[String]) -> Re
     Ok(out)
 }
 
-fn delete_request(tx: &Transaction, kind: RequestKind, address: &str) -> Result<()> {
+fn delete_request(tx: &Transaction, kind: RequestKind, address: &Address) -> Result<()> {
     tx.execute(
         "DELETE FROM requests WHERE kind = ?1 AND address = ?2",
         params![kind.as_str(), address],
@@ -1648,13 +1643,16 @@ impl<'a> ScanWriter<'a> {
 mod tests {
     use super::*;
 
+    /// A stagenet address for a name (`"A"`, `"B"`).
+    fn addr(name: &str) -> Address {
+        crate::testkit::Wallet::new(u64::from(name.as_bytes()[0])).address()
+    }
+
     fn acct(db: &Db) -> Account {
         db.add_account(
             &NewAccount {
-                address: "A".into(),
+                address: addr("A"),
                 view_key: PrivateViewKey::from_bytes(&[1; 32]),
-                spend_pub: [2; 32],
-                view_pub: [3; 32],
                 start_height: 10,
                 generated_locally: false,
             },
@@ -1671,10 +1669,8 @@ mod tests {
         assert!(
             db.add_account(
                 &NewAccount {
-                    address: "A".into(),
+                    address: addr("A"),
                     view_key: PrivateViewKey::from_bytes(&[1; 32]),
-                    spend_pub: [2; 32],
-                    view_pub: [3; 32],
                     start_height: 0,
                     generated_locally: false
                 },
@@ -1683,10 +1679,10 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            db.set_status(&["A".into(), "B".into()], Status::Hidden).unwrap(),
-            vec!["A".to_string()]
+            db.set_status(&[addr("A"), addr("B")], Status::Hidden).unwrap(),
+            vec![addr("A")]
         );
-        assert_eq!(db.account("A").unwrap().unwrap().status, Status::Hidden);
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().status, Status::Hidden);
         assert!(db.accounts(Some(Status::Active)).unwrap().is_empty());
     }
 
@@ -1851,11 +1847,11 @@ mod tests {
         db.rewind(13).unwrap();
         assert_eq!(db.txs(a.id).unwrap().len(), 1);
         assert!(db.spends(a.id).unwrap().is_empty());
-        assert_eq!(db.account("A").unwrap().unwrap().scan_height, 13);
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, 13);
         assert_eq!(db.scanner_height().unwrap(), Some(13));
-        db.rescan(&["A".into()], 0).unwrap();
+        db.rescan(&[addr("A")], 0).unwrap();
         assert!(db.outputs(a.id).unwrap().is_empty());
-        assert_eq!(db.account("A").unwrap().unwrap().scan_height, 0);
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, 0);
     }
 
     fn new_tx(hash: u8, height: u64) -> NewTx<'static> {
@@ -1935,7 +1931,7 @@ mod tests {
         assert_eq!(db.halted().unwrap(), None);
         assert!(db.recent_blocks().unwrap().is_empty());
         assert!(db.outputs(a.id).unwrap().is_empty());
-        assert_eq!(db.account("A").unwrap().unwrap().scan_height, 15);
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, 15);
     }
 
     /// A rewind leaves the totals of the transactions before it as they
@@ -2059,7 +2055,10 @@ mod tests {
         let (done_tx, done) = std::sync::mpsc::channel();
         let reader = db.clone();
         std::thread::spawn(move || {
-            let read = (reader.account("A").unwrap(), reader.holdings(a.id).unwrap().txs.len());
+            let read = (
+                reader.account(&addr("A")).unwrap(),
+                reader.holdings(a.id).unwrap().txs.len(),
+            );
             done_tx.send(read).unwrap();
         });
         let (account, txs) = done
@@ -2122,13 +2121,13 @@ mod tests {
                 .expect("touch waited")
         );
         assert_eq!(
-            db.account("A").unwrap().unwrap().access_time,
+            db.account(&addr("A")).unwrap().unwrap().access_time,
             1,
             "not yet: the writer is held"
         );
         go.send(()).unwrap();
         writer.join().unwrap();
-        assert!(db.account("A").unwrap().unwrap().access_time >= now() - 5);
+        assert!(db.account(&addr("A")).unwrap().unwrap().access_time >= now() - 5);
         // With the writer free, at once.
         db.write(|tx| {
             tx.execute("UPDATE accounts SET access_time = 1 WHERE id = ?1", [a.id])?;
@@ -2136,7 +2135,7 @@ mod tests {
         })
         .unwrap();
         db.touch(a.id).unwrap();
-        assert!(db.account("A").unwrap().unwrap().access_time >= now() - 5);
+        assert!(db.account(&addr("A")).unwrap().unwrap().access_time >= now() - 5);
     }
 
     /// Each read is one snapshot: a commit landing between its statements
@@ -2184,7 +2183,7 @@ mod tests {
                 let db = db.clone();
                 std::thread::spawn(move || {
                     for _ in 0..20 {
-                        assert_eq!(db.account("A").unwrap().unwrap().id, a.id);
+                        assert_eq!(db.account(&addr("A")).unwrap().unwrap().id, a.id);
                     }
                 })
             })

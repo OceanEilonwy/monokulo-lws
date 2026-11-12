@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use curve25519_dalek::{EdwardsPoint, constants::ED25519_BASEPOINT_TABLE, scalar::Scalar as DScalar};
 use lws_api::{Login, PrivateViewKey};
 use monero_wallet::{
-    address::{AddressType, MoneroAddress, Network},
+    address::Network,
     block::{Block, BlockHeader},
     ed25519::CompressedPoint,
     interface::ScannableBlock,
@@ -19,6 +19,7 @@ use monero_wallet::{
 };
 use tokio::sync::Mutex;
 
+use crate::address::Address;
 use crate::crypto;
 use crate::daemon::{Daemon, FeeEstimate, RawBlock};
 use crate::db::{Account, Db, NewAccount, ScanWriter, Status};
@@ -76,19 +77,18 @@ impl Wallet {
         self.spend_pub() + &crypto::subaddress_derivation(&self.view_key(), major, minor) * ED25519_BASEPOINT_TABLE
     }
 
-    pub fn address(&self) -> String {
-        MoneroAddress::new(
+    /// Its primary address, on stagenet.
+    pub fn address(&self) -> Address {
+        Address::from_keys(
             Network::Stagenet,
-            AddressType::Legacy,
             monero_wallet::ed25519::Point::from(self.spend_pub()),
             monero_wallet::ed25519::Point::from(self.view_pub()),
         )
-        .to_string()
     }
 
     pub fn login(&self) -> Login {
         Login {
-            address: self.address(),
+            address: self.address().as_str().to_owned(),
             view_key: self.view_key(),
         }
     }
@@ -98,8 +98,6 @@ impl Wallet {
             &NewAccount {
                 address: self.address(),
                 view_key: self.view_key(),
-                spend_pub: self.spend_pub().compress().to_bytes(),
-                view_pub: self.view_pub().compress().to_bytes(),
                 start_height: start,
                 generated_locally: false,
             },

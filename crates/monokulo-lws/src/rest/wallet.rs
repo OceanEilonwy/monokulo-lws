@@ -31,7 +31,7 @@ type Reply<T> = std::result::Result<Json<T>, ApiError>;
 /// is taken whole: its view key ends in the `Checked`, and is wiped there.
 async fn authorize(app: &App, login: Login) -> Result<Account> {
     let checked = crypto::check_login(app.scanner.config.network, &login.address, login.view_key)?;
-    let address = checked.address().to_owned();
+    let address = checked.address().clone();
     let Some(account) = app.db.call(move |db| db.account(&address)).await? else {
         return Err(Error::Forbidden);
     };
@@ -155,7 +155,7 @@ pub async fn login(
     ApiJson(req): ApiJson<LoginRequest>,
 ) -> Reply<LoginResponse> {
     let checked = crypto::check_login(app.scanner.config.network, &req.login.address, req.login.view_key)?;
-    let address = checked.address().to_owned();
+    let address = checked.address().clone();
     if let Some(account) = app.db.call(move |db| db.account(&address)).await? {
         if account.status == Status::Hidden || account.view_key.ct_eq(checked.view_key()).unwrap_u8() == 0 {
             return Err(Error::Forbidden.into());
@@ -180,7 +180,7 @@ pub async fn login(
     strict_allowed(&app, client.as_ref())?;
     // Asked before and not yet accepted: refused before it can spend the
     // global token.
-    let address = checked.address().to_owned();
+    let address = checked.address().clone();
     if approve
         && app
             .db
@@ -685,10 +685,8 @@ pub async fn import_wallet_request(
         }
         Policy::Approve => {
             let new = NewAccount {
-                address: account.address.clone(),
+                address: account.address,
                 view_key: account.view_key,
-                spend_pub: account.spend_pub,
-                view_pub: account.view_pub,
                 start_height: 0,
                 generated_locally: account.generated_locally,
             };

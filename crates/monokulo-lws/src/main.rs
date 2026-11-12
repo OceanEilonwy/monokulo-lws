@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod address;
 mod admin_keys;
 mod at_rest;
 #[cfg(test)]
@@ -507,22 +508,32 @@ fn admin(command: AdminCommand) -> anyhow::Result<()> {
             let key = lws_api::PrivateViewKey::from_hex(&view_key).context("the view key must be 64 hex characters")?;
             let checked = crypto::check_login(network, &address, key)?;
             let account = db.add_account(&checked.into_new_account(start_height, false), Status::Active)?;
-            println!("added {} from height {}", account.address, account.start_height);
+            println!(
+                "added {} from height {}",
+                account.address.as_str(),
+                account.start_height
+            );
         }
         AdminCommand::RemoveAccount { db, address } => {
             let db = open_db(&db)?;
+            let address = address::Address::parse_any_network(&address)?;
             if db.remove_accounts(std::slice::from_ref(&address))?.is_empty() {
                 bail!("no account with that address");
             }
-            println!("removed {address}");
+            println!("removed {}", address.as_str());
         }
         AdminCommand::List { db } => {
             let db = open_db(&db)?;
             for a in db.accounts(None)? {
-                println!("{:<8} {:>9} {}", a.status.as_str(), a.scan_height, a.address);
+                println!("{:<8} {:>9} {}", a.status.as_str(), a.scan_height, a.address.as_str());
             }
             for (kind, r) in db.requests()? {
-                println!("request {:<7} {:>9} {}", kind.as_str(), r.start_height, r.address);
+                println!(
+                    "request {:<7} {:>9} {}",
+                    kind.as_str(),
+                    r.start_height,
+                    r.address.as_str()
+                );
             }
         }
     }

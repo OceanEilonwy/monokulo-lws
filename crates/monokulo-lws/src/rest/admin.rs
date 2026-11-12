@@ -19,6 +19,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use super::{ApiError, ApiJson, App, parse_value};
+use crate::address::Address;
 use crate::db::{Accepted, Status};
 use crate::error::{Error, Result, bad};
 use crate::{admin_keys, crypto};
@@ -38,6 +39,18 @@ async fn authorize(app: &App, auth: Option<lws_api::AdminKey>) -> Result<()> {
 
 fn params<P: DeserializeOwned>(value: &Value) -> Result<P> {
     parse_value(value.clone())
+}
+
+/// The addresses a command names, each parsed as a primary address on this
+/// network. One that doesn't parse fails the whole command (400), as in
+/// monero-lws; the error doesn't quote it.
+fn addresses(app: &App, list: &[String]) -> Result<Vec<Address>> {
+    list.iter()
+        .map(|a| {
+            Address::parse(app.scanner.config.network, a)
+                .map_err(|_| bad("an address isn't a primary address on this network"))
+        })
+        .collect()
 }
 
 pub async fn command(
@@ -67,7 +80,8 @@ pub async fn command(
 /// All or nothing: if any named create request's address already has an
 /// account, 409 with those addresses and nothing is accepted.
 async fn accept(app: &App, p: Requests) -> Result<Response> {
-    match app.db.call(move |db| db.accept_requests(p.kind, &p.addresses)).await? {
+    let named = addresses(app, &p.addresses)?;
+    match app.db.call(move |db| db.accept_requests(p.kind, &named)).await? {
         Accepted::Done(done) => {
             app.scanner.wake.notify_one();
             Ok(Json(json!({ "updated": done })).into_response())
@@ -84,7 +98,8 @@ async fn accept(app: &App, p: Requests) -> Result<Response> {
 }
 
 async fn reject(app: &App, p: Requests) -> Result<Value> {
-    let taken = app.db.call(move |db| db.take_requests(p.kind, &p.addresses)).await?;
+    let named = addresses(app, &p.addresses)?;
+    let taken = app.db.call(move |db| db.take_requests(p.kind, &named)).await?;
     Ok(json!({ "updated": taken.into_iter().map(|n| n.address).collect::<Vec<_>>() }))
 }
 
@@ -107,7 +122,7 @@ async fn list_accounts(app: &App) -> Result<Value> {
     let mut out = Accounts::default();
     for a in app.db.call(|db| db.accounts(None)).await? {
         let row = AccountRow {
-            address: a.address,
+            address: a.address.as_str().to_owned(),
             scan_height: a.scan_height,
             access_time: a.access_time,
         };
@@ -124,7 +139,7 @@ async fn list_requests(app: &App) -> Result<Value> {
     let mut out = PendingRequests::default();
     for (kind, new) in app.db.call(|db| db.requests()).await? {
         let row = RequestRow {
-            address: new.address,
+            address: new.address.as_str().to_owned(),
             start_height: new.start_height,
         };
         match kind {
@@ -137,13 +152,15 @@ async fn list_requests(app: &App) -> Result<Value> {
 
 async fn modify_status(app: &App, p: ModifyStatus) -> Result<Value> {
     let status = Status::parse(&p.status).ok_or_else(|| bad("status must be active, inactive or hidden"))?;
-    let done = app.db.call(move |db| db.set_status(&p.addresses, status)).await?;
+    let named = addresses(app, &p.addresses)?;
+    let done = app.db.call(move |db| db.set_status(&named, status)).await?;
     app.scanner.wake.notify_one();
     Ok(json!({ "updated": done }))
 }
 
 async fn rescan(app: &App, p: Rescan) -> Result<Value> {
-    let done = app.db.call(move |db| db.rescan(&p.addresses, p.height)).await?;
+    let named = addresses(app, &p.addresses)?;
+    let done = app.db.call(move |db| db.rescan(&named, p.height)).await?;
     app.scanner.wake.notify_one();
     Ok(json!({ "updated": done }))
 }
@@ -151,13 +168,13 @@ async fn rescan(app: &App, p: Rescan) -> Result<Value> {
 /// Not in monero-lws's API, which only hides an account: forgets these
 /// accounts and everything scanned for them.
 async fn remove(app: &App, p: Addresses) -> Result<Value> {
-    let done = app.db.call(move |db| db.remove_accounts(&p.addresses)).await?;
+    let named = addresses(app, &p.addresses)?;
+    let done = app.db.call(move |db| db.remove_accounts(&named)).await?;
     app.scanner.wake.notify_one();
     Ok(json!({ "removed": done }))
 }
 
 fn validate(app: &App, p: Validate) -> Result<Value> {
-    use monero_wallet::address::{AddressType, MoneroAddress};
     use monero_wallet::ed25519::CompressedPoint;
     let spend_point = CompressedPoint::from(p.spend_public_hex.0)
         .decompress()
@@ -165,10 +182,9 @@ fn validate(app: &App, p: Validate) -> Result<Value> {
     let view_point = CompressedPoint::from(p.view_public_hex.0)
         .decompress()
         .ok_or_else(|| bad("view_public_hex isn't a point"))?;
-    let address =
-        MoneroAddress::new(app.scanner.config.network, AddressType::Legacy, spend_point, view_point).to_string();
-    match crypto::check_login(app.scanner.config.network, &address, p.view_key_hex) {
-        Ok(_) => Ok(json!({ "address": address })),
+    let address = Address::from_keys(app.scanner.config.network, spend_point, view_point);
+    match crypto::check_key(address, p.view_key_hex) {
+        Ok(checked) => Ok(json!({ "address": checked.address() })),
         Err(e) => Ok(json!({ "error": e.to_string() })),
     }
 }

@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 use super::*;
+use crate::address::Address;
 use crate::db::{Db, Status};
 use crate::limits::{ClientIpConfig, Limits};
 use crate::scanner::{LaneConfig, ScanConfig, Scanner};
@@ -102,6 +103,11 @@ fn add(app: &App, seed: u64, status: Status) -> (String, [u8; 32]) {
         .add_account(&checked.into_new_account(10, false), status)
         .unwrap();
     (address, key)
+}
+
+/// A wallet's address as the server holds it.
+fn parsed(address: &str) -> Address {
+    Address::parse(Network::Stagenet, address).unwrap()
 }
 
 fn login_body(address: &str, key: &[u8; 32]) -> Value {
@@ -230,7 +236,7 @@ async fn unknown_accounts_and_wrong_keys_look_the_same() {
     let mut create = login_body(&unknown, &other_key);
     create["create_account"] = json!(true);
     assert_eq!(call(&router, "/login", &create).await.status, StatusCode::FORBIDDEN);
-    assert!(app.db.account(&unknown).unwrap().is_none());
+    assert!(app.db.account(&parsed(&unknown)).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -315,7 +321,7 @@ async fn create_off_answers_501_and_creation_is_capped() {
     let r = call_from(&router, "/login", &body.to_string(), "198.51.100.99:1", &[]).await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
     assert!(r.headers.contains_key("retry-after"));
-    assert!(capped.db.account(&address).unwrap().is_none());
+    assert!(capped.db.account(&parsed(&address)).unwrap().is_none());
 
     // The approval queue holds one.
     let queued = app(Setup {
@@ -772,10 +778,25 @@ async fn remove_accounts_forgets_the_accounts_whole() {
         serde_json::from_str(&call(&admin, "/list_requests", &json!({ "auth": auth })).await.body).unwrap();
     assert_eq!(listed["create"].as_array().unwrap().len(), 1);
 
+    // A name that isn't an address fails the whole command, unquoted.
     let r = call(
         &admin,
         "/remove_accounts",
-        &json!({ "auth": auth, "params": { "addresses": [address, asking, "not an account"] } }),
+        &json!({ "auth": auth, "params": { "addresses": [address, "not an address"] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(!r.body.contains("not an address"), "{}", r.body);
+    assert!(
+        app.db.account(&parsed(&address)).unwrap().is_some(),
+        "nothing was removed"
+    );
+    // An address without an account is passed over.
+    let (unknown, _) = wallet(43);
+    let r = call(
+        &admin,
+        "/remove_accounts",
+        &json!({ "auth": auth, "params": { "addresses": [address, asking, unknown] } }),
     )
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
@@ -798,7 +819,7 @@ async fn remove_accounts_forgets_the_accounts_whole() {
         listed.get("create").is_none(),
         "the request under the address went too: {listed}"
     );
-    assert!(app.db.account(&address).unwrap().is_none());
+    assert!(app.db.account(&parsed(&address)).unwrap().is_none());
     // The removed wallet asks afresh, as any new one.
     let mut create = login_body(&address, &key);
     create["create_account"] = json!(true);
@@ -820,7 +841,7 @@ async fn an_output_without_its_transaction_is_no_panic() {
     let app = app(Setup::default());
     let router = wallet_router(app.clone());
     let (address, key) = add(&app, 95, Status::Active);
-    let id = app.db.account(&address).unwrap().unwrap().id;
+    let id = app.db.account(&parsed(&address)).unwrap().unwrap().id;
     app.db
         .raw_writer(|c| {
             c.execute_batch("PRAGMA foreign_keys=OFF;")?;
@@ -979,7 +1000,7 @@ async fn rescan_heights_past_i64_are_refused() {
         .await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
     }
-    assert_eq!(app.db.account(&address).unwrap().unwrap().scan_height, 10);
+    assert_eq!(app.db.account(&parsed(&address)).unwrap().unwrap().scan_height, 10);
     let r = call(
         &admin,
         "/rescan",
@@ -987,12 +1008,9 @@ async fn rescan_heights_past_i64_are_refused() {
     )
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(app.db.account(&address).unwrap().unwrap().scan_height, 5);
-    assert_eq!(
-        app.db.import(std::slice::from_ref(&address)).unwrap(),
-        vec![address.clone()]
-    );
-    let a = app.db.account(&address).unwrap().unwrap();
+    assert_eq!(app.db.account(&parsed(&address)).unwrap().unwrap().scan_height, 5);
+    assert_eq!(app.db.import(&[parsed(&address)]).unwrap(), vec![parsed(&address)]);
+    let a = app.db.account(&parsed(&address)).unwrap().unwrap();
     assert_eq!((a.start_height, a.scan_height), (0, 0));
     // A new account can't start there either.
     let (other, key) = wallet(99);
@@ -1002,7 +1020,7 @@ async fn rescan_heights_past_i64_are_refused() {
         app.db.add_account(&new, Status::Active),
         Err(crate::error::Error::BadRequest(_))
     ));
-    assert!(app.db.account(&other).unwrap().is_none());
+    assert!(app.db.account(&parsed(&other)).unwrap().is_none());
 }
 
 /// A repeated create request is refused before it takes a token from the
@@ -1113,8 +1131,8 @@ async fn accept_requests_is_all_or_nothing() {
     let body: Value = serde_json::from_str(&r.body).unwrap();
     assert_eq!(body["exists"], json!([a]));
     assert_eq!(app.db.requests().unwrap().len(), 3, "nothing was taken");
-    assert!(app.db.account(&b).unwrap().is_none());
-    assert!(app.db.account(&c).unwrap().is_none());
+    assert!(app.db.account(&parsed(&b)).unwrap().is_none());
+    assert!(app.db.account(&parsed(&c)).unwrap().is_none());
 
     let r = call(
         &admin,
@@ -1125,9 +1143,15 @@ async fn accept_requests_is_all_or_nothing() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     let body: Value = serde_json::from_str(&r.body).unwrap();
     assert_eq!(body["updated"], json!([b, c]));
-    assert_eq!(app.db.account(&b).unwrap().unwrap().status, Status::Active);
-    assert!(app.db.account(&c).unwrap().is_some());
-    let left: Vec<String> = app.db.requests().unwrap().into_iter().map(|(_, n)| n.address).collect();
+    assert_eq!(app.db.account(&parsed(&b)).unwrap().unwrap().status, Status::Active);
+    assert!(app.db.account(&parsed(&c)).unwrap().is_some());
+    let left: Vec<String> = app
+        .db
+        .requests()
+        .unwrap()
+        .into_iter()
+        .map(|(_, n)| n.address.as_str().to_owned())
+        .collect();
     assert_eq!(left, vec![a.clone()]);
 
     // Rejecting takes the request away; an unknown type is a 400 there too.

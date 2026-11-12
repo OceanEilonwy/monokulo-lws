@@ -317,9 +317,11 @@ No view key and no address appears in the log at any level:
 
 - A key is never a bare byte array: `lws_api::PrivateViewKey` and
   `lws_api::AdminKey` print `<redacted>` in `Debug` and `Display`, so any
-  struct that holds one, derived `Debug` or not, can't print it. The types
-  that also hold an address (`Login`, `admin::AddAccount`, `db::Account`,
-  `db::NewAccount`, `crypto::Checked`) print `<redacted>` for it too.
+  struct that holds one, derived `Debug` or not, can't print it. Inside the
+  server an address is an `address::Address` (parsed once, a primary
+  address on the server's network), which prints `<redacted>` in `Debug`
+  and has no `Display`. The wire types that carry an address as text
+  (`Login`, `admin::AddAccount`) print `<redacted>` for it too.
 - Accounts are named by row id in log lines (`new account #12`), never by
   address, not even shortened.
 - No error variant carries a key or an address; a request that fails

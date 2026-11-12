@@ -221,7 +221,7 @@ impl Ring {
         let mut ids = Vec::with_capacity(accounts.len());
         let mut in_keyring = Vec::with_capacity(accounts.len());
         for (account, ranges) in accounts {
-            let pair = crypto::view_pair(&account.spend_pub, &account.view_key)?;
+            let pair = crypto::view_pair(account.address.spend_pub(), &account.view_key)?;
             let id = keyring.add(&pair, &zeroize::Zeroizing::new(*account.view_key.as_bytes()));
             for index in watched(lookahead, ranges) {
                 keyring.watch(id, &pair, index);
@@ -284,7 +284,7 @@ impl Ring {
                 .find(|(id, _)| *id == account.id)
                 .map(|(_, r)| r.clone())
                 .unwrap_or_default();
-            let mut scanner = OxideScanner::new(crypto::view_pair(&account.spend_pub, &account.view_key)?);
+            let mut scanner = OxideScanner::new(crypto::view_pair(account.address.spend_pub(), &account.view_key)?);
             for index in watched(lookahead, &ranges) {
                 scanner.register_subaddress(index);
             }
@@ -2110,15 +2110,15 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
             rng.fill_bytes(&mut wide);
             let spend =
                 &DScalar::from_bytes_mod_order_wide(&wide) * curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
-            let view_pub = (&view * curve25519_dalek::constants::ED25519_BASEPOINT_TABLE)
-                .compress()
-                .to_bytes();
+            let view_pub = &view * curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
             accounts.push(db.add_account(
                 &crate::db::NewAccount {
-                    address: format!("replay-{i}"),
+                    address: crate::address::Address::from_keys(
+                        Network::Mainnet,
+                        monero_wallet::ed25519::Point::from(spend),
+                        monero_wallet::ed25519::Point::from(view_pub),
+                    ),
                     view_key: PrivateViewKey::from_bytes(&view.to_bytes()),
-                    spend_pub: spend.compress().to_bytes(),
-                    view_pub,
                     start_height: 3_797_000,
                     generated_locally: false,
                 },
@@ -2412,15 +2412,26 @@ mod tests {
         db.account(&account.address).unwrap().unwrap()
     }
 
-    fn account(db: &Db, keys: &Keys, address: &str, start: u64) -> Account {
-        let spend_pub = keys.spend.compress().to_bytes();
-        let view_pub = (&keys.view * ED25519_BASEPOINT_TABLE).compress().to_bytes();
+    /// The address `name` stands for: the keys' primary address, on stagenet
+    /// for `"A"` and mainnet for `"B"`, so two accounts can share keys.
+    fn addr(keys: &Keys, name: &str) -> crate::address::Address {
+        let network = match name {
+            "A" => Network::Stagenet,
+            "B" => Network::Mainnet,
+            _ => Network::Testnet,
+        };
+        crate::address::Address::from_keys(
+            network,
+            monero_wallet::ed25519::Point::from(keys.spend),
+            monero_wallet::ed25519::Point::from(&keys.view * ED25519_BASEPOINT_TABLE),
+        )
+    }
+
+    fn account(db: &Db, keys: &Keys, name: &str, start: u64) -> Account {
         db.add_account(
             &NewAccount {
-                address: address.into(),
+                address: addr(keys, name),
                 view_key: PrivateViewKey::from_bytes(keys.view.as_bytes()),
-                spend_pub,
-                view_pub,
                 start_height: start,
                 generated_locally: false,
             },
@@ -2468,8 +2479,8 @@ mod tests {
             db.outputs(b.id).unwrap().is_empty() && db.spends(b.id).unwrap().is_empty(),
             "B starts at 200"
         );
-        assert_eq!(db.account("A").unwrap().unwrap().scan_height, 102);
-        assert_eq!(db.account("B").unwrap().unwrap().scan_height, 200);
+        assert_eq!(db.account(&addr(&keys(), "A")).unwrap().unwrap().scan_height, 102);
+        assert_eq!(db.account(&addr(&keys(), "B")).unwrap().unwrap().scan_height, 200);
         assert!(db.block_hash(101).unwrap().is_some(), "the live lane keeps hashes");
     }
 
@@ -2544,21 +2555,21 @@ mod tests {
         go.send(()).unwrap();
         writer.join().unwrap();
 
-        db.rescan(&["B".to_string()], 50).unwrap();
+        db.rescan(&[addr(&keys, "B")], 50).unwrap();
         db.write(|tx| write_scanned(&ScanWriter::new(tx), &accounts, &batch, 100, scanned, true))
             .unwrap();
         assert_eq!(db.outputs(a.id).unwrap().len(), 1);
         assert_eq!(db.spends(a.id).unwrap().len(), 1);
-        assert_eq!(db.account("A").unwrap().unwrap().scan_height, 102);
+        assert_eq!(db.account(&addr(&keys, "A")).unwrap().unwrap().scan_height, 102);
         assert!(db.outputs(b.id).unwrap().is_empty(), "rescanned meanwhile");
-        assert_eq!(db.account("B").unwrap().unwrap().scan_height, 50);
+        assert_eq!(db.account(&addr(&keys, "B")).unwrap().unwrap().scan_height, 50);
     }
 
     #[test]
     fn no_hits_no_outputs_but_scan_heights_move_on() {
         let (db, a, _) = record(Some(&|_: &Ring| vec![]));
         assert!(db.outputs(a.id).unwrap().is_empty());
-        assert_eq!(db.account("A").unwrap().unwrap().scan_height, 102);
+        assert_eq!(db.account(&addr(&keys(), "A")).unwrap().unwrap().scan_height, 102);
     }
 
     #[test]
