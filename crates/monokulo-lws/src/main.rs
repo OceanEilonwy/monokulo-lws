@@ -389,8 +389,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             lanes,
         },
     );
+    tracing::info!("database {} with {} read connections", args.db.display(), db.readers());
     let app = Arc::new(App {
-        db,
+        db: crate::db::AsyncDb::new(db),
         daemon,
         scanner: scanner.clone(),
         config: Config {
@@ -450,7 +451,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("listening on {addr}"))?;
-            if app.config.admin_auth && admin_keys::count(&app.db)? == 0 {
+            if app.config.admin_auth && app.db.call(admin_keys::count).await? == 0 {
                 tracing::warn!("admin API on but no admin key yet: run `monokulo-lws admin create-key`");
             }
             if !app.config.admin_auth {

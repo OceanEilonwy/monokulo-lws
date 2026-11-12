@@ -30,13 +30,15 @@ type Reply<T> = std::result::Result<Json<T>, ApiError>;
 /// answer nor its timing says whether an address has an account.
 async fn authorize(app: &App, login: &Login) -> Result<Account> {
     let checked = crypto::check_login(app.scanner.config.network, &login.address, &login.view_key.0)?;
-    let Some(account) = app.db.account(&checked.address)? else {
+    let address = checked.address.clone();
+    let Some(account) = app.db.call(move |db| db.account(&address)).await? else {
         return Err(Error::Forbidden);
     };
     if account.status == Status::Hidden || account.view_key.ct_eq(&checked.view_key).unwrap_u8() == 0 {
         return Err(Error::Forbidden);
     }
-    app.db.touch(account.id)?;
+    let id = account.id;
+    app.db.call(move |db| db.touch(id)).await?;
     Ok(account)
 }
 
@@ -78,8 +80,9 @@ fn creation_allowed(app: &App, client: Option<&Extension<ClientIp>>) -> Result<(
 /// Queues a create or import request: `Ok(false)` if one is already
 /// pending, `Busy` when the queue is full (monero-lws's
 /// `--create-queue-max`).
-fn queue(app: &App, kind: RequestKind, new: &NewAccount) -> Result<bool> {
-    match app.db.add_request(kind, new, app.limits.max_pending_requests)? {
+async fn queue(app: &App, kind: RequestKind, new: &NewAccount) -> Result<bool> {
+    let (new, max) = (new.clone(), app.limits.max_pending_requests);
+    match app.db.call(move |db| db.add_request(kind, &new, max)).await? {
         Queued::Added => Ok(true),
         Queued::Duplicate => Ok(false),
         Queued::Full(pending) => {
@@ -151,11 +154,13 @@ pub async fn login(
     ApiJson(req): ApiJson<LoginRequest>,
 ) -> Reply<LoginResponse> {
     let checked = crypto::check_login(app.scanner.config.network, &req.login.address, &req.login.view_key.0)?;
-    if let Some(account) = app.db.account(&checked.address)? {
+    let address = checked.address.clone();
+    if let Some(account) = app.db.call(move |db| db.account(&address)).await? {
         if account.status == Status::Hidden || account.view_key.ct_eq(&checked.view_key).unwrap_u8() == 0 {
             return Err(Error::Forbidden.into());
         }
-        app.db.touch(account.id)?;
+        let id = account.id;
+        app.db.call(move |db| db.touch(id)).await?;
         return Ok(Json(LoginResponse {
             new_address: false,
             generated_locally: Some(account.generated_locally),
@@ -174,7 +179,13 @@ pub async fn login(
     strict_allowed(&app, client.as_ref())?;
     // Asked before and not yet accepted: refused before it can spend the
     // global token.
-    if approve && app.db.has_request(RequestKind::Create, &checked.address)? {
+    let address = checked.address.clone();
+    if approve
+        && app
+            .db
+            .call(move |db| db.has_request(RequestKind::Create, &address))
+            .await?
+    {
         return Err(Error::Forbidden.into());
     }
     global_allowed(&app)?;
@@ -188,12 +199,13 @@ pub async fn login(
         generated_locally: req.generated_locally,
     };
     if approve {
-        if !queue(&app, RequestKind::Create, &new)? {
+        if !queue(&app, RequestKind::Create, &new).await? {
             return Err(Error::Forbidden.into());
         }
         tracing::info!("a new account request is waiting for approval");
     } else {
-        let account = app.db.add_account(&new, Status::Active)?;
+        let adding = new.clone();
+        let account = app.db.call(move |db| db.add_account(&adding, Status::Active)).await?;
         app.scanner.wake.notify_one();
         tracing::info!("new account #{} from height {}", account.id, new.start_height);
     }
@@ -209,7 +221,8 @@ pub async fn get_address_info(State(app): State<Arc<App>>, ApiJson(login): ApiJs
     let account = authorize(&app, &login).await?;
     let chain = chain_height(&app);
     let now = crate::db::now();
-    let Holdings { txs, outputs, spends } = app.db.holdings(account.id)?;
+    let id = account.id;
+    let Holdings { txs, outputs, spends } = app.db.call(move |db| db.holdings(id)).await?;
     let txs: HashMap<i64, TxRow> = txs.into_iter().map(|t| (t.id, t)).collect();
     let outputs: HashMap<i64, OutputRow> = outputs.into_iter().map(|o| (o.id, o)).collect();
     let mut total_received = 0u64;
@@ -264,11 +277,15 @@ fn proof_of(row: crate::db::ProofRow) -> Proof {
 pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<AddressTxs> {
     let account = authorize(&app, &login).await?;
     let chain = chain_height(&app);
-    let Holdings {
-        txs: rows,
-        outputs,
-        spends,
-    } = app.db.holdings(account.id)?;
+    let id = account.id;
+    let (
+        Holdings {
+            txs: rows,
+            outputs,
+            spends,
+        },
+        mut proofs,
+    ) = app.db.call(move |db| db.holdings_and_proofs(id)).await?;
     let outputs: HashMap<i64, OutputRow> = outputs.into_iter().map(|o| (o.id, o)).collect();
     let mut receives_by_tx: HashMap<i64, Vec<ReceivedOutput>> = HashMap::new();
     for o in outputs.values() {
@@ -284,7 +301,6 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
         });
     }
     let mut spends = spends_by_tx(&spends, &outputs);
-    let mut proofs = app.db.proofs(account.id)?;
     let mut total_received = outputs.values().map(|o| o.amount).fold(0u64, u64::saturating_add);
     let mined: std::collections::HashSet<[u8; 32]> = rows.iter().map(|t| t.hash).collect();
     let mut transactions: Vec<Transaction> = rows
@@ -401,7 +417,8 @@ pub async fn get_unspent_outs(
 ) -> Reply<UnspentOuts> {
     let account = authorize(&app, &req.login).await?;
     let fee = app.fee().await?;
-    let Holdings { txs, outputs, spends } = app.db.holdings(account.id)?;
+    let id = account.id;
+    let Holdings { txs, outputs, spends } = app.db.call(move |db| db.holdings(id)).await?;
     let txs: HashMap<i64, TxRow> = txs.into_iter().map(|t| (t.id, t)).collect();
     let mut images: HashMap<i64, Vec<Hex32>> = HashMap::new();
     for s in spends {
@@ -666,7 +683,8 @@ pub async fn import_wallet_request(
                 return Ok(reply(false, true, "Approved"));
             }
             creation_allowed(&app, client.as_ref())?;
-            app.db.import(std::slice::from_ref(&account.address))?;
+            let address = account.address.clone();
+            app.db.call(move |db| db.import(std::slice::from_ref(&address))).await?;
             app.scanner.wake.notify_one();
             tracing::info!("import for account #{}: scanning from 0", account.id);
             Ok(reply(true, true, "Approved"))
@@ -680,11 +698,16 @@ pub async fn import_wallet_request(
                 start_height: 0,
                 generated_locally: account.generated_locally,
             };
-            if app.db.has_request(RequestKind::Import, &new.address)? {
+            let address = new.address.clone();
+            if app
+                .db
+                .call(move |db| db.has_request(RequestKind::Import, &address))
+                .await?
+            {
                 return Ok(reply(false, false, "Already requested"));
             }
             creation_allowed(&app, client.as_ref())?;
-            let added = queue(&app, RequestKind::Import, &new)?;
+            let added = queue(&app, RequestKind::Import, &new).await?;
             Ok(reply(added, false, if added { "Pending" } else { "Already requested" }))
         }
     }
@@ -724,11 +747,30 @@ fn check_ranges(ranges: &[SubaddrRanges], max: u64) -> Result<()> {
     Ok(())
 }
 
+/// Adds the ranges to the account's and, with `get_all`, reads them all
+/// back: what is new, and everything.
+async fn upsert(
+    app: &App,
+    account: i64,
+    wanted: Vec<SubaddrRanges>,
+    max: u64,
+    get_all: bool,
+) -> Result<(Vec<SubaddrRanges>, Option<Vec<SubaddrRanges>>)> {
+    app.db
+        .call(move |db| {
+            let new = db.upsert_subaddrs(account, &wanted, max)?;
+            let all = get_all.then(|| db.subaddrs(account)).transpose()?;
+            Ok((new, all))
+        })
+        .await
+}
+
 pub async fn get_subaddrs(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<Subaddrs> {
     let max = subaddresses_on(&app)?;
     let account = authorize(&app, &login).await?;
+    let id = account.id;
     Ok(Json(Subaddrs {
-        all_subaddrs: app.db.subaddrs(account.id)?,
+        all_subaddrs: app.db.call(move |db| db.subaddrs(id)).await?,
         max_subaddrs: Some(max),
     }))
 }
@@ -740,8 +782,7 @@ pub async fn upsert_subaddrs(
     let max = subaddresses_on(&app)?;
     check_ranges(&req.subaddrs, max)?;
     let account = authorize_active(&app, &req.login).await?;
-    let new_subaddrs = app.db.upsert_subaddrs(account.id, &req.subaddrs, max)?;
-    let all_subaddrs = req.get_all.then(|| app.db.subaddrs(account.id)).transpose()?;
+    let (new_subaddrs, all_subaddrs) = upsert(&app, account.id, req.subaddrs, max, req.get_all).await?;
     Ok(Json(NewSubaddrs {
         new_subaddrs,
         all_subaddrs,
@@ -760,7 +801,8 @@ pub async fn provision_subaddrs(
     if u64::from(n_maj) * u64::from(n_min) > max {
         return Err(Error::Conflict(format!("asking for more than the limit of {max}")).into());
     }
-    let have = app.db.subaddrs(account.id)?;
+    let id = account.id;
+    let have = app.db.call(move |db| db.subaddrs(id)).await?;
     let mut wanted = vec![];
     let full = || Error::Conflict("no room left in that major index".into());
     for maj in maj_i..maj_i.saturating_add(n_maj) {
@@ -780,8 +822,7 @@ pub async fn provision_subaddrs(
             value: vec![[lo, hi]],
         });
     }
-    let new_subaddrs = app.db.upsert_subaddrs(account.id, &wanted, max)?;
-    let all_subaddrs = req.get_all.then(|| app.db.subaddrs(account.id)).transpose()?;
+    let (new_subaddrs, all_subaddrs) = upsert(&app, account.id, wanted, max, req.get_all).await?;
     Ok(Json(NewSubaddrs {
         new_subaddrs,
         all_subaddrs,

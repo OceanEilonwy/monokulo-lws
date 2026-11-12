@@ -1,5 +1,13 @@
 //! The server's store: one SQLite file, WAL mode, one writer.
 //!
+//! Writes go through the one writer connection, one transaction at a time.
+//! Reads go through a small pool of read-only connections (`query_only`),
+//! each read one SQLite read transaction: under WAL a reader sees the last
+//! commit and is never held up by a write transaction in progress, so the
+//! scanner writing a batch doesn't stall the API. Every call blocks, so
+//! async code reaches the store through [`AsyncDb`] (or [`Db::call`]), which
+//! runs it on tokio's blocking threads, never on a worker.
+//!
 //! What is kept, per account: the view key and public keys, where scanning
 //! stands, every output received, every candidate spend (an input whose ring
 //! holds one of the account's outputs), the transactions those came in, and
@@ -10,11 +18,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lws_api::admin::RequestKind;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use crate::error::{Error, Result, bad};
 
@@ -265,7 +273,59 @@ pub struct NewOutput {
 }
 
 pub struct Db {
-    conn: Mutex<Connection>,
+    writer: Mutex<Connection>,
+    /// Read-only connections; empty for an in-memory database, whose reads
+    /// then go through the writer.
+    readers: Mutex<Vec<Connection>>,
+    reader_free: Condvar,
+    /// How many readers the pool was made with.
+    reader_count: usize,
+    /// Accounts whose access time is to be set (`touch`) and when, for the
+    /// next write: a login doesn't wait for the scanner's batch to commit.
+    touched: Mutex<HashMap<i64, u64>>,
+    /// A test database's file, removed with it (`Db::scratch`).
+    #[cfg(test)]
+    scratch: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for Db {
+    fn drop(&mut self) {
+        if let Some(path) = &self.scratch {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+    }
+}
+
+/// Read connections a database opens by default: a few, so a burst of API
+/// reads doesn't queue behind one, but not one per core on a big machine.
+pub fn default_readers() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4)
+}
+
+/// How long a connection waits on SQLite's own locks (another process,
+/// a checkpoint) before giving up.
+const BUSY_TIMEOUT_MS: u32 = 5_000;
+
+/// A reader taken from the pool, given back when dropped.
+struct Reader<'a> {
+    db: &'a Db,
+    conn: Option<Connection>,
+}
+
+impl Drop for Reader<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            lock(&self.db.readers).push(conn);
+            self.db.reader_free.notify_one();
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn blob32(v: Vec<u8>) -> rusqlite::Result<[u8; 32]> {
@@ -327,40 +387,187 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-impl Db {
-    pub fn open(path: &Path) -> Result<Db> {
-        let mut conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")?;
-        conn.execute_batch(SCHEMA)?;
-        migrate(&mut conn)?;
-        Ok(Db { conn: Mutex::new(conn) })
+/// A read-only connection to the database at `path`, which the writer has
+/// made: never creates it, refuses to write (`query_only`), waits out
+/// SQLite's locks for a while.
+fn open_reader(path: &Path) -> Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.execute_batch(&format!("PRAGMA query_only=ON; PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))?;
+    Ok(conn)
+}
+
+/// The store as async code holds it: the only way in is [`AsyncDb::call`],
+/// which runs on a blocking thread, so a handler can't block a tokio worker
+/// on SQLite by forgetting to.
+#[derive(Clone)]
+pub struct AsyncDb(Arc<Db>);
+
+impl AsyncDb {
+    pub fn new(db: Arc<Db>) -> AsyncDb {
+        AsyncDb(db)
     }
 
+    /// `f` with the store, on one of tokio's blocking threads.
+    pub async fn call<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Db) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.0.call(f).await
+    }
+}
+
+/// Tests look at the store directly.
+#[cfg(test)]
+impl std::ops::Deref for AsyncDb {
+    type Target = Db;
+
+    fn deref(&self) -> &Db {
+        &self.0
+    }
+}
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Db> {
+        Db::open_with_readers(path, default_readers())
+    }
+
+    /// Opens the database with `readers` read-only connections besides the
+    /// writer (at least one).
+    pub fn open_with_readers(path: &Path, readers: usize) -> Result<Db> {
+        let mut conn = Connection::open(path)?;
+        conn.execute_batch(&format!(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"
+        ))?;
+        conn.execute_batch(SCHEMA)?;
+        migrate(&mut conn)?;
+        let readers = (0..readers.max(1))
+            .map(|_| open_reader(path))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Db::with(conn, readers))
+    }
+
+    fn with(writer: Connection, readers: Vec<Connection>) -> Db {
+        Db {
+            writer: Mutex::new(writer),
+            reader_count: readers.len(),
+            readers: Mutex::new(readers),
+            reader_free: Condvar::new(),
+            touched: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            scratch: None,
+        }
+    }
+
+    /// A database in a file of its own under the temporary directory, with
+    /// the read pool as a served one has it; the file goes with it.
+    #[cfg(test)]
+    pub fn scratch() -> Db {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "monokulo-lws-db-{}-{}-{}.sqlite",
+            std::process::id(),
+            now(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut db = Db::open_with_readers(&path, 2).unwrap();
+        db.scratch = Some(path);
+        db
+    }
+
+    /// A private in-memory database. It has no read pool (each in-memory
+    /// connection is a database of its own): reads go through the writer.
+    /// Tests of the pool itself open a file (`Db::open`).
     #[cfg(test)]
     pub fn in_memory() -> Db {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         migrate(&mut conn).unwrap();
-        Db { conn: Mutex::new(conn) }
+        Db::with(conn, vec![])
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    /// How many read-only connections the database has (0: reads go
+    /// through the writer).
+    pub fn readers(&self) -> usize {
+        self.reader_count
     }
 
-    /// Run `f` inside one write transaction.
+    /// Run `f` inside one write transaction, on the one writer. Access
+    /// times left by `touch` are written in it too.
     pub fn write<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
-        let mut conn = self.lock();
+        let mut conn = lock(&self.writer);
         let tx = conn.transaction()?;
         let out = f(&tx)?;
+        self.flush_touched(&tx)?;
         tx.commit()?;
         Ok(out)
     }
 
+    /// Run `f` inside one read transaction, on a read-only connection from
+    /// the pool (waiting for one if all are out), or on the writer for an
+    /// in-memory database. Everything `f` reads is one snapshot: a write
+    /// committed while it runs is not half seen.
     pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self.lock();
-        f(&conn)
+        if self.reader_count == 0 {
+            let mut conn = lock(&self.writer);
+            let tx = conn.transaction()?;
+            return f(&tx);
+        }
+        let mut reader = self.take_reader();
+        let conn = reader.conn.as_mut().expect("held until dropped");
+        let tx = conn.transaction()?;
+        let out = f(&tx);
+        // A read transaction has nothing to commit; dropping it ends it.
+        drop(tx);
+        out
+    }
+
+    /// `f` on the writer outside any transaction, for a test that must
+    /// do what a transaction can't (turn foreign keys off).
+    #[cfg(test)]
+    pub fn raw_writer<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        f(&lock(&self.writer))
+    }
+
+    fn take_reader(&self) -> Reader<'_> {
+        let mut idle = lock(&self.readers);
+        loop {
+            if let Some(conn) = idle.pop() {
+                return Reader {
+                    db: self,
+                    conn: Some(conn),
+                };
+            }
+            idle = self.reader_free.wait(idle).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Runs `f` on one of tokio's blocking threads, so a caller on a
+    /// worker never waits there for SQLite (a write the scanner holds, a
+    /// busy pool, the disk). What async code uses; see [`AsyncDb`].
+    pub async fn call<T, F>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        F: FnOnce(&Db) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || f(&db))
+            .await
+            .map_err(|e| Error::Internal(format!("a database call failed: {e}")))?
+    }
+
+    fn flush_touched(&self, tx: &Transaction) -> Result<()> {
+        let touched = std::mem::take(&mut *lock(&self.touched));
+        for (id, at) in touched {
+            tx.execute(
+                "UPDATE accounts SET access_time = MAX(access_time, ?1) WHERE id = ?2",
+                params![at as i64, id],
+            )?;
+        }
+        Ok(())
     }
 
     // ---- accounts ----
@@ -412,14 +619,33 @@ impl Db {
         })
     }
 
+    /// Sets the account's access time to now: at once if the writer is
+    /// free, else with the next write (the scanner's batch commit, most
+    /// likely), so a login never waits for a batch to commit.
     pub fn touch(&self, id: i64) -> Result<()> {
-        self.write(|tx| {
-            tx.execute(
-                "UPDATE accounts SET access_time = ?1 WHERE id = ?2",
-                params![now() as i64, id],
-            )?;
-            Ok(())
-        })
+        {
+            let mut touched = lock(&self.touched);
+            let at = touched.entry(id).or_insert(0);
+            *at = (*at).max(now());
+        }
+        match self.writer.try_lock() {
+            Ok(mut conn) => {
+                let tx = conn.transaction()?;
+                self.flush_touched(&tx)?;
+                tx.commit()?;
+                Ok(())
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                let mut conn = e.into_inner();
+                let tx = conn.transaction()?;
+                self.flush_touched(&tx)?;
+                tx.commit()?;
+                Ok(())
+            }
+            // Held: whoever holds it writes the access time before committing,
+            // or the next writer does.
+            Err(std::sync::TryLockError::WouldBlock) => Ok(()),
+        }
     }
 
     /// Scan these accounts again from `height`: their rows from there on go.
@@ -711,59 +937,24 @@ impl Db {
         self.read(|c| txs_in(c, account))
     }
 
-    /// The account's transactions, outputs and candidate spends, read under
-    /// one lock, so a scanner commit can't fall between them (an output
-    /// whose transaction isn't in the list).
+    /// The account's transactions, outputs and candidate spends, read in
+    /// one read transaction, so a scanner commit can't fall between them
+    /// (an output whose transaction isn't in the list).
     pub fn holdings(&self, account: i64) -> Result<Holdings> {
-        self.read(|c| {
-            Ok(Holdings {
-                txs: txs_in(c, account)?,
-                outputs: outputs_in(c, account)?,
-                spends: spends_in(c, account)?,
-            })
-        })
+        self.read(|c| holdings_in(c, account))
+    }
+
+    /// [`Db::holdings`] and what each transaction can be proved in (by row
+    /// id) from one snapshot: a rescan
+    /// between two reads could give a row id to another transaction (SQLite
+    /// reuses the highest ids once they are deleted), and its proof to it.
+    pub fn holdings_and_proofs(&self, account: i64) -> Result<(Holdings, HashMap<i64, ProofRow>)> {
+        self.read(|c| Ok((holdings_in(c, account)?, proofs_in(c, account)?)))
     }
 
     #[cfg(test)]
     pub fn outputs(&self, account: i64) -> Result<Vec<OutputRow>> {
         self.read(|c| outputs_in(c, account))
-    }
-
-    /// What each of the account's transactions can be proved in, by row id:
-    /// a miner transaction whose block is kept, or another whose block and
-    /// pruned parts are, its prunable hash included. Transactions scanned
-    /// before these were kept, those whose prunable hash is still pending,
-    /// and those the account only (maybe) spent in, have none.
-    pub fn proofs(&self, account: i64) -> Result<HashMap<i64, ProofRow>> {
-        self.read(|c| {
-            let mut st = c.prepare(
-                "SELECT t.id, b.blob, k.prefix, k.rct_base, k.prunable_hash FROM txs t
-                 JOIN blocks_kept b ON b.height = t.height
-                 LEFT JOIN txs_kept k ON k.hash = t.hash AND k.height = t.height
-                 WHERE t.account = ?1 AND (t.coinbase != 0 OR k.prunable_hash IS NOT NULL)",
-            )?;
-            let rows = st
-                .query_map([account], |r| {
-                    let prefix: Option<Vec<u8>> = r.get(2)?;
-                    let parts = match prefix {
-                        Some(prefix) => Some(crate::proof::TxParts {
-                            prefix,
-                            rct_base: r.get(3)?,
-                            prunable_hash: Some(blob32(r.get(4)?)?),
-                        }),
-                        None => None,
-                    };
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        ProofRow {
-                            block: r.get(1)?,
-                            parts,
-                        },
-                    ))
-                })?
-                .collect::<rusqlite::Result<HashMap<_, _>>>()?;
-            Ok(rows)
-        })
     }
 
     /// Kept transactions whose prunable hash isn't known yet (the node sent
@@ -835,6 +1026,49 @@ pub struct Holdings {
     pub txs: Vec<TxRow>,
     pub outputs: Vec<OutputRow>,
     pub spends: Vec<SpendRow>,
+}
+
+fn holdings_in(c: &Connection, account: i64) -> Result<Holdings> {
+    Ok(Holdings {
+        txs: txs_in(c, account)?,
+        outputs: outputs_in(c, account)?,
+        spends: spends_in(c, account)?,
+    })
+}
+
+/// What each of the account's transactions can be proved in, by row id:
+/// a miner transaction whose block is kept, or another whose block and
+/// pruned parts are, its prunable hash included. Transactions scanned
+/// before these were kept, those whose prunable hash is still pending,
+/// and those the account only (maybe) spent in, have none.
+fn proofs_in(c: &Connection, account: i64) -> Result<HashMap<i64, ProofRow>> {
+    let mut st = c.prepare(
+        "SELECT t.id, b.blob, k.prefix, k.rct_base, k.prunable_hash FROM txs t
+         JOIN blocks_kept b ON b.height = t.height
+         LEFT JOIN txs_kept k ON k.hash = t.hash AND k.height = t.height
+         WHERE t.account = ?1 AND (t.coinbase != 0 OR k.prunable_hash IS NOT NULL)",
+    )?;
+    let rows = st
+        .query_map([account], |r| {
+            let prefix: Option<Vec<u8>> = r.get(2)?;
+            let parts = match prefix {
+                Some(prefix) => Some(crate::proof::TxParts {
+                    prefix,
+                    rct_base: r.get(3)?,
+                    prunable_hash: Some(blob32(r.get(4)?)?),
+                }),
+                None => None,
+            };
+            Ok((
+                r.get::<_, i64>(0)?,
+                ProofRow {
+                    block: r.get(1)?,
+                    parts,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+    Ok(rows)
 }
 
 fn txs_in(c: &Connection, account: i64) -> Result<Vec<TxRow>> {
@@ -1057,7 +1291,7 @@ fn uncovered(want: &[[u32; 2]], have: &[[u32; 2]]) -> Vec<[u32; 2]> {
     out
 }
 
-fn subaddrs_in(c: &Connection, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
+pub(crate) fn subaddrs_in(c: &Connection, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
     let mut st = c.prepare("SELECT maj, min_lo, min_hi FROM subaddrs WHERE account = ?1 ORDER BY maj, min_lo")?;
     let mut out: Vec<lws_api::SubaddrRanges> = vec![];
     for row in st.query_map([account], |r| {
@@ -1384,6 +1618,10 @@ impl<'a> ScanWriter<'a> {
         Ok(())
     }
 
+    pub fn subaddrs(&self, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
+        subaddrs_in(self.tx, account)
+    }
+
     /// Owned outputs by global index, for matching rings against.
     pub fn owned_indexes(&self, account: i64) -> Result<HashMap<u64, OutputRow>> {
         Ok(outputs_in(self.tx, account)?
@@ -1391,10 +1629,6 @@ impl<'a> ScanWriter<'a> {
             .filter(|o| o.mask.is_some())
             .map(|o| (o.global_index, o))
             .collect())
-    }
-
-    pub fn subaddrs(&self, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
-        subaddrs_in(self.tx, account)
     }
 }
 
@@ -1779,5 +2013,173 @@ mod tests {
         let outputs = outputs_in(&conn, 1).unwrap();
         assert_eq!(outputs[0].commitment, Some(crate::crypto::commit(&mask, 1234)));
         assert_eq!(outputs[1].commitment, None, "a pre-RingCT output has none");
+    }
+
+    /// Holds a write transaction open on another thread until told to go
+    /// on, having written one transaction row for `account` in it.
+    fn hold_writer(db: &Arc<Db>, account: i64) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let writer = db.clone();
+        let handle = std::thread::spawn(move || {
+            writer
+                .write(|tx| {
+                    ScanWriter::new(tx).tx_row(account, &new_tx(9, 50))?;
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        held.recv().unwrap();
+        (handle, go)
+    }
+
+    /// A read goes through a read connection while the writer is in the
+    /// middle of a transaction (the scanner's batch), and sees the last
+    /// commit, not the write in progress.
+    #[test]
+    fn a_read_goes_on_while_a_write_is_held() {
+        let db = Arc::new(Db::scratch());
+        assert_eq!(db.readers(), 2);
+        let a = acct(&db);
+        let (writer, go) = hold_writer(&db, a.id);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reader = db.clone();
+        std::thread::spawn(move || {
+            let read = (reader.account("A").unwrap(), reader.holdings(a.id).unwrap().txs.len());
+            done_tx.send(read).unwrap();
+        });
+        let (account, txs) = done
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the read waited for the writer");
+        assert_eq!(account.map(|a| a.id), Some(a.id));
+        assert_eq!(txs, 0, "the write in progress isn't seen");
+        go.send(()).unwrap();
+        writer.join().unwrap();
+        assert_eq!(db.holdings(a.id).unwrap().txs.len(), 1, "seen once committed");
+    }
+
+    /// From async code, with the writer held: `AsyncDb::call` answers on a
+    /// one-thread runtime (nothing parks its only worker), and the runtime
+    /// keeps running other tasks meanwhile.
+    #[test]
+    fn async_reads_never_wait_on_the_writer() {
+        let db = Arc::new(Db::scratch());
+        let a = acct(&db);
+        let (writer, go) = hold_writer(&db, a.id);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = AsyncDb::new(db.clone());
+        let found = rt.block_on(async move {
+            let ticker = tokio::spawn(async { tokio::task::yield_now().await });
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                handle.call(move |db| db.holdings(a.id)),
+            )
+            .await
+            .expect("answered while the writer was held")
+            .unwrap();
+            ticker.await.unwrap();
+            read.txs.len()
+        });
+        assert_eq!(found, 0);
+        go.send(()).unwrap();
+        writer.join().unwrap();
+    }
+
+    /// A login's access time doesn't wait for the writer: it is written
+    /// with the transaction that holds it, before that commits.
+    #[test]
+    fn touch_never_waits_for_the_writer() {
+        let db = Arc::new(Db::scratch());
+        let a = acct(&db);
+        db.write(|tx| {
+            tx.execute("UPDATE accounts SET access_time = 1 WHERE id = ?1", [a.id])?;
+            Ok(())
+        })
+        .unwrap();
+        let (writer, go) = hold_writer(&db, a.id);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let toucher = db.clone();
+        std::thread::spawn(move || done_tx.send(toucher.touch(a.id).is_ok()).unwrap());
+        assert!(
+            done.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("touch waited")
+        );
+        assert_eq!(
+            db.account("A").unwrap().unwrap().access_time,
+            1,
+            "not yet: the writer is held"
+        );
+        go.send(()).unwrap();
+        writer.join().unwrap();
+        assert!(db.account("A").unwrap().unwrap().access_time >= now() - 5);
+        // With the writer free, at once.
+        db.write(|tx| {
+            tx.execute("UPDATE accounts SET access_time = 1 WHERE id = ?1", [a.id])?;
+            Ok(())
+        })
+        .unwrap();
+        db.touch(a.id).unwrap();
+        assert!(db.account("A").unwrap().unwrap().access_time >= now() - 5);
+    }
+
+    /// Each read is one snapshot: a commit landing between its statements
+    /// (the scanner writing a transaction and its output) is wholly unseen,
+    /// so `holdings` never gives an output without its transaction.
+    #[test]
+    fn a_read_is_one_snapshot() {
+        let db = Arc::new(Db::scratch());
+        let a = acct(&db);
+        let (txs, outputs) = db
+            .read(|c| {
+                let txs = txs_in(c, a.id)?.len();
+                let writer = db.clone();
+                std::thread::spawn(move || {
+                    writer
+                        .write(|tx| {
+                            let w = ScanWriter::new(tx);
+                            let t = w.tx_row(a.id, &new_tx(1, 10))?;
+                            w.add_output(a.id, t, &new_output(1, 100, 5, 10))?;
+                            Ok(())
+                        })
+                        .unwrap()
+                })
+                .join()
+                .unwrap();
+                Ok((txs, outputs_in(c, a.id)?.len()))
+            })
+            .unwrap();
+        assert_eq!((txs, outputs), (0, 0), "the commit in between isn't half seen");
+        let h = db.holdings(a.id).unwrap();
+        assert_eq!((h.txs.len(), h.outputs.len()), (1, 1));
+        let (h, _) = db.holdings_and_proofs(a.id).unwrap();
+        assert_eq!(h.outputs[0].tx, h.txs[0].id);
+    }
+
+    /// Read connections refuse to write, and wait their turn when all are out.
+    #[test]
+    fn readers_are_read_only_and_shared() {
+        let db = Arc::new(Db::scratch());
+        let a = acct(&db);
+        let wrote = db.read(|c| Ok(c.execute("UPDATE accounts SET access_time = 0", [])?));
+        assert!(wrote.is_err(), "query_only");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        assert_eq!(db.account("A").unwrap().unwrap().id, a.id);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(lock(&db.readers).len(), 2, "every reader given back");
     }
 }

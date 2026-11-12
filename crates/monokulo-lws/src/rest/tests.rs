@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 use super::*;
-use crate::db::{NewAccount, Status};
+use crate::db::{Db, NewAccount, Status};
 use crate::limits::{ClientIpConfig, Limits};
 use crate::scanner::{LaneConfig, ScanConfig, Scanner};
 
@@ -52,7 +52,8 @@ impl Default for Setup {
 }
 
 fn app(setup: Setup) -> Arc<App> {
-    let db = Arc::new(Db::in_memory());
+    // A file, so the handlers read through the read pool as when served.
+    let db = Arc::new(Db::scratch());
     let daemon = Daemon::new(&setup.daemon).unwrap();
     let scanner = Scanner::new(
         db.clone(),
@@ -73,7 +74,7 @@ fn app(setup: Setup) -> Arc<App> {
     // As if the scanner had heard from the node: a new account starts below this.
     scanner.status.write().unwrap().chain_height = 1_000;
     Arc::new(App {
-        db,
+        db: crate::db::AsyncDb::new(db),
         daemon,
         scanner,
         config: Config {
@@ -830,7 +831,7 @@ async fn an_output_without_its_transaction_is_no_panic() {
     let (address, key) = add(&app, 95, Status::Active);
     let id = app.db.account(&address).unwrap().unwrap().id;
     app.db
-        .read(|c| {
+        .raw_writer(|c| {
             c.execute_batch("PRAGMA foreign_keys=OFF;")?;
             c.execute(
                 "INSERT INTO outputs (account, tx, out_index, global_index, amount, public_key, tx_pub_key, height, maj, min) VALUES (?1, 999, 0, 5, 7, ?2, ?2, 20, 0, 0)",

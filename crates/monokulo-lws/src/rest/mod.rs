@@ -31,7 +31,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::daemon::{Daemon, FeeEstimate, Info};
-use crate::db::Db;
+use crate::db::AsyncDb;
 use crate::decoys::Picker;
 use crate::error::{Error, bad};
 use crate::limits::{ClientIp, Limits};
@@ -64,7 +64,8 @@ pub struct Config {
 
 /// What every handler reaches.
 pub struct App {
-    pub db: Arc<Db>,
+    /// The store, reached only off the tokio workers (`AsyncDb::call`).
+    pub db: AsyncDb,
     pub daemon: Daemon,
     pub scanner: Arc<Scanner>,
     pub config: Config,

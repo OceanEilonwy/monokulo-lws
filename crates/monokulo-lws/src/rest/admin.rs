@@ -23,12 +23,13 @@ use crate::db::{Accepted, NewAccount, Status};
 use crate::error::{Error, Result, bad};
 use crate::{admin_keys, crypto};
 
-fn authorize(app: &App, auth: Option<&lws_api::Hex32>) -> Result<()> {
+async fn authorize(app: &App, auth: Option<&lws_api::Hex32>) -> Result<()> {
     if !app.config.admin_auth {
         return Ok(());
     }
     let Some(auth) = auth else { return Err(Error::Forbidden) };
-    if admin_keys::verify(&app.db, &auth.0)? {
+    let key = zeroize::Zeroizing::new(auth.0);
+    if app.db.call(move |db| admin_keys::verify(db, &key)).await? {
         Ok(())
     } else {
         tracing::warn!("an admin request with a wrong key");
@@ -45,16 +46,16 @@ pub async fn command(
     Path(command): Path<String>,
     ApiJson(req): ApiJson<Request<Value>>,
 ) -> std::result::Result<Response, ApiError> {
-    authorize(&app, req.auth.as_ref())?;
+    authorize(&app, req.auth.as_ref()).await?;
     let out = match command.as_str() {
-        "accept_requests" => return Ok(accept(&app, params(&req.params)?)?),
-        "reject_requests" => reject(&app, params(&req.params)?)?,
-        "add_account" => add_account(&app, params(&req.params)?)?,
-        "list_accounts" => list_accounts(&app)?,
-        "list_requests" => list_requests(&app)?,
-        "modify_account_status" => modify_status(&app, params(&req.params)?)?,
-        "rescan" => rescan(&app, params(&req.params)?)?,
-        "remove_accounts" => remove(&app, params(&req.params)?)?,
+        "accept_requests" => return Ok(accept(&app, params(&req.params)?).await?),
+        "reject_requests" => reject(&app, params(&req.params)?).await?,
+        "add_account" => add_account(&app, params(&req.params)?).await?,
+        "list_accounts" => list_accounts(&app).await?,
+        "list_requests" => list_requests(&app).await?,
+        "modify_account_status" => modify_status(&app, params(&req.params)?).await?,
+        "rescan" => rescan(&app, params(&req.params)?).await?,
+        "remove_accounts" => remove(&app, params(&req.params)?).await?,
         "validate" => validate(&app, params(&req.params)?)?,
         "webhook_add" | "webhook_delete" | "webhook_delete_uuid" | "webhook_list" => {
             return Ok((StatusCode::NOT_IMPLEMENTED, "webhooks aren't built yet").into_response());
@@ -66,8 +67,8 @@ pub async fn command(
 
 /// All or nothing: if any named create request's address already has an
 /// account, 409 with those addresses and nothing is accepted.
-fn accept(app: &App, p: Requests) -> Result<Response> {
-    match app.db.accept_requests(p.kind, &p.addresses)? {
+async fn accept(app: &App, p: Requests) -> Result<Response> {
+    match app.db.call(move |db| db.accept_requests(p.kind, &p.addresses)).await? {
         Accepted::Done(done) => {
             app.scanner.wake.notify_one();
             Ok(Json(json!({ "updated": done })).into_response())
@@ -83,12 +84,12 @@ fn accept(app: &App, p: Requests) -> Result<Response> {
     }
 }
 
-fn reject(app: &App, p: Requests) -> Result<Value> {
-    let taken = app.db.take_requests(p.kind, &p.addresses)?;
+async fn reject(app: &App, p: Requests) -> Result<Value> {
+    let taken = app.db.call(move |db| db.take_requests(p.kind, &p.addresses)).await?;
     Ok(json!({ "updated": taken.into_iter().map(|n| n.address).collect::<Vec<_>>() }))
 }
 
-fn add_account(app: &App, p: AddAccount) -> Result<Value> {
+async fn add_account(app: &App, p: AddAccount) -> Result<Value> {
     // A key that isn't the address's is the operator's mistake, not a
     // failed login: a 400 with the reason, and 403 stays the admin key's.
     let checked = crypto::check_login(app.scanner.config.network, &p.address, &p.key.0).map_err(|e| match e {
@@ -104,14 +105,14 @@ fn add_account(app: &App, p: AddAccount) -> Result<Value> {
         start_height: height.saturating_sub(1),
         generated_locally: false,
     };
-    app.db.add_account(&new, Status::Active)?;
+    app.db.call(move |db| db.add_account(&new, Status::Active)).await?;
     app.scanner.wake.notify_one();
     Ok(json!({ "updated": [checked.address.clone()] }))
 }
 
-fn list_accounts(app: &App) -> Result<Value> {
+async fn list_accounts(app: &App) -> Result<Value> {
     let mut out = Accounts::default();
-    for a in app.db.accounts(None)? {
+    for a in app.db.call(|db| db.accounts(None)).await? {
         let row = AccountRow {
             address: a.address,
             scan_height: a.scan_height,
@@ -126,9 +127,9 @@ fn list_accounts(app: &App) -> Result<Value> {
     Ok(serde_json::to_value(out).expect("json"))
 }
 
-fn list_requests(app: &App) -> Result<Value> {
+async fn list_requests(app: &App) -> Result<Value> {
     let mut out = PendingRequests::default();
-    for (kind, new) in app.db.requests()? {
+    for (kind, new) in app.db.call(|db| db.requests()).await? {
         let row = RequestRow {
             address: new.address,
             start_height: new.start_height,
@@ -141,23 +142,23 @@ fn list_requests(app: &App) -> Result<Value> {
     Ok(serde_json::to_value(out).expect("json"))
 }
 
-fn modify_status(app: &App, p: ModifyStatus) -> Result<Value> {
+async fn modify_status(app: &App, p: ModifyStatus) -> Result<Value> {
     let status = Status::parse(&p.status).ok_or_else(|| bad("status must be active, inactive or hidden"))?;
-    let done = app.db.set_status(&p.addresses, status)?;
+    let done = app.db.call(move |db| db.set_status(&p.addresses, status)).await?;
     app.scanner.wake.notify_one();
     Ok(json!({ "updated": done }))
 }
 
-fn rescan(app: &App, p: Rescan) -> Result<Value> {
-    let done = app.db.rescan(&p.addresses, p.height)?;
+async fn rescan(app: &App, p: Rescan) -> Result<Value> {
+    let done = app.db.call(move |db| db.rescan(&p.addresses, p.height)).await?;
     app.scanner.wake.notify_one();
     Ok(json!({ "updated": done }))
 }
 
 /// Not in monero-lws's API, which only hides an account: forgets these
 /// accounts and everything scanned for them.
-fn remove(app: &App, p: Addresses) -> Result<Value> {
-    let done = app.db.remove_accounts(&p.addresses)?;
+async fn remove(app: &App, p: Addresses) -> Result<Value> {
+    let done = app.db.call(move |db| db.remove_accounts(&p.addresses)).await?;
     app.scanner.wake.notify_one();
     Ok(json!({ "removed": done }))
 }

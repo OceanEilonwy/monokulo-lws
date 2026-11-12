@@ -505,7 +505,7 @@ pub fn app_with_node(db: Arc<Db>, chain_height: u64, node: &str) -> Arc<App> {
     );
     scanner.status.write().unwrap().chain_height = chain_height;
     Arc::new(App {
-        db,
+        db: crate::db::AsyncDb::new(db),
         daemon,
         scanner,
         limits: crate::limits::Limits::none(),

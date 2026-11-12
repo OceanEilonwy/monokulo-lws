@@ -81,6 +81,21 @@ malformed JSON; spoof `X-Forwarded-For`.
   its sender a real fee. `get_info` for the public `/get_version` and
   `/daemon_status` is cached for 5 s, so those endpoints don't make a node
   call each.
+- *Stall the API behind the scanner, or the scanner behind the API.* The
+  database has one writer connection and a pool of read-only ones
+  (`query_only`, up to four, fewer on a machine with fewer cores). Under
+  WAL a read sees the last commit and never waits for the scanner's batch
+  transaction, and each read is one read transaction, so an account's
+  transactions, outputs, spends and proofs come from one snapshot. Handlers
+  reach the database only through `db::AsyncDb::call`, which runs on
+  tokio's blocking threads, so no request parks a runtime worker on SQLite;
+  the scanner's own calls go the same way or through `block_in_place`. A
+  login's access time is written with whichever write holds the writer
+  rather than waiting for it. What still waits for the writer are the
+  rare, rate-limited writes a client asks for (a new account, a request,
+  subaddresses, an import), and they wait on a blocking thread.
+  (`db::tests::a_read_goes_on_while_a_write_is_held`,
+  `db::tests::async_reads_never_wait_on_the_writer`)
 - *Pick their own client address.* `X-Forwarded-For` (or the header named
   by `--client-ip-header`) is read only when the TCP peer is in
   `--trusted-proxies`; the client is then the rightmost address in it that is

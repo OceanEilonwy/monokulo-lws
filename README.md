@@ -293,7 +293,10 @@ cost about sixteen times the storage of proving receives.
 - Ring members for `/get_random_outs` are drawn from the RingCT output
   distribution with wallet2's gamma over age, fetched with `get_outs`, and
   kept only if unlocked.
-- Storage is one SQLite file in WAL mode.
+- Storage is one SQLite file in WAL mode: one writer connection, and a
+  few read-only connections the API reads through, so reads never wait
+  for the scanner's batch. Every database call from async code runs on
+  tokio's blocking threads.
 
 Cost on the GPU is accounts × transaction keys derivations: on an RX 6800
 XT about 2.6 million a second, so the replay of 2,000 mainnet blocks

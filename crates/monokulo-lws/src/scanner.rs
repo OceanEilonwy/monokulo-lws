@@ -510,8 +510,8 @@ impl Scanner {
             s.last_error = None;
             s.last_step = Some(Instant::now());
         });
-        let active = self.db.accounts(Some(Status::Active))?;
-        if let Some(lowest) = self.db.halted()? {
+        let active = self.db.call(|db| db.accounts(Some(Status::Active))).await?;
+        if let Some(lowest) = self.db.call(|db| db.halted()).await? {
             if !active.iter().all(|a| a.scan_height < lowest) {
                 let message = halt_message(lowest);
                 let mut logged = self.halt_logged.lock().unwrap_or_else(|e| e.into_inner());
@@ -522,7 +522,7 @@ impl Scanner {
                 self.set_status(|s| s.last_error = Some(message));
                 return Ok(false);
             }
-            self.db.resume(lowest)?;
+            self.db.call(move |db| db.resume(lowest)).await?;
             *self.halt_logged.lock().unwrap_or_else(|e| e.into_inner()) = None;
             tracing::warn!(
                 "scan resumed after the deep reorg: no active account stands at or above {lowest}; what was kept from there on is dropped"
@@ -548,13 +548,17 @@ impl Scanner {
         if accounts.is_empty() {
             return Ok(false);
         }
+        let kept_top = match chain_height.checked_sub(1) {
+            Some(top) if start == chain_height => self.db.call(move |db| db.block_hash(top)).await?,
+            _ => None,
+        };
         if start >= chain_height {
             // Caught up: a reorg that replaced the top block without making the
             // chain longer shows only in the top block's hash.
             let top = crate::daemon::hex32(&info.top_block_hash);
             if start == chain_height
                 && let Some(top) = top
-                && let Some(kept) = self.db.block_hash(chain_height - 1)?
+                && let Some(kept) = kept_top
                 && kept != top
             {
                 self.reorg().await?;
@@ -566,7 +570,7 @@ impl Scanner {
         }
 
         let count = BATCH.min(chain_height - start);
-        let generation = self.db.reorg_generation()?;
+        let generation = self.db.call(|db| db.reorg_generation()).await?;
         let fetched = self.daemon.blocks(start, count).await?;
         if fetched.is_empty() {
             return Err(Error::Daemon("the node sent no blocks".into()));
@@ -696,7 +700,8 @@ impl Scanner {
         };
         let accounts: Vec<Account> = self
             .db
-            .accounts(Some(Status::Active))?
+            .call(|db| db.accounts(Some(Status::Active)))
+            .await?
             .into_iter()
             .filter(|a| lane.accounts.contains(&a.id))
             .collect();
@@ -704,7 +709,7 @@ impl Scanner {
             self.plan().end(task.id);
             return Ok(LaneStep::Done);
         }
-        if self.db.halted()?.is_some() {
+        if self.db.call(|db| db.halted()).await?.is_some() {
             // Stopped for a reorg too deep: the live lane says when it's over.
             return Ok(LaneStep::Wait);
         }
@@ -721,7 +726,7 @@ impl Scanner {
         let count = self.config.lanes.blocks.max(1).min(live - cursor);
         // Read before fetching: a reorg unwound while the blocks were on
         // their way may have orphaned them.
-        let generation = self.db.reorg_generation()?;
+        let generation = self.db.call(|db| db.reorg_generation()).await?;
         let fetched = {
             let _permit = self
                 .catch_up
@@ -829,7 +834,7 @@ impl Scanner {
                 return Ok(());
             }
             Fork::Deeper(lowest) => {
-                self.db.halt(lowest)?;
+                self.db.call(move |db| db.halt(lowest)).await?;
                 let message = halt_message(lowest);
                 tracing::error!("scan stopped: {message}");
                 *self.halt_logged.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
@@ -840,7 +845,7 @@ impl Scanner {
             }
         };
         tracing::info!("reorg: rewinding to {fork}");
-        self.db.rewind(fork)?;
+        self.db.call(move |db| db.rewind(fork)).await?;
         self.mempool.lock().unwrap_or_else(|e| e.into_inner()).reset(vec![]);
         *self.last_block.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if self.plan().live.is_some() {
@@ -869,7 +874,7 @@ impl Scanner {
         const AT_ONCE: usize = 1_000;
         const PER_REQUEST: usize = 100;
         loop {
-            let pending = self.db.pending_proofs(AT_ONCE)?;
+            let pending = self.db.call(|db| db.pending_proofs(AT_ONCE)).await?;
             if pending.is_empty() {
                 return Ok(());
             }
@@ -888,7 +893,7 @@ impl Scanner {
             if !dropped.is_empty() {
                 tracing::warn!("proofs: {} transactions the node couldn't complete", dropped.len());
             }
-            self.db.settle_proofs(&found, &dropped)?;
+            self.db.call(move |db| db.settle_proofs(&found, &dropped)).await?;
             if pending.len() < AT_ONCE {
                 return Ok(());
             }
@@ -905,7 +910,7 @@ impl Scanner {
     async fn find_fork(&self) -> Result<Fork> {
         /// Kept hashes tried one by one from the top.
         const TOP: usize = 8;
-        let mut kept = self.db.recent_blocks()?;
+        let mut kept = self.db.call(|db| db.recent_blocks()).await?;
         kept.reverse();
         let Some(&(lowest, hash)) = kept.first() else {
             return Ok(Fork::Nothing);
@@ -1039,7 +1044,8 @@ impl Scanner {
         };
         let accounts: Vec<Account> = self
             .db
-            .accounts(Some(Status::Active))?
+            .call(|db| db.accounts(Some(Status::Active)))
+            .await?
             .into_iter()
             .filter(|a| ids.binary_search(&a.id).is_ok())
             .collect();
