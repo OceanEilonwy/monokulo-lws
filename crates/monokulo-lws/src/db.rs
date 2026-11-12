@@ -464,6 +464,7 @@ impl Db {
     /// address or `max_pending` requests are. The count and the insert are
     /// one transaction, so concurrent callers can't pass the cap together.
     pub fn add_request(&self, kind: RequestKind, new: &NewAccount, max_pending: u64) -> Result<Queued> {
+        let start_height = sql_height(new.start_height)?;
         self.write(|tx| {
             if request_exists(tx, kind, &new.address)? {
                 return Ok(Queued::Duplicate);
@@ -480,7 +481,7 @@ impl Db {
                     new.view_key.as_slice(),
                     new.spend_pub.as_slice(),
                     new.view_pub.as_slice(),
-                    new.start_height as i64,
+                    start_height,
                     new.generated_locally as i64,
                     now() as i64
                 ],
@@ -894,8 +895,15 @@ fn account_id(c: &Connection, address: &str) -> Result<Option<i64>> {
     )
 }
 
+/// A height as SQLite stores it. One past `i64::MAX` would be stored
+/// negative (and `u64::MAX` read back from -1), so it is refused: 400.
+fn sql_height(height: u64) -> Result<i64> {
+    i64::try_from(height).map_err(|_| bad(format!("a height must be at most {}", i64::MAX)))
+}
+
 /// Adds an account inside `tx`; `Err(Conflict)` if the address is already here.
 fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<Account> {
+    let start_height = sql_height(new.start_height)?;
     let n = now();
     let changed = tx.execute(
         "INSERT OR IGNORE INTO accounts (address, view_key, spend_pub, view_pub, status, start_height, scan_height, created, access_time, generated_locally) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?7, ?8)",
@@ -905,7 +913,7 @@ fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<
             new.spend_pub.as_slice(),
             new.view_pub.as_slice(),
             status.as_str(),
-            new.start_height as i64,
+            start_height,
             n as i64,
             new.generated_locally as i64
         ],
@@ -923,13 +931,14 @@ fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<
 
 /// [`Db::rescan`] inside `tx`.
 fn rescan_in(tx: &Transaction, addresses: &[String], height: u64) -> Result<Vec<String>> {
+    let h = sql_height(height)?;
     let mut done = vec![];
     for a in addresses {
         let Some(id) = account_id(tx, a)? else { continue };
         delete_account_from(tx, id, height)?;
         tx.execute(
             "UPDATE accounts SET scan_height = MIN(scan_height, ?1) WHERE id = ?2",
-            params![height as i64, id],
+            params![h, id],
         )?;
         done.push(a.clone());
     }

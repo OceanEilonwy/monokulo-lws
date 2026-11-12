@@ -979,6 +979,57 @@ fn subaddress_upserts_match_a_set_and_scale() {
     assert!(db.upsert_subaddrs(account, &top, 100_000).unwrap().is_empty());
 }
 
+/// A rescan height past i64::MAX is a 400, not stored as -1 (which deleted
+/// everything and left the account never scanning again); an import is one
+/// transaction that starts the account at 0.
+#[tokio::test]
+async fn rescan_heights_past_i64_are_refused() {
+    let app = app(Setup::default());
+    let admin = admin_router(app.clone());
+    let auth = hex::encode(*crate::admin_keys::create(&app.db).unwrap());
+    let (address, _) = add(&app, 98, Status::Active);
+    for height in [u64::MAX, i64::MAX as u64 + 1] {
+        let r = call(
+            &admin,
+            "/rescan",
+            &json!({ "auth": auth, "params": { "height": height, "addresses": [address] } }),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    }
+    assert_eq!(app.db.account(&address).unwrap().unwrap().scan_height, 10);
+    let r = call(
+        &admin,
+        "/rescan",
+        &json!({ "auth": auth, "params": { "height": 5, "addresses": [address] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(app.db.account(&address).unwrap().unwrap().scan_height, 5);
+    assert_eq!(
+        app.db.import(std::slice::from_ref(&address)).unwrap(),
+        vec![address.clone()]
+    );
+    let a = app.db.account(&address).unwrap().unwrap();
+    assert_eq!((a.start_height, a.scan_height), (0, 0));
+    // A new account can't start there either.
+    let (other, key) = wallet(99);
+    let checked = crate::crypto::check_login(Network::Stagenet, &other, &key).unwrap();
+    let new = NewAccount {
+        address: checked.address.clone(),
+        view_key: checked.view_key,
+        spend_pub: checked.spend_pub,
+        view_pub: checked.view_pub,
+        start_height: u64::MAX,
+        generated_locally: false,
+    };
+    assert!(matches!(
+        app.db.add_account(&new, Status::Active),
+        Err(crate::error::Error::BadRequest(_))
+    ));
+    assert!(app.db.account(&other).unwrap().is_none());
+}
+
 /// A repeated create request is refused before it takes a token from the
 /// global bucket, so it can't drain it for everyone.
 #[tokio::test]
