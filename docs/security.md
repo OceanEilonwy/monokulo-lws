@@ -41,7 +41,8 @@ malformed JSON; spoof `X-Forwarded-For`.
   and that holder owns it anyway. (`rest::tests::unknown_accounts_and_wrong_keys_look_the_same`)
 - *Fill the database or the scanner.* Account creation and import requests
   take a token from a strict per-client bucket (`--strict-rate-limit`,
-  default 12 a minute) and from a global bucket (`--max-new-accounts-per-hour`,
+  default 12 a minute, and `--strict-rate-limit-per-48`, default 48 a minute
+  per IPv6 /48) and from a global bucket (`--max-new-accounts-per-hour`,
   default 1,000); pending requests are capped (`--max-pending-requests`,
   default 10,000, monero-lws's `--create-queue-max`); subaddresses are capped
   per account (`--max-subaddresses`).
@@ -59,7 +60,13 @@ malformed JSON; spoof `X-Forwarded-For`.
   per-client bucket (`--rate-limit`, 300 a minute); `/submit_raw_tx`,
   `/get_random_outs`, `/import_wallet_request` and account creation also
   take one from the strict bucket. A client is an IPv4 address or an IPv6
-  /64. `/get_random_outs` is capped at monero-lws's limits (20 members a
+  /64; each IPv6 /48 also has a bucket of its own in both classes
+  (`--rate-limit-per-48` and `--strict-rate-limit-per-48`, by default four
+  times the per-client rates), and a request must find a token in both, so
+  one holder of a /48 can't spend 65,536 per-/64 buckets. Each class keeps
+  at most 200,000 buckets per tier; past that the least recently used tenth
+  are dropped, and refilled buckets are swept only when the map has doubled,
+  so no request walks the whole map. `/get_random_outs` is capped at monero-lws's limits (20 members a
   ring, 150 rings) and needs no account. Each round draws only what every
   ring still lacks and asks the node for all of it in one `get_outs` (in
   chunks of 1,000), so the most a request asks for in its first round is
@@ -358,7 +365,7 @@ read the process's memory learns.
 | Body limits | Per endpoint: 2 KiB login family, 10 KiB upsert, 512 KiB submit | Per endpoint: 4 KiB, 64 KiB, 2 MB (monerod's 1 MB transaction cap) |
 | Timeouts | Handshake 5 s, first request 5 s, after login 5 min, response 15 s | Headers 10 s (idle included), handshake 10 s, whole request 30 s |
 | Connection caps | None | Per listener and per address |
-| Rate limits | None | Per client (IPv4 or IPv6 /64), strict class, global creation cap |
+| Rate limits | None | Per client (IPv4 or IPv6 /64) and per IPv6 /48, strict class, global creation cap |
 | Pending requests | `--create-queue-max` 10,000 | `--max-pending-requests` 10,000 |
 | `/get_random_outs` | 20 a ring, 150 rings | The same |
 | `/get_random_outs` over the caps | 500 (`exceeded_rest_request_limit` isn't mapped) | 400 with a sentence |

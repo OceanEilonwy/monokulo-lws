@@ -39,7 +39,7 @@ use tokio::sync::Mutex;
 
 use crate::daemon::Daemon;
 use crate::db::{Db, NewAccount, Status};
-use crate::limits::{Cidr, ClientIpConfig, Limits};
+use crate::limits::{Cidr, ClientIpConfig, Limits, PER_48_FACTOR};
 use crate::rest::{App, Config, Policy};
 use crate::scanner::{LaneConfig, ScanConfig, Scanner};
 use crate::server::ListenerConfig;
@@ -127,6 +127,14 @@ struct ServeArgs {
     /// /submit_raw_tx and /get_random_outs; 0 is no limit.
     #[arg(long, default_value_t = 12)]
     strict_rate_limit: u32,
+    /// Requests a minute from one IPv6 /48, on top of --rate-limit per /64;
+    /// 0 is no limit. Default: 4 × --rate-limit.
+    #[arg(long)]
+    rate_limit_per_48: Option<u32>,
+    /// As --strict-rate-limit, per IPv6 /48; 0 is no limit. Default:
+    /// 4 × --strict-rate-limit.
+    #[arg(long)]
+    strict_rate_limit_per_48: Option<u32>,
     /// New accounts and import requests an hour across all clients; 0 is no
     /// limit.
     #[arg(long, default_value_t = 1000)]
@@ -395,13 +403,21 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             request_timeout: Duration::from_secs(args.request_timeout.max(1)),
             tls: tls.is_some(),
         },
-        limits: Limits::new(
+        limits: Limits::with_per_48(
             ClientIpConfig {
                 trusted_proxies: args.trusted_proxies.clone(),
                 header: args.client_ip_header.to_ascii_lowercase(),
             },
-            args.rate_limit,
-            args.strict_rate_limit,
+            [
+                args.rate_limit,
+                args.rate_limit_per_48
+                    .unwrap_or(args.rate_limit.saturating_mul(PER_48_FACTOR)),
+            ],
+            [
+                args.strict_rate_limit,
+                args.strict_rate_limit_per_48
+                    .unwrap_or(args.strict_rate_limit.saturating_mul(PER_48_FACTOR)),
+            ],
             args.max_new_accounts_per_hour,
             args.max_pending_requests,
         ),

@@ -393,6 +393,42 @@ async fn login_with_create_takes_the_strict_limit() {
     );
 }
 
+/// One /48 can't spend a strict bucket per /64: its own /48 bucket (four
+/// /64s' worth by default) runs out first.
+#[tokio::test]
+async fn a_slash_48_shares_a_strict_bucket() {
+    let app = app(Setup {
+        limits: Limits::new(ClientIpConfig::default(), 0, 1, 0, u64::MAX),
+        ..Setup::default()
+    });
+    let router = wallet_router(app.clone());
+    for n in 1..=5u64 {
+        let (address, key) = wallet(60 + n);
+        let mut body = login_body(&address, &key);
+        body["create_account"] = json!(true);
+        let r = call_from(
+            &router,
+            "/login",
+            &body.to_string(),
+            &format!("[2001:db8:7:{n}::1]:1"),
+            &[],
+        )
+        .await;
+        let wanted = if n <= 4 {
+            StatusCode::OK
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        assert_eq!(r.status, wanted, "/64 number {n}: {}", r.body);
+    }
+    // Another /48 isn't held back.
+    let (address, key) = wallet(70);
+    let mut body = login_body(&address, &key);
+    body["create_account"] = json!(true);
+    let r = call_from(&router, "/login", &body.to_string(), "[2001:db8:8:1::1]:1", &[]).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+}
+
 #[tokio::test]
 async fn a_forwarded_for_header_counts_only_from_a_trusted_proxy() {
     let limits = || Limits::new(ClientIpConfig::default(), 1, 0, 0, u64::MAX);

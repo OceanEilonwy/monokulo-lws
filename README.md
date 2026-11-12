@@ -57,6 +57,8 @@ Options that matter:
 | `--client-ip-header NAME` | `X-Forwarded-For` | The header a trusted proxy puts the client's address in (the rightmost untrusted entry is the client). |
 | `--rate-limit N` | 300 | Requests a minute from one client (an IPv4 address or IPv6 /64); 0 is no limit. |
 | `--strict-rate-limit N` | 12 | Requests a minute from one client for account creation, imports, `/submit_raw_tx` and `/get_random_outs`; 0 is no limit. |
+| `--rate-limit-per-48 N` | 4 × `--rate-limit` | Requests a minute from one IPv6 /48, on top of the per-/64 limit; 0 is no limit. |
+| `--strict-rate-limit-per-48 N` | 4 × `--strict-rate-limit` | As `--strict-rate-limit`, per IPv6 /48; 0 is no limit. |
 | `--max-new-accounts-per-hour N` | 1000 | New accounts and import requests an hour, across all clients; 0 is no limit. |
 | `--max-pending-requests N` | 10000 | Pending create and import requests at most (monero-lws's `--create-queue-max`). |
 | `--max-connections N` | 1024 | Open connections at most, per listener. |
