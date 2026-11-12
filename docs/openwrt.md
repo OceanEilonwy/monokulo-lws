@@ -117,8 +117,14 @@ when it is missing), which needs git, a C compiler, meson, ninja,
 pkg-config and the openssl, zlib and zstd headers. `APK_TOOLS=/path/to/apk`
 uses another apk-tools 3.0.5 binary instead. CI builds in one job without
 the secret and signs in another, on a fresh runner, which builds apk-tools
-in a step before the one with the secret and caches it by commit. Every
-Docker image is pinned by digest and every action by commit.
+afresh, from the pinned commit, in a step before the one with the secret
+(never from a cache, so no stored binary is trusted with the key). Every
+Docker image is pinned by digest and every action by commit. A local
+`build-openwrt.sh all` keeps the key out of cargo's environment, but that
+is no defence against a malicious dependency: its build script runs as
+you and can read your key file, or the key in your shell's environment
+through `/proc`. Sign with the real key only in CI, or as a separate user
+the build never runs as.
 `scripts/test-openwrt.sh` boots the official x86_64 rootfs image in Docker
 and installs, starts (against a stand-in node), drives through the LuCI
 backend, upgrades and removes the package there; CI runs it after the

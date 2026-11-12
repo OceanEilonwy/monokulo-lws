@@ -30,7 +30,11 @@
 #          own, on a fresh runner that never built anything.
 #   all    apk-tools, build, then sign: for local use. A key in
 #          $APK_SIGNING_KEY is taken out of the environment before anything
-#          is built.
+#          is built, but that keeps it only from careless code, not from a
+#          malicious dependency: a build script runs as you, and can read
+#          the key file under ~/.config or the environment of the shell
+#          that ran this (/proc/<pid>/environ). Sign with the real key only
+#          in CI, or as a user the build never runs as.
 #
 # Needs: docker, rustup (stable), openssl (build); git, a C compiler, meson,
 # ninja, pkg-config and the openssl, zlib and zstd headers (apk-tools);
