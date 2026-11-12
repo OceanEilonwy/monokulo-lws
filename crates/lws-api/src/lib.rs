@@ -30,7 +30,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 /// A `uint64-string`: a 64-bit amount or index written as a decimal string,
 /// since JSON numbers past 2^53 lose precision in many readers.
 ///
-/// Reading accepts a number too, for lenient clients.
+/// Reading takes ASCII digits only (leading zeros are fine; a sign, a space
+/// or anything else is refused, as is a value past `u64::MAX`), or a
+/// non-negative integer, for lenient clients and the fields monero-lws
+/// writes as numbers ([`as_number`]). Both forms exist only in
+/// self-describing, human-readable formats (JSON), which are the only ones
+/// asked which form they hold; a compact binary format reads a `u64`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Amount(pub u64);
 
@@ -42,6 +47,8 @@ impl Serialize for Amount {
 
 impl<'de> Deserialize<'de> for Amount {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        /// A decimal string or an unsigned integer, nothing else: a float, a
+        /// negative number or a bool is refused by the visitor's defaults.
         struct V;
         impl de::Visitor<'_> for V {
             type Value = Amount;
@@ -49,13 +56,21 @@ impl<'de> Deserialize<'de> for Amount {
                 f.write_str("a decimal string or an unsigned integer")
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Amount, E> {
-                v.parse().map(Amount).map_err(|_| E::custom("not an unsigned decimal"))
+                // u64::from_str would take a leading '+'.
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(E::custom("not an unsigned decimal"));
+                }
+                v.parse().map(Amount).map_err(|_| E::custom("past the largest uint64"))
             }
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Amount, E> {
                 Ok(Amount(v))
             }
         }
-        d.deserialize_any(V)
+        if d.is_human_readable() {
+            d.deserialize_any(V)
+        } else {
+            d.deserialize_u64(V)
+        }
     }
 }
 
@@ -920,6 +935,32 @@ mod tests {
         assert_eq!(serde_json::from_str::<Amount>("\"12\"").unwrap(), Amount(12));
         assert_eq!(serde_json::from_str::<Amount>("12").unwrap(), Amount(12));
         assert!(serde_json::from_str::<Amount>("\"-1\"").is_err());
+    }
+
+    #[test]
+    fn amounts_refuse_a_sign_but_take_leading_zeros() {
+        for bad in [
+            "\"+5\"",
+            "\"-5\"",
+            "\"\"",
+            "\" 5\"",
+            "\"5 \"",
+            "\"5.0\"",
+            "\"0x5\"",
+            "\"18446744073709551616\"",
+            "-5",
+            "5.5",
+            "true",
+            "null",
+        ] {
+            assert!(serde_json::from_str::<Amount>(bad).is_err(), "{bad}");
+        }
+        assert_eq!(serde_json::from_str::<Amount>("\"0012\"").unwrap(), Amount(12));
+        assert_eq!(serde_json::from_str::<Amount>("\"000\"").unwrap(), Amount(0));
+        assert_eq!(
+            serde_json::from_str::<Amount>("\"18446744073709551615\"").unwrap(),
+            Amount(u64::MAX)
+        );
     }
 
     #[test]
