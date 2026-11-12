@@ -89,12 +89,14 @@ tag=${ref##*:}
 
 # The apk that signs: apk-tools built from upstream at this commit, the
 # tag v3.0.5 (the release `apk --version` reports in the SDK images above;
-# a new SDK may mean a new release here, and openwrt.yml's cache key names
-# the commit too). The commit, not the tag, is what is trusted: a tag can
-# be moved, a commit hash names its contents.
+# a new SDK may mean a new release here). The commit, not the tag, is what
+# is trusted: a tag can be moved, a commit hash names its contents. So it is
+# fetched from Alpine's GitHub mirror, which GitHub's runners can reach
+# (gitlab.alpinelinux.org answers them 418); the hash makes the mirror as
+# good as the source.
 APK_TOOLS_VERSION=3.0.5
 APK_TOOLS_COMMIT=b5a31c0d865342ad80be10d68f1bb3d3ad9b0866
-APK_TOOLS_REPO=https://gitlab.alpinelinux.org/alpine/apk-tools.git
+APK_TOOLS_REPO=https://github.com/alpinelinux/apk-tools.git
 APK_TOOLS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/monokulo-lws/apk-tools/$APK_TOOLS_COMMIT"
 
 build() {

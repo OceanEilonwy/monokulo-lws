@@ -109,7 +109,8 @@ the key but `openssl` and `apk`: the signing key is never in the
 environment while cargo, a dependency's build script or the SDK's own
 build runs, and no Docker image, however pinned, ever sees it. That `apk`
 is apk-tools built from its upstream source
-([gitlab.alpinelinux.org/alpine/apk-tools](https://gitlab.alpinelinux.org/alpine/apk-tools))
+([gitlab.alpinelinux.org/alpine/apk-tools](https://gitlab.alpinelinux.org/alpine/apk-tools),
+fetched from its GitHub mirror, which CI runners can reach)
 at a pinned commit, the release the SDK's own `apk` is (3.0.5 for 25.12),
 checked after the fetch; `build-openwrt.sh apk-tools` builds it into
 `~/.cache/monokulo-lws/apk-tools/<commit>/` once (`sign` and `all` do too
