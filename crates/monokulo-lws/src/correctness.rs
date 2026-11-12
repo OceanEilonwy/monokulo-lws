@@ -26,7 +26,7 @@ use crate::error::Error;
 use crate::rest::{App, wallet};
 use crate::scanner::{Batch, Ring, pool_block, record_batch, scan_pool_block, stand_in};
 use crate::testkit::*;
-use crate::types::Height;
+use crate::types::{BlockHash, Height, TxHash};
 
 fn unwrap<T>(r: std::result::Result<Json<T>, crate::rest::ApiError>) -> T {
     match r {
@@ -463,16 +463,16 @@ async fn subaddresses_through_additional_keys_and_the_lookahead() {
     let (_, main) = tx_key(70);
     let r0 = tx_key(71).0;
     assert_eq!(
-        outs[0].tx_pub_key,
+        outs[0].tx_pub_key.0,
         (r0 * w.sub_spend(0, 2)).compress().to_bytes(),
         "the additional key it came by"
     );
     let r1 = tx_key(72).0;
     assert_eq!(
-        outs[1].tx_pub_key,
+        outs[1].tx_pub_key.0,
         (&r1 * ED25519_BASEPOINT_TABLE).compress().to_bytes()
     );
-    assert_ne!(outs[1].tx_pub_key, main.compress().to_bytes());
+    assert_ne!(outs[1].tx_pub_key.0, main.compress().to_bytes());
 
     // Registering (1, 5) and scanning again finds it.
     let db = Arc::new(db);
@@ -585,7 +585,7 @@ fn a_reorg_drops_what_the_orphaned_blocks_held_and_the_new_chain_is_scanned() {
         vec![(1_003, 555)]
     );
     assert!(db.outputs(accounts[1].id).unwrap().is_empty());
-    assert_eq!(db.block_hash(Height::new(100)).unwrap(), Some(hash));
+    assert_eq!(db.block_hash(Height::new(100)).unwrap(), Some(BlockHash(hash)));
 }
 
 /// Every block's hash is kept while under `KEEP_HASHES` behind the tip (the
@@ -638,7 +638,10 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
     let outgoing_hash = [0xee; 32];
     let pool = pool_block(
         &last,
-        vec![(incoming_hash, incoming.build()), (outgoing_hash, outgoing.build())],
+        vec![
+            (TxHash(incoming_hash), incoming.build()),
+            (TxHash(outgoing_hash), outgoing.build()),
+        ],
     )
     .unwrap();
     let look = || {
@@ -656,7 +659,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
         })
         .unwrap()
     };
-    let hashes = [incoming_hash, outgoing_hash];
+    let hashes = [TxHash(incoming_hash), TxHash(outgoing_hash)];
     app.scanner.mempool.lock().unwrap().reset(vec![account.id]);
     app.scanner.mempool.lock().unwrap().add(&hashes, look());
     // Looked at again (as after a lost race): nothing twice.
@@ -709,7 +712,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
         .mempool
         .lock()
         .unwrap()
-        .retain(&HashSet::from([incoming_hash]));
+        .retain(&HashSet::from([TxHash(incoming_hash)]));
     let served = txs(&app, &w).await;
     assert!(served.transactions.iter().all(|t| !t.mempool));
     assert_eq!(served.transactions.len(), 3);
@@ -1002,10 +1005,10 @@ async fn a_mined_receive_comes_with_a_proof_of_its_block() {
             .kept_block(Height::new(100))
             .unwrap()
             .expect("the paying block is kept");
-        assert_eq!(kept_hash, hash);
+        assert_eq!(kept_hash, BlockHash(hash));
         assert_eq!(
             db.block_hash(Height::new(100)).unwrap(),
-            Some(hash),
+            Some(BlockHash(hash)),
             "the hash the live lane keeps"
         );
         assert_eq!(
@@ -1081,7 +1084,10 @@ async fn a_reorg_drops_the_kept_block_and_the_new_one_is_proved() {
     let new_100 = block(100, [9; 32], dull_miner(100), vec![other.build()], 1_000, 1);
     let hash = new_100.block.block.hash();
     write(&db, &[account], vec![new_100], 100, true, None);
-    assert_eq!(db.kept_block(Height::new(100)).unwrap().map(|k| k.0), Some(hash));
+    assert_eq!(
+        db.kept_block(Height::new(100)).unwrap().map(|k| k.0),
+        Some(BlockHash(hash))
+    );
     let served = txs(&app(db, 200), &w).await;
     assert_eq!(served.transactions.len(), 1);
     check_proof(&served.transactions[0], hash);

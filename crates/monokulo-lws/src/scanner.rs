@@ -41,7 +41,7 @@ use crate::daemon::{Daemon, Fetched, RawBlock};
 use crate::db::{Account, Db, NewOutput, NewTx, OutputRow, ScanWriter, Status};
 use crate::error::{Error, Result};
 use crate::lanes::{Join, Plan};
-use crate::types::{AccountId, GlobalIndex, Height, OutIndex, OutputId};
+use crate::types::{AccountId, BlockHash, GlobalIndex, Height, KeyImage, OutIndex, OutputId, PublicKey, TxHash};
 
 /// Blocks the live lane asks for in one request.
 const BATCH: u64 = 100;
@@ -82,12 +82,12 @@ pub struct LaneStatus {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct PoolReceipt {
-    pub tx_hash: [u8; 32],
+    pub tx_hash: TxHash,
     pub tx_prefix_hash: [u8; 32],
-    pub tx_pub_key: [u8; 32],
+    pub tx_pub_key: PublicKey,
     pub out_index: OutIndex,
     pub amount: Amount,
-    pub public_key: [u8; 32],
+    pub public_key: PublicKey,
     pub mask: Option<[u8; 32]>,
     pub commitment: Option<[u8; 32]>,
     pub unlock_time: u64,
@@ -103,10 +103,10 @@ pub struct PoolReceipt {
 /// holds one of the account's (mined) outputs.
 #[derive(Clone, Debug)]
 pub struct PoolSpend {
-    pub tx_hash: [u8; 32],
+    pub tx_hash: TxHash,
     /// The output's row id.
     pub output: OutputId,
-    pub key_image: [u8; 32],
+    pub key_image: KeyImage,
     pub mixin: u32,
     pub unlock_time: u64,
     pub fee: Amount,
@@ -119,7 +119,7 @@ pub struct Mempool {
     /// The accounts the pool was scanned for; another set scans it again.
     accounts: Vec<AccountId>,
     /// Pool transactions already looked at, so each is scanned once.
-    seen: HashSet<[u8; 32]>,
+    seen: HashSet<TxHash>,
     /// What each account received, by account id.
     received: HashMap<AccountId, Vec<PoolReceipt>>,
     /// Each account's candidate spends, by account id.
@@ -144,7 +144,7 @@ impl Mempool {
         };
     }
 
-    pub(crate) fn retain(&mut self, still_in_pool: &HashSet<[u8; 32]>) {
+    pub(crate) fn retain(&mut self, still_in_pool: &HashSet<TxHash>) {
         self.seen.retain(|h| still_in_pool.contains(h));
         for list in self.received.values_mut() {
             list.retain(|r| still_in_pool.contains(&r.tx_hash));
@@ -606,7 +606,7 @@ impl Scanner {
         if start >= chain_height {
             // Caught up: a reorg that replaced the top block without making the
             // chain longer shows only in the top block's hash.
-            let top = crate::daemon::hex32(&info.top_block_hash);
+            let top = crate::daemon::hex32(&info.top_block_hash).map(BlockHash);
             if start == chain_height
                 && let Some(top) = top
                 && let Some(kept) = kept_top
@@ -863,7 +863,7 @@ impl Scanner {
                 for (i, block) in batch.blocks.iter().enumerate() {
                     let height = height_at(at.start, i)?;
                     if height >= at.keep_from {
-                        w.keep_hash(height, &block.block.hash())?;
+                        w.keep_hash(height, &BlockHash(block.block.hash()))?;
                     }
                 }
             }
@@ -950,11 +950,11 @@ impl Scanner {
             let mut found = vec![];
             let mut dropped = vec![];
             for chunk in pending.chunks(PER_REQUEST) {
-                let hashes: Vec<[u8; 32]> = chunk.iter().map(|p| p.0).collect();
+                let hashes: Vec<TxHash> = chunk.iter().map(|p| p.0).collect();
                 let prunable = self.daemon.prunable_hashes(&hashes).await?;
                 for (hash, prefix, rct_base) in chunk {
                     match prunable.get(hash) {
-                        Some(p) if crate::proof::tx_hash(prefix, rct_base, p) == *hash => found.push((*hash, *p)),
+                        Some(p) if crate::proof::tx_hash(prefix, rct_base, p) == hash.0 => found.push((*hash, *p)),
                         _ => dropped.push(*hash),
                     }
                 }
@@ -1015,10 +1015,10 @@ impl Scanner {
     /// accounts' outputs for candidate spends.
     async fn scan_pool(&self, accounts: &[Account]) -> Result<()> {
         let hashes = self.daemon.pool_hashes().await?;
-        let in_pool: HashSet<[u8; 32]> = hashes.iter().copied().collect();
+        let in_pool: HashSet<TxHash> = hashes.iter().copied().collect();
         let mut ids: Vec<AccountId> = accounts.iter().map(|a| a.id).collect();
         ids.sort_unstable();
-        let new: Vec<[u8; 32]> = {
+        let new: Vec<TxHash> = {
             let mut pool = self.mempool.lock().unwrap_or_else(|e| e.into_inner());
             if pool.accounts != ids {
                 // An account came or went: everything is looked at again for
@@ -1038,7 +1038,7 @@ impl Scanner {
         // out is asked for again next time. One it sent that doesn't read (or
         // isn't what it says) is looked at as far as it ever will be.
         let fetched = self.daemon.transactions(&new).await?;
-        let mut scanned: Vec<[u8; 32]> = fetched.bad;
+        let mut scanned: Vec<TxHash> = fetched.bad;
         scanned.extend(fetched.txs.iter().map(|(h, _)| *h));
         let found = if fetched.txs.is_empty() {
             PoolFound::default()
@@ -1110,7 +1110,7 @@ impl Scanner {
     /// keyring is for other accounts; the lane's next look at the pool,
     /// which the handler wakes, finds it then. That look keeps it while the
     /// node has it and drops it after.
-    pub async fn add_submitted(&self, hash: [u8; 32], tx: Transaction<Pruned>) -> Result<()> {
+    pub async fn add_submitted(&self, hash: TxHash, tx: Transaction<Pruned>) -> Result<()> {
         let ids = {
             let pool = self.mempool.lock().unwrap_or_else(|e| e.into_inner());
             if pool.accounts.is_empty() || pool.seen.contains(&hash) {
@@ -1172,7 +1172,7 @@ impl Scanner {
 /// bytes after the base are its prunable part, hashed as monerod hashes it;
 /// a version 1 transaction is hashed whole. `None` if it doesn't parse, or
 /// is a miner transaction, which can't be submitted.
-pub fn parse_submitted(bytes: &[u8]) -> Option<([u8; 32], Transaction<Pruned>)> {
+pub fn parse_submitted(bytes: &[u8]) -> Option<(TxHash, Transaction<Pruned>)> {
     let mut rest = bytes;
     let tx = Transaction::<Pruned>::read(&mut rest).ok()?;
     if is_coinbase(&tx) || tx.prefix().inputs.is_empty() {
@@ -1188,7 +1188,7 @@ pub fn parse_submitted(bytes: &[u8]) -> Option<([u8; 32], Transaction<Pruned>)> 
         }
         Transaction::V2 { proofs: Some(_), .. } => tx.hash_with_prunable_hash(keccak256(rest))?,
     };
-    Some((hash, tx))
+    Some((TxHash(hash), tx))
 }
 
 /// A block holding only a submitted transaction, for the `Scanner`: the last
@@ -1196,7 +1196,7 @@ pub fn parse_submitted(bytes: &[u8]) -> Option<([u8; 32], Transaction<Pruned>)> 
 /// nothing.
 fn submitted_block(
     header: Option<monero_wallet::block::BlockHeader>,
-    hash: [u8; 32],
+    hash: TxHash,
     tx: Transaction<Pruned>,
 ) -> Option<ScannableBlock> {
     let header = header.unwrap_or(monero_wallet::block::BlockHeader {
@@ -1218,7 +1218,7 @@ fn submitted_block(
             prefix: miner,
             proofs: None,
         },
-        vec![hash],
+        vec![hash.0],
     )?;
     Some(ScannableBlock {
         block,
@@ -1278,13 +1278,13 @@ fn halt_message(lowest: Height) -> String {
 fn follows_kept(w: &ScanWriter, batch: &Batch, start: Height) -> Result<bool> {
     if let (Some(before), Some(first)) = (start.prev(), batch.blocks.first())
         && w.block_hash(before)?
-            .is_some_and(|kept| kept != first.block.header.previous)
+            .is_some_and(|kept| kept != BlockHash(first.block.header.previous))
     {
         return Ok(false);
     }
     for (i, block) in batch.blocks.iter().enumerate() {
         if w.block_hash(height_at(start, i)?)?
-            .is_some_and(|kept| kept != block.block.hash())
+            .is_some_and(|kept| kept != BlockHash(block.block.hash()))
         {
             return Ok(false);
         }
@@ -1436,7 +1436,7 @@ pub fn write_scanned(
         }
         record_spends(w, &by_id, block, height, &spends)?;
         if live {
-            w.set_block(height, &block.block.hash(), KEEP_HASHES)?;
+            w.set_block(height, &BlockHash(block.block.hash()), KEEP_HASHES)?;
         }
     }
     let next = height_at(start, batch.blocks.len())?;
@@ -1472,16 +1472,16 @@ fn scan_one(ring: &mut Ring, lookahead: u32, account: &Account, target: Scannabl
 /// for `Scanner::complete_proofs`). Nothing for a block made rather than
 /// fetched, or a transaction that can't be split (pre-RingCT) or whose parts
 /// don't hash to it.
-fn keep_proof(w: &ScanWriter, at: &Place, tx_hash: &[u8; 32], index: Option<usize>) -> Result<()> {
+fn keep_proof(w: &ScanWriter, at: &Place, tx_hash: &TxHash, index: Option<usize>) -> Result<()> {
     let Some(raw) = at.raw else { return Ok(()) };
     if let Some(index) = index {
-        let Some(parts) = raw.txs.get(index).and_then(|t| crate::proof::split(t, tx_hash)) else {
+        let Some(parts) = raw.txs.get(index).and_then(|t| crate::proof::split(t, &tx_hash.0)) else {
             tracing::debug!("no proof for a transaction at {}: it can't be split", at.height);
             return Ok(());
         };
         w.keep_tx(tx_hash, at.height, &parts)?;
     }
-    w.keep_block(at.height, &at.block.block.hash(), &raw.blob)
+    w.keep_block(at.height, &BlockHash(at.block.block.hash()), &raw.blob)
 }
 
 /// What a transaction row needs, worked out once per transaction.
@@ -1492,9 +1492,9 @@ struct TxMeta {
     mixin: u32,
     fee: Amount,
     payment_id: Option<Vec<u8>>,
-    main_key: [u8; 32],
+    main_key: PublicKey,
     /// The key the output in hand was derived from.
-    derived_key: [u8; 32],
+    derived_key: PublicKey,
 }
 
 impl TxMeta {
@@ -1519,12 +1519,12 @@ impl TxMeta {
                 PaymentId::Encrypted(short) => short.to_vec(),
                 PaymentId::Unencrypted(long) => long.to_vec(),
             }),
-            main_key,
-            derived_key,
+            main_key: PublicKey(main_key),
+            derived_key: PublicKey(derived_key),
         }
     }
 
-    fn new_tx<'a>(&'a self, hash: [u8; 32], height: Height, timestamp: u64) -> NewTx<'a> {
+    fn new_tx<'a>(&'a self, hash: TxHash, height: Height, timestamp: u64) -> NewTx<'a> {
         NewTx {
             hash,
             prefix_hash: self.prefix_hash,
@@ -1568,8 +1568,10 @@ fn record_received(
     };
     let mut kept = HashSet::new();
     for output in outputs {
-        let tx_hash = output.transaction();
-        let Some((tx_index, tx)) = tx_of(tx_hash) else { continue };
+        let tx_hash = TxHash(output.transaction());
+        let Some((tx_index, tx)) = tx_of(tx_hash.0) else {
+            continue;
+        };
         let out_index = out_index(&output)?;
         let meta = TxMeta::of(tx, &output, &account.view_key);
         let tx_id = w.tx_row(account.id, &meta.new_tx(tx_hash, height, timestamp))?;
@@ -1583,7 +1585,7 @@ fn record_received(
             out_index,
             global_index: GlobalIndex::new(output.index_on_blockchain()),
             amount: Amount(output.commitment().amount),
-            public_key: output.key().compress().to_bytes(),
+            public_key: PublicKey(output.key().compress().to_bytes()),
             tx_pub_key: meta.derived_key,
             mask: rct.then(|| *mask.as_bytes()),
             height,
@@ -1626,8 +1628,8 @@ pub struct PoolFound {
 impl Mempool {
     /// Takes in what scanning the pool transactions `scanned` found; each is
     /// looked at once, so nothing is added twice.
-    pub(crate) fn add(&mut self, scanned: &[[u8; 32]], found: PoolFound) {
-        let fresh: HashSet<[u8; 32]> = scanned.iter().copied().filter(|h| self.seen.insert(*h)).collect();
+    pub(crate) fn add(&mut self, scanned: &[TxHash], found: PoolFound) {
+        let fresh: HashSet<TxHash> = scanned.iter().copied().filter(|h| self.seen.insert(*h)).collect();
         for (account, receipts) in found.received {
             let list = self.received.entry(account).or_default();
             list.extend(receipts.into_iter().filter(|r| fresh.contains(&r.tx_hash)));
@@ -1644,8 +1646,9 @@ impl Mempool {
 /// Pool transactions as a block the `Scanner` takes: the header and miner
 /// transaction of `last` (the last block scanned), then the pool's. Pool
 /// outputs have no global index yet; theirs count from 0 and are not served.
-pub fn pool_block(last: &Block, txs: Vec<([u8; 32], Transaction<Pruned>)>) -> Option<ScannableBlock> {
-    let (hashes, transactions): (Vec<[u8; 32]>, Vec<Transaction<Pruned>>) = txs.into_iter().unzip();
+pub fn pool_block(last: &Block, txs: Vec<(TxHash, Transaction<Pruned>)>) -> Option<ScannableBlock> {
+    let (hashes, transactions): (Vec<[u8; 32]>, Vec<Transaction<Pruned>>) =
+        txs.into_iter().map(|(h, tx)| (h.0, tx)).unzip();
     let block = Block::new(last.header.clone(), last.miner_transaction().clone(), hashes)?;
     Some(ScannableBlock {
         block,
@@ -1693,13 +1696,13 @@ pub fn scan_pool_block(
             let index = usize::from(out_index.get());
             let meta = TxMeta::of(tx, &output, &account.view_key);
             let list = found.received.entry(account.id).or_default();
-            let public_key = output.key().compress().to_bytes();
+            let public_key = PublicKey(output.key().compress().to_bytes());
             // The burning bug: a key already received in this pool transaction counts once.
             if list.iter().any(|r| r.public_key == public_key) {
                 continue;
             }
             list.push(PoolReceipt {
-                tx_hash,
+                tx_hash: TxHash(tx_hash),
                 tx_prefix_hash: meta.prefix_hash,
                 tx_pub_key: meta.derived_key,
                 out_index,
@@ -1722,7 +1725,7 @@ pub fn scan_pool_block(
         return Ok(found);
     }
     for (i, tx) in block.transactions.iter().enumerate() {
-        let tx_hash = hashes[i];
+        let tx_hash = TxHash(hashes[i]);
         let mixin = mixin(tx);
         let fee = fee(tx);
         let unlock_time = unlock_time(tx.prefix().additional_timelock);
@@ -1743,7 +1746,7 @@ pub fn scan_pool_block(
                 absolute = absolute.saturating_add(*offset);
                 for (account, ours) in spends.get(GlobalIndex::new(absolute)) {
                     let list = found.spent.entry(*account).or_default();
-                    let key_image = key_image.to_bytes();
+                    let key_image = KeyImage(key_image.to_bytes());
                     if !list
                         .iter()
                         .any(|s| s.tx_hash == tx_hash && s.output == ours.id && s.key_image == key_image)
@@ -1779,7 +1782,7 @@ fn record_spends(
     }
     let timestamp = block.block.header.timestamp;
     for (i, tx) in block.transactions.iter().enumerate() {
-        let hash = block.block.transactions[i];
+        let hash = TxHash(block.block.transactions[i]);
         // Worked out (the prefix hashed, the extra read) the first time an
         // input of this transaction has one of ours in its ring, then reused.
         let mut meta: Option<TxMeta> = None;
@@ -1809,7 +1812,7 @@ fn record_spends(
                         tx_id,
                         ours.id,
                         ours.amount,
-                        &key_image.to_bytes(),
+                        &KeyImage(key_image.to_bytes()),
                         meta.mixin,
                         height,
                     )?;
@@ -1833,8 +1836,8 @@ impl TxMeta {
             mixin: mixin(tx),
             fee: fee(tx),
             payment_id: None,
-            main_key,
-            derived_key: main_key,
+            main_key: PublicKey(main_key),
+            derived_key: PublicKey(main_key),
         }
     }
 }
@@ -2428,8 +2431,8 @@ mod tests {
             out_index: OutIndex::new(0),
             global_index: GlobalIndex::new(global_index),
             amount: Amount(5),
-            public_key: [0; 32],
-            tx_pub_key: [0; 32],
+            public_key: PublicKey([0; 32]),
+            tx_pub_key: PublicKey([0; 32]),
             mask: Some([0; 32]),
             height: Height::new(1),
             maj: 0,
@@ -2745,7 +2748,7 @@ mod tests {
         db.write(|tx| {
             let w = ScanWriter::new(tx);
             for h in heights {
-                w.set_block(Height::new(h), &chain_hash(h, 0), KEEP_HASHES)?;
+                w.set_block(Height::new(h), &BlockHash(chain_hash(h, 0)), KEEP_HASHES)?;
             }
             Ok(())
         })
@@ -2773,7 +2776,7 @@ mod tests {
             assert!(!app.scanner.suspect.load(Ordering::SeqCst));
             assert_eq!(
                 db.block_hash(Height::new(fork - 1)).unwrap(),
-                Some(chain_hash(fork - 1, 0))
+                Some(BlockHash(chain_hash(fork - 1, 0)))
             );
             assert_eq!(db.block_hash(Height::new(fork)).unwrap(), None);
             assert_eq!(
@@ -2837,7 +2840,7 @@ mod tests {
         assert_eq!(waits, [None, Some(1), Some(2), Some(4)]);
         assert_eq!(
             db.block_hash(Height::new(99)).unwrap(),
-            Some(chain_hash(99, 0)),
+            Some(BlockHash(chain_hash(99, 0))),
             "nothing lost"
         );
         app.scanner.scanned_on();
@@ -2937,7 +2940,7 @@ mod tests {
         assert_eq!(db.block_hash(Height::new(100)).unwrap(), None, "below keep_from");
         assert_eq!(
             db.block_hash(Height::new(102)).unwrap(),
-            Some(made[2].block.block.hash())
+            Some(BlockHash(made[2].block.block.hash()))
         );
         let accounts = vec![db.account(&w.address()).unwrap().unwrap()];
         assert_eq!(accounts[0].scan_height, Height::new(103));
@@ -3049,12 +3052,15 @@ mod tests {
         assert_eq!(asked(0), vec![100, 50], "a hundred at a time");
         {
             let pool = app.scanner.mempool.lock().unwrap();
-            let seen: HashSet<[u8; 32]> = pool.seen.iter().copied().collect();
+            let seen: HashSet<[u8; 32]> = pool.seen.iter().map(|h| h.0).collect();
             assert_eq!(seen, HashSet::from([paying_hash, bad, wrong]));
         }
         let received = app.scanner.mempool.lock().unwrap().for_account(account.id);
         assert_eq!(received.len(), 1);
-        assert_eq!((received[0].tx_hash, received[0].amount), (paying_hash, Amount(42_000)));
+        assert_eq!(
+            (received[0].tx_hash, received[0].amount),
+            (TxHash(paying_hash), Amount(42_000))
+        );
 
         let before = node.calls.lock().unwrap().len();
         app.scanner.scan_pool(&accounts).await.unwrap();

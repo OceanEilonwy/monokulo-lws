@@ -20,7 +20,7 @@ use crate::db::{Account, Holdings, NewAccount, OutputRow, Queued, SpendRow, Stat
 use crate::error::{Error, Result, bad};
 use crate::limits::ClientIp;
 use crate::scanner::{PoolReceipt, PoolSpend, unlocked};
-use crate::types::{AccountId, Height, OutputId, TxId};
+use crate::types::{AccountId, Height, KeyImage, OutputId, TxHash, TxId};
 
 type Reply<T> = std::result::Result<Json<T>, ApiError>;
 
@@ -125,11 +125,11 @@ fn fee_of(fee: Amount) -> Option<Amount> {
     Some(fee)
 }
 
-fn spend_of(o: &OutputRow, key_image: [u8; 32], mixin: u32) -> Spend {
+fn spend_of(o: &OutputRow, key_image: KeyImage, mixin: u32) -> Spend {
     Spend {
         amount: o.amount,
-        key_image: Hex(key_image),
-        tx_pub_key: Hex(o.tx_pub_key),
+        key_image: key_image.into(),
+        tx_pub_key: o.tx_pub_key.into(),
         out_index: o.out_index.get(),
         mixin,
         sender: Some(meta(o.maj, o.min)),
@@ -287,17 +287,17 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
         receives_by_tx.entry(o.tx).or_default().push(ReceivedOutput {
             commitment: o.commitment.map(Hex),
             amount: o.amount,
-            public_key: Hex(o.public_key),
+            public_key: o.public_key.into(),
             index: o.out_index.get(),
             global_index: Amount(o.global_index.get()),
-            tx_pub_key: Hex(o.tx_pub_key),
+            tx_pub_key: o.tx_pub_key.into(),
             rct: o.mask.map(Hex),
             recipient: meta(o.maj, o.min),
         });
     }
     let mut spends = spends_by_tx(&spends, &outputs);
     let mut total_received = outputs.values().map(|o| o.amount.0).fold(0u64, u64::saturating_add);
-    let mined: std::collections::HashSet<[u8; 32]> = rows.iter().map(|t| t.hash).collect();
+    let mined: std::collections::HashSet<TxHash> = rows.iter().map(|t| t.hash).collect();
     let mut transactions: Vec<Transaction> = rows
         .into_iter()
         .map(|t| {
@@ -307,7 +307,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
                 proof: proofs.remove(&t.id).map(proof_of),
                 fee: fee_of(t.fee),
                 id: t.id.get(),
-                hash: Hex(t.hash),
+                hash: t.hash.into(),
                 timestamp: Some(Timestamp::from_unix(t.timestamp)),
                 total_received: t.total_received,
                 total_sent: t.total_sent,
@@ -328,8 +328,8 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
         let pool = app.scanner.mempool.lock().unwrap_or_else(|e| e.into_inner());
         (pool.for_account(account.id), pool.spends_for(account.id))
     };
-    let mut pooled: Vec<([u8; 32], Vec<PoolReceipt>, Vec<PoolSpend>)> = vec![];
-    let entry = |pooled: &mut Vec<([u8; 32], Vec<PoolReceipt>, Vec<PoolSpend>)>, hash: [u8; 32]| -> usize {
+    let mut pooled: Vec<(TxHash, Vec<PoolReceipt>, Vec<PoolSpend>)> = vec![];
+    let entry = |pooled: &mut Vec<(TxHash, Vec<PoolReceipt>, Vec<PoolSpend>)>, hash: TxHash| -> usize {
         match pooled.iter().position(|(h, _, _)| *h == hash) {
             Some(i) => i,
             None => {
@@ -368,7 +368,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
             proof: None,
             fee: Some(fee),
             id: next_id + n as u64,
-            hash: Hex(hash),
+            hash: hash.into(),
             timestamp: None,
             total_received: Amount(received),
             total_sent: Amount(spent_outputs.iter().map(|s| s.amount.0).fold(0, u64::saturating_add)),
@@ -380,10 +380,10 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
                 .map(|r| ReceivedOutput {
                     commitment: r.commitment.map(Hex),
                     amount: r.amount,
-                    public_key: Hex(r.public_key),
+                    public_key: r.public_key.into(),
                     index: r.out_index.get(),
                     global_index: Amount(0),
-                    tx_pub_key: Hex(r.tx_pub_key),
+                    tx_pub_key: r.tx_pub_key.into(),
                     rct: r.mask.map(Hex),
                     recipient: meta(r.maj, r.min),
                 })
@@ -417,7 +417,7 @@ pub async fn get_unspent_outs(
     let txs: HashMap<TxId, TxRow> = txs.into_iter().map(|t| (t.id, t)).collect();
     let mut images: HashMap<OutputId, Vec<Hex32>> = HashMap::new();
     for s in spends {
-        images.entry(s.output).or_default().push(Hex(s.key_image));
+        images.entry(s.output).or_default().push(s.key_image.into());
     }
     let dust = if req.use_dust {
         0
@@ -450,7 +450,7 @@ pub async fn get_unspent_outs(
                 let commitment = o.commitment.unwrap_or_else(|| crypto::commit(&mask, o.amount.0));
                 crypto::legacy_rct(
                     &account.view_key,
-                    &o.tx_pub_key,
+                    o.tx_pub_key.as_bytes(),
                     u64::from(o.out_index.get()),
                     &commitment,
                     &mask,
@@ -461,14 +461,14 @@ pub async fn get_unspent_outs(
         });
         listed.push(Output {
             amount: o.amount,
-            public_key: Hex(o.public_key),
+            public_key: o.public_key.into(),
             index: o.out_index.get(),
             global_index: Amount(o.global_index.get()),
             // monero-lws writes the global index here too.
             tx_id: o.global_index.get(),
-            tx_hash: Hex(tx.hash),
+            tx_hash: tx.hash.into(),
             tx_prefix_hash: Hex(tx.prefix_hash),
-            tx_pub_key: Hex(o.tx_pub_key),
+            tx_pub_key: o.tx_pub_key.into(),
             timestamp: Timestamp::from_unix(tx.timestamp),
             height: o.height.get(),
             spend_key_images: images.remove(&o.id).unwrap_or_default(),

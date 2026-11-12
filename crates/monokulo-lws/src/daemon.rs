@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
-use crate::types::Height;
+use crate::types::{BlockHash, Height, TxHash};
 
 /// The most one `get_blocks.bin` response may be; the body is read in
 /// chunks and given up on as soon as it passes this, whatever
@@ -235,7 +235,7 @@ impl Daemon {
     }
 
     /// The hash of the block at `height`.
-    pub async fn block_hash(&self, height: Height) -> Result<[u8; 32]> {
+    pub async fn block_hash(&self, height: Height) -> Result<BlockHash> {
         #[derive(Deserialize)]
         struct Header {
             hash: String,
@@ -251,7 +251,8 @@ impl Daemon {
                 SMALL_JSON_RESPONSE,
             )
             .await?;
-        hex32(&r.block_header.hash).ok_or_else(|| Error::Daemon("get_block_header_by_height: bad hash".into()))
+        BlockHash::from_hex(&r.block_header.hash)
+            .ok_or_else(|| Error::Daemon("get_block_header_by_height: bad hash".into()))
     }
 
     pub async fn fee_estimate(&self) -> Result<FeeEstimate> {
@@ -339,11 +340,11 @@ impl Daemon {
         .await
     }
 
-    pub async fn pool_hashes(&self) -> Result<Vec<[u8; 32]>> {
+    pub async fn pool_hashes(&self) -> Result<Vec<TxHash>> {
         #[derive(Deserialize)]
         struct R {
             #[serde(default, deserialize_with = "hashes")]
-            tx_hashes: Vec<[u8; 32]>,
+            tx_hashes: Vec<TxHash>,
         }
         let r: R = self
             .rpc("get_transaction_pool_hashes", json!({}), POOL_HASHES_RESPONSE)
@@ -358,7 +359,7 @@ impl Daemon {
     /// doesn't send are left out of both lists, to be asked for again; one
     /// that doesn't read or hashes to something else is in `bad`, so the
     /// caller can stop asking for it without failing the rest.
-    pub async fn transactions(&self, hashes: &[[u8; 32]]) -> Result<Transactions> {
+    pub async fn transactions(&self, hashes: &[TxHash]) -> Result<Transactions> {
         #[derive(Deserialize)]
         struct Tx {
             tx_hash: String,
@@ -379,7 +380,7 @@ impl Daemon {
         let mut out = Transactions::default();
         let mut seen = std::collections::HashSet::new();
         for chunk in hashes.chunks(TXS_PER_REQUEST) {
-            let hex_hashes: Vec<String> = chunk.iter().map(hex::encode).collect();
+            let hex_hashes: Vec<String> = chunk.iter().map(TxHash::to_string).collect();
             let r: R = self
                 .rpc(
                     "get_transactions",
@@ -394,7 +395,7 @@ impl Daemon {
                 )));
             }
             for tx in r.txs {
-                let Some(hash) = hex32(&tx.tx_hash).filter(|h| chunk.contains(h)) else {
+                let Some(hash) = TxHash::from_hex(&tx.tx_hash).filter(|h| chunk.contains(h)) else {
                     tracing::warn!("get_transactions: the node sent a transaction not asked for");
                     continue;
                 };
@@ -404,7 +405,7 @@ impl Daemon {
                 match read_transaction(&tx.pruned_as_hex, &tx.as_hex, &tx.prunable_hash, &hash) {
                     Ok(parsed) => out.txs.push((hash, parsed)),
                     Err(e) => {
-                        tracing::warn!("get_transactions: skipping {}: {e}", hex::encode(hash));
+                        tracing::warn!("get_transactions: skipping {hash}: {e}");
                         out.bad.push(hash);
                     }
                 }
@@ -416,7 +417,7 @@ impl Daemon {
     /// The prunable hash of each of these mined transactions the node has,
     /// by transaction hash (`get_transactions`, pruned, which sends it where
     /// `get_blocks.bin` sends zeros).
-    pub async fn prunable_hashes(&self, hashes: &[[u8; 32]]) -> Result<std::collections::HashMap<[u8; 32], [u8; 32]>> {
+    pub async fn prunable_hashes(&self, hashes: &[TxHash]) -> Result<std::collections::HashMap<TxHash, [u8; 32]>> {
         #[derive(Deserialize)]
         struct Tx {
             tx_hash: String,
@@ -433,7 +434,7 @@ impl Daemon {
         if hashes.is_empty() {
             return Ok(Default::default());
         }
-        let hex_hashes: Vec<String> = hashes.iter().map(hex::encode).collect();
+        let hex_hashes: Vec<String> = hashes.iter().map(TxHash::to_string).collect();
         let r: R = self
             .rpc(
                 "get_transactions",
@@ -446,7 +447,7 @@ impl Daemon {
         }
         Ok(r.txs
             .iter()
-            .filter_map(|t| Some((hex32(&t.tx_hash)?, hex32(&t.prunable_hash)?)))
+            .filter_map(|t| Some((TxHash::from_hex(&t.tx_hash)?, hex32(&t.prunable_hash)?)))
             .filter(|(_, p)| *p != [0; 32])
             .collect())
     }
@@ -493,8 +494,8 @@ pub(crate) fn check_chain(blocks: &[Fetched], start: Height) -> Result<()> {
 /// the node sent but that didn't read or didn't hash to their hash.
 #[derive(Debug, Default)]
 pub struct Transactions {
-    pub txs: Vec<([u8; 32], Transaction<Pruned>)>,
-    pub bad: Vec<[u8; 32]>,
+    pub txs: Vec<(TxHash, Transaction<Pruned>)>,
+    pub bad: Vec<TxHash>,
 }
 
 /// Hashes asked of `get_transactions` at once (a restricted node answers at
@@ -510,7 +511,7 @@ fn read_transaction(
     pruned_hex: &str,
     full_hex: &str,
     prunable_hex: &str,
-    hash: &[u8; 32],
+    hash: &TxHash,
 ) -> Result<Transaction<Pruned>> {
     let pruned = !pruned_hex.is_empty();
     let bytes =
@@ -526,7 +527,7 @@ fn read_transaction(
             .filter(|p| *p != [0; 32])
             .and_then(|p| tx.hash_with_prunable_hash(p)),
     };
-    if computed.is_some_and(|c| c != *hash) {
+    if computed.is_some_and(|c| c != hash.0) {
         return Err(Error::Daemon("its bytes hash to another hash".into()));
     }
     Ok(tx)
@@ -589,8 +590,8 @@ fn capped_u64s<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Ve
 /// hex digits is skipped, so nothing but the 32 bytes of each good hash is
 /// kept (a node can't make a limit's worth of `"",` cost many times that in
 /// `String`s).
-fn hashes<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<[u8; 32]>, D::Error> {
-    struct Hash(Option<[u8; 32]>);
+fn hashes<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<TxHash>, D::Error> {
+    struct Hash(Option<TxHash>);
     impl<'de> Deserialize<'de> for Hash {
         fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Hash, D::Error> {
             struct V;
@@ -600,7 +601,7 @@ fn hashes<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<[u8
                     f.write_str("a hex hash")
                 }
                 fn visit_str<E: serde::de::Error>(self, s: &str) -> std::result::Result<Hash, E> {
-                    Ok(Hash(hex32(s)))
+                    Ok(Hash(TxHash::from_hex(s)))
                 }
             }
             d.deserialize_str(V)
@@ -608,11 +609,11 @@ fn hashes<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<[u8
     }
     struct V;
     impl<'de> serde::de::Visitor<'de> for V {
-        type Value = Vec<[u8; 32]>;
+        type Value = Vec<TxHash>;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("an array of hex hashes")
         }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Vec<[u8; 32]>, A::Error> {
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Vec<TxHash>, A::Error> {
             let mut out = Vec::new();
             while let Some(Hash(h)) = seq.next_element()? {
                 out.extend(h);
@@ -1079,7 +1080,7 @@ mod tests {
             "a".repeat(63)
         );
         let hashes = answering(body).await.pool_hashes().await.unwrap();
-        assert_eq!(hashes, vec![[0xab; 32]]);
+        assert_eq!(hashes, vec![TxHash([0xab; 32])]);
     }
 
     #[tokio::test]

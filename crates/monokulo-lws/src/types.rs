@@ -1,4 +1,5 @@
-//! The server's own value types: row ids, and how each is stored.
+//! The server's own value types: row ids, heights, indexes, hashes and
+//! keys, and how each is stored.
 //!
 //! Each is its own type so that passing one where another belongs (an
 //! output's row id where a transaction's goes) doesn't compile. Each that is
@@ -229,6 +230,91 @@ impl FromSql for Height {
     }
 }
 
+/// A 32-byte value whose meaning is its type: a transaction hash isn't a
+/// block hash, nor a key image a public key, though each is 32 bytes.
+/// Stored as a 32-byte blob (any other length is an error on read, naming
+/// both lengths); read from a node's JSON as 64 hex characters; served as
+/// `lws_api::Hex32`.
+macro_rules! bytes32 {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub [u8; 32]);
+
+        #[allow(dead_code)] // Not every type uses every accessor.
+        impl $name {
+            pub const fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+
+            /// 64 hex characters, either case.
+            pub fn from_hex(s: &str) -> Option<Self> {
+                let mut out = [0u8; 32];
+                (s.len() == 64 && hex::decode_to_slice(s, &mut out).is_ok()).then_some($name(out))
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, concat!(stringify!($name), "({})"), hex::encode(self.0))
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&hex::encode(self.0))
+            }
+        }
+
+        impl From<[u8; 32]> for $name {
+            fn from(v: [u8; 32]) -> Self {
+                $name(v)
+            }
+        }
+
+        impl From<$name> for lws_api::Hex32 {
+            fn from(v: $name) -> Self {
+                lws_api::Hex(v.0)
+            }
+        }
+
+        impl ToSql for $name {
+            fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+                Ok(ToSqlOutput::from(self.0.as_slice()))
+            }
+        }
+
+        impl FromSql for $name {
+            fn column_result(v: ValueRef<'_>) -> FromSqlResult<Self> {
+                <[u8; 32]>::column_result(v).map($name)
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                lws_api::Hex32::deserialize(d).map(|h| $name(h.0))
+            }
+        }
+    };
+}
+
+bytes32!(
+    /// A transaction's hash.
+    TxHash
+);
+bytes32!(
+    /// A block's hash.
+    BlockHash
+);
+bytes32!(
+    /// The key image an input spends.
+    KeyImage
+);
+bytes32!(
+    /// A public key: an output's one-time key, or a transaction's.
+    PublicKey
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +358,40 @@ mod tests {
                 .is_err()
         );
         assert!(c.query_row("SELECT v FROM t", [], |r| r.get::<_, OutIndex>(0)).is_err());
+    }
+
+    /// A 32-byte value of another length in the database is an error that
+    /// says so, not rusqlite's `InvalidQuery`.
+    #[test]
+    fn blobs_of_the_wrong_length_are_refused_by_name() {
+        let c = conn();
+        c.execute("INSERT INTO t VALUES (x'0102')", []).unwrap();
+        let e = c
+            .query_row("SELECT v FROM t", [], |r| r.get::<_, TxHash>(0))
+            .unwrap_err();
+        assert!(e.to_string().contains("32 byte value out of 2 byte blob"), "{e}");
+        c.execute("DELETE FROM t", []).unwrap();
+        c.execute("INSERT INTO t VALUES (?1)", [KeyImage([7; 32])]).unwrap();
+        let back: KeyImage = c.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(back, KeyImage([7; 32]));
+    }
+
+    /// From a node's JSON: 64 hex characters, nothing else.
+    #[test]
+    fn hashes_decode_from_hex_of_the_right_length() {
+        let good = format!("\"{}\"", "Ab".repeat(32));
+        assert_eq!(serde_json::from_str::<BlockHash>(&good).unwrap(), BlockHash([0xab; 32]));
+        for bad in [
+            "\"\"",
+            "\"abc\"",
+            &format!("\"{}\"", "a".repeat(63)),
+            &format!("\"{}\"", "zz".repeat(32)),
+            "7",
+        ] {
+            assert!(serde_json::from_str::<TxHash>(bad).is_err(), "{bad}");
+        }
+        assert_eq!(PublicKey::from_hex(&"00".repeat(32)), Some(PublicKey([0; 32])));
+        assert_eq!(PublicKey::from_hex(&"00".repeat(33)), None);
     }
 
     /// An out index past 65,535 in the database is an error, not truncated.
