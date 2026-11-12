@@ -438,8 +438,28 @@ impl Daemon {
         let response = self
             .post("get_blocks.bin", request(start, count), false, MAX_BLOCKS_RESPONSE)
             .await?;
-        parse(&response, count as usize)
+        let blocks = parse(&response, count as usize)?;
+        check_chain(&blocks, start)?;
+        Ok(blocks)
     }
+}
+
+/// Refuses blocks that aren't the chain from `start` on: the scanner files
+/// each block's outputs and hash under `start + i`, so block `i` must be at
+/// that height and follow block `i - 1`.
+pub(crate) fn check_chain(blocks: &[Fetched], start: u64) -> Result<()> {
+    let mut previous: Option<[u8; 32]> = None;
+    for (i, f) in blocks.iter().enumerate() {
+        let block = &f.block.block;
+        if Some(block.number() as u64) != start.checked_add(i as u64) {
+            return Err(invalid("get_blocks.bin sent a block from the wrong height"));
+        }
+        if previous.is_some_and(|p| p != block.header.previous) {
+            return Err(invalid("get_blocks.bin sent blocks that don't follow each other"));
+        }
+        previous = Some(block.hash());
+    }
+    Ok(())
 }
 
 /// `user:password@` in a URL as `***@`.
@@ -769,6 +789,23 @@ mod tests {
             assert_eq!(f.first_indexes.len(), f.block.transactions.len() + 1);
         }
         assert!(parse(FIXTURE, 2).is_err(), "more blocks than asked for is an error");
+    }
+
+    #[test]
+    fn blocks_must_be_the_chain_from_the_start_asked() {
+        let blocks = parse(FIXTURE, 3).unwrap();
+        check_chain(&blocks, 3_300_000).unwrap();
+        check_chain(&blocks[1..], 3_300_001).unwrap();
+        check_chain(&[], 7).unwrap();
+        assert!(check_chain(&blocks, 3_300_001).is_err(), "the wrong start");
+        let skipped = vec![blocks[0].clone(), blocks[2].clone()];
+        assert!(check_chain(&skipped, 3_300_000).is_err(), "a block left out");
+        let repeated = vec![blocks[0].clone(), blocks[0].clone()];
+        assert!(check_chain(&repeated, 3_300_000).is_err(), "a block twice");
+        // At the right height but on another chain.
+        let mut forked = blocks.clone();
+        forked[1].block.block.header.previous = [7; 32];
+        assert!(check_chain(&forked, 3_300_000).is_err(), "not following its parent");
     }
 
     /// A little fuzzing: thousands of random mutations of a real response,
