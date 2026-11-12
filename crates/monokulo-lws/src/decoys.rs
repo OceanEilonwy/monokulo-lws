@@ -181,7 +181,7 @@ impl<'a> GammaPicker<'a> {
     /// `None` where wallet2 throws: fewer blocks than the spendable age, no
     /// spendable output, or no output in the last year.
     fn new(offsets: &'a [u64]) -> Option<GammaPicker<'a>> {
-        let age = (SPENDABLE_AGE as usize).max(1);
+        let age = usize::try_from(SPENDABLE_AGE).unwrap_or(usize::MAX).max(1);
         if offsets.len() < age {
             return None;
         }
@@ -228,6 +228,8 @@ impl<'a> GammaPicker<'a> {
             // Too young to spend: somewhere in the recent spend window.
             rng.gen_range(0..RECENT_SPEND_WINDOW) as f64
         };
+        // Float to integer `as` saturates (and takes NaN to 0), which is
+        // what is wanted: an age past every output is refused just below.
         let back = (x / self.average_output_time) as u64;
         if back >= self.num_rct_outputs {
             return None;

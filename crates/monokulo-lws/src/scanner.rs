@@ -511,7 +511,11 @@ impl Scanner {
     fn arena(&self, lane: u64) -> Arena {
         match self.arenas.len() {
             1 => self.arenas[0].clone(),
-            n => self.arenas[1 + (lane as usize % (n - 1))].clone(),
+            n => {
+                // Below `n - 1`, so it fits a usize.
+                let shared = u64::try_from(n - 1).unwrap_or(u64::MAX);
+                self.arenas[1 + usize::try_from(lane % shared).unwrap_or(0)].clone()
+            }
         }
     }
 
@@ -1938,30 +1942,22 @@ fn onchain_commitment(tx: &Transaction<Pruned>, index: usize, output: &WalletOut
     }
 }
 
-fn varint(mut v: u64, out: &mut Vec<u8>) {
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
 /// Keccak of the prefix as serialised: version, timelock, inputs,
 /// outputs, extra. (monero-oxide keeps its own prefix hash private.)
 pub fn prefix_hash(tx: &Transaction<Pruned>) -> [u8; 32] {
     let prefix = tx.prefix();
     let mut buf = Vec::with_capacity(512);
-    varint(u64::from(tx.version()), &mut buf);
+    crypto::varint(u64::from(tx.version()), &mut buf);
     prefix.additional_timelock.write(&mut buf).expect("vec");
-    varint(prefix.inputs.len() as u64, &mut buf);
+    crypto::varint(prefix.inputs.len() as u64, &mut buf);
     for input in &prefix.inputs {
         input.write(&mut buf).expect("vec");
     }
-    varint(prefix.outputs.len() as u64, &mut buf);
+    crypto::varint(prefix.outputs.len() as u64, &mut buf);
     for output in &prefix.outputs {
         output.write(&mut buf).expect("vec");
     }
-    varint(prefix.extra.len() as u64, &mut buf);
+    crypto::varint(prefix.extra.len() as u64, &mut buf);
     buf.extend(&prefix.extra);
     keccak256(buf)
 }
@@ -2007,9 +2003,9 @@ pub fn fixture_blocks(fixture: &std::path::Path) -> anyhow::Result<FixtureBlocks
     let mut f = std::io::BufReader::new(std::fs::File::open(fixture)?);
     let mut word = [0u8; 8];
     f.read_exact(&mut word)?;
-    let block_count = u64::from_le_bytes(word) as usize;
+    let block_count = usize::try_from(u64::from_le_bytes(word))?;
     f.read_exact(&mut word)?;
-    let key_count = u64::from_le_bytes(word) as usize;
+    let key_count = usize::try_from(u64::from_le_bytes(word))?;
     let mut keys = Vec::with_capacity(key_count);
     for _ in 0..key_count {
         let mut r = [0u8; 32];
@@ -2245,10 +2241,10 @@ mod tests {
     #[test]
     fn varints() {
         let mut v = vec![];
-        varint(0, &mut v);
-        varint(127, &mut v);
-        varint(128, &mut v);
-        varint(300, &mut v);
+        crypto::varint(0, &mut v);
+        crypto::varint(127, &mut v);
+        crypto::varint(128, &mut v);
+        crypto::varint(300, &mut v);
         assert_eq!(v, vec![0, 127, 0x80, 0x01, 0xac, 0x02]);
     }
 
@@ -2280,9 +2276,9 @@ mod tests {
             .to_bytes();
         let mut tagged = b"view_tag".to_vec();
         tagged.extend_from_slice(&derivation);
-        varint(index, &mut tagged);
+        crypto::varint(index, &mut tagged);
         let mut shared = derivation.to_vec();
-        varint(index, &mut shared);
+        crypto::varint(index, &mut shared);
         let shared = DScalar::from_bytes_mod_order(keccak256(&shared));
         let key = &shared * ED25519_BASEPOINT_TABLE + keys.spend;
         Output {

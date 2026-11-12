@@ -375,7 +375,8 @@ impl Timestamp {
 
     /// ISO 8601 in UTC from seconds since the epoch.
     pub fn from_unix(secs: u64) -> Timestamp {
-        let days = (secs / 86_400) as i64;
+        // u64::MAX / 86,400 is about 2.1e14 days: always an i64.
+        let days = i64::try_from(secs / 86_400).expect("u64 seconds are within i64 days");
         let rem = secs % 86_400;
         let (y, m, d) = civil_from_days(days);
         Timestamp(format!(
@@ -396,6 +397,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
+    // In 1..=31 and 1..=12 by construction (0 <= doy <= 365, 0 <= mp <= 11),
+    // so these casts neither truncate nor lose a sign.
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)

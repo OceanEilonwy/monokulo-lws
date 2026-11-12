@@ -111,12 +111,16 @@ fn hash_to_scalar(data: &[u8]) -> DScalar {
     Scalar::hash(data).into()
 }
 
-fn varint(mut v: u64, out: &mut Vec<u8>) {
+/// `v` as a Monero varint: seven bits a byte, low first, the top bit set
+/// on every byte but the last.
+pub(crate) fn varint(mut v: u64, out: &mut Vec<u8>) {
     while v >= 0x80 {
-        out.push((v as u8) | 0x80);
+        // The low byte, its top bit then set: the low seven bits and "more".
+        out.push(v.to_le_bytes()[0] | 0x80);
         v >>= 7;
     }
-    out.push(v as u8);
+    // Below 0x80, so the low byte is all of it.
+    out.push(v.to_le_bytes()[0]);
 }
 
 /// The view key as a curve25519 scalar, wiped when dropped.

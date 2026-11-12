@@ -1187,14 +1187,14 @@ fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<
 
 /// [`Db::rescan`] inside `tx`.
 fn rescan_in(tx: &Transaction, addresses: &[Address], height: Height) -> Result<Vec<Address>> {
-    let h = sql_height(height)?;
+    let height = sql_height(height)?;
     let mut done = vec![];
     for a in addresses {
         let Some(id) = account_id(tx, a)? else { continue };
         delete_account_from(tx, id, height)?;
         tx.execute(
             "UPDATE accounts SET scan_height = MIN(scan_height, ?1) WHERE id = ?2",
-            params![h, id],
+            params![height, id],
         )?;
         done.push(a.clone());
     }
