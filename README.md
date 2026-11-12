@@ -273,7 +273,9 @@ cost about sixteen times the storage of proving receives.
   node on another chain) stops scanning with an error in the log and
   `/daemon_status`, rewinding nothing; the API goes on serving. Rescan
   every active account (admin `rescan`) from below the fork and scanning
-  resumes by itself.
+  resumes by itself. Reorgs that keep ending at the same fork with nothing
+  scanned between (a node whose blocks and headers disagree) are retried
+  after a wait, from a second doubling to a minute, logged at warn.
 - One SQLite transaction per batch: outputs, spends, block hashes and scan
   heights land together or not at all, so a kill mid-batch leaves every
   account at a height it really scanned to. A batch writes only for the

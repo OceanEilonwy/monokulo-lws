@@ -408,6 +408,50 @@ pub struct Scanner {
     suspect: AtomicBool,
     /// When the stop for a reorg too deep was last logged.
     halt_logged: Mutex<Option<Instant>>,
+    /// Reorgs in a row unwound to the same fork, with nothing scanned
+    /// between them.
+    reorg_streak: Mutex<ReorgStreak>,
+    /// How long the live lane waits before its next step, after a reorg
+    /// that repeats the last ones (`reorg_backoff`).
+    reorg_wait: Mutex<Option<Duration>>,
+}
+
+/// Reorgs in a row that ended at the same fork.
+#[derive(Debug, Default)]
+struct ReorgStreak {
+    fork: Option<u64>,
+    count: u32,
+}
+
+impl ReorgStreak {
+    /// Counts a reorg unwound to `fork`: how many in a row ended there.
+    fn note(&mut self, fork: u64) -> u32 {
+        if self.fork == Some(fork) {
+            self.count = self.count.saturating_add(1);
+        } else {
+            *self = ReorgStreak {
+                fork: Some(fork),
+                count: 1,
+            };
+        }
+        self.count
+    }
+}
+
+/// The wait after the `n`th reorg in a row to the same fork: none for the
+/// first (a real reorg is unwound and scanned past at once), then a second,
+/// doubling, at most a minute. A node whose blocks and headers disagree
+/// would otherwise have the live lane rewind and fetch again in a tight
+/// loop, hammering the node and the database.
+fn reorg_backoff(n: u32) -> Option<Duration> {
+    const FIRST: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(60);
+    let doublings = n.checked_sub(2)?;
+    Some(
+        2u32.checked_pow(doublings)
+            .and_then(|f| FIRST.checked_mul(f))
+            .map_or(MAX, |d| d.min(MAX)),
+    )
 }
 
 impl Scanner {
@@ -428,6 +472,8 @@ impl Scanner {
             live_ring: Mutex::new(None),
             suspect: AtomicBool::new(false),
             halt_logged: Mutex::new(None),
+            reorg_streak: Mutex::new(ReorgStreak::default()),
+            reorg_wait: Mutex::new(None),
         })
     }
 
@@ -473,6 +519,10 @@ impl Scanner {
             match self.step().await {
                 Ok(true) => {
                     backoff = Duration::from_secs(2);
+                    let wait = self.reorg_wait.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    if let Some(wait) = wait {
+                        tokio::time::sleep(wait).await;
+                    }
                     continue;
                 }
                 Ok(false) => {
@@ -564,6 +614,7 @@ impl Scanner {
                 self.reorg().await?;
                 return Ok(true);
             }
+            self.scanned_on();
             self.complete_proofs().await;
             self.scan_pool(&accounts).await?;
             return Ok(false);
@@ -590,7 +641,7 @@ impl Scanner {
             tokio::task::block_in_place(|| self.scan_batch(&mut ring, &self.arenas[0], &accounts, &batch, &at));
         *self.live_ring.lock().unwrap_or_else(|e| e.into_inner()) = ring;
         match result? {
-            Outcome::Written => {}
+            Outcome::Written => self.scanned_on(),
             // A reorg shows as a block not following, or not being, the one kept.
             Outcome::Diverged => {
                 self.reorg().await?;
@@ -812,6 +863,12 @@ impl Scanner {
         })
     }
 
+    /// The live lane got past where it stands without a reorg: the next
+    /// reorg starts a new streak.
+    fn scanned_on(&self) {
+        *self.reorg_streak.lock().unwrap_or_else(|e| e.into_inner()) = ReorgStreak::default();
+    }
+
     /// Unwinds a reorg: everything from the fork on (outputs, candidate spends,
     /// transactions, kept hashes) goes, every account at or past it moves back
     /// to it, and the pool is looked at afresh, as the orphaned blocks'
@@ -839,6 +896,15 @@ impl Scanner {
                 return Ok(());
             }
         };
+        let streak = self.reorg_streak.lock().unwrap_or_else(|e| e.into_inner()).note(fork);
+        if let Some(wait) = reorg_backoff(streak) {
+            tracing::warn!(
+                "reorg: {streak} in a row to {fork} with nothing scanned between; the node's blocks and its \
+                 headers may disagree. Waiting {}s before trying again",
+                wait.as_secs()
+            );
+            *self.reorg_wait.lock().unwrap_or_else(|e| e.into_inner()) = Some(wait);
+        }
         tracing::info!("reorg: rewinding to {fork}");
         self.db.call(move |db| db.rewind(fork)).await?;
         self.mempool.lock().unwrap_or_else(|e| e.into_inner()).reset(vec![]);
@@ -2633,6 +2699,57 @@ mod tests {
             assert!(asked <= 25, "fork {fork}: {asked} requests");
             assert_eq!(db.halted().unwrap(), None);
         }
+    }
+
+    #[test]
+    fn reorgs_to_the_same_fork_back_off_up_to_a_minute() {
+        assert_eq!(reorg_backoff(0), None);
+        assert_eq!(reorg_backoff(1), None);
+        let secs: Vec<u64> = (2..=10).map(|n| reorg_backoff(n).unwrap().as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(reorg_backoff(u32::MAX), Some(Duration::from_secs(60)));
+        let mut streak = ReorgStreak::default();
+        assert_eq!(streak.note(100), 1);
+        assert_eq!(streak.note(100), 2);
+        assert_eq!(streak.note(90), 1, "another fork starts again");
+        assert_eq!(streak.note(90), 2);
+    }
+
+    /// A node whose top block hash disagrees with its own headers makes
+    /// every caught-up step find a "reorg" to the same fork: the first is
+    /// unwound at once, the ones after it wait, longer each time, and say
+    /// so at warn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_that_disagrees_with_itself_is_backed_off() {
+        let node = crate::testkit::fake_node(|route, input| match route {
+            "get_info" => serde_json::json!({
+                "height": 100,
+                "top_block_hash": hex::encode(chain_hash(99, 1)),
+            }),
+            "get_block_header_by_height" => {
+                let height = input["height"].as_u64().unwrap();
+                serde_json::json!({ "block_header": { "hash": hex::encode(chain_hash(height, 0)) } })
+            }
+            _ => serde_json::json!({}),
+        })
+        .await;
+        let db = Arc::new(Db::in_memory());
+        keep_chain(&db, 1..=99);
+        let account = crate::testkit::Wallet::new(11).add(&db, 0);
+        db.write(|tx| ScanWriter::new(tx).set_scan_height(account.id, 100))
+            .unwrap();
+        let app = crate::testkit::app_with_node(db.clone(), 100, &node.url);
+        let wait = || app.scanner.reorg_wait.lock().unwrap().take();
+        let mut waits = vec![];
+        for _ in 0..4 {
+            assert!(app.scanner.step().await.unwrap(), "a reorg each time");
+            waits.push(wait().map(|d| d.as_secs()));
+        }
+        assert_eq!(waits, [None, Some(1), Some(2), Some(4)]);
+        assert_eq!(db.block_hash(99).unwrap(), Some(chain_hash(99, 0)), "nothing lost");
+        app.scanner.scanned_on();
+        assert!(app.scanner.step().await.unwrap());
+        assert_eq!(wait(), None, "a new streak after scanning on");
     }
 
     /// A reorg deeper than every kept hash stops the scan, rewinding
