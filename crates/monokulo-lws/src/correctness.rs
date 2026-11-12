@@ -26,6 +26,7 @@ use crate::error::Error;
 use crate::rest::{App, wallet};
 use crate::scanner::{Batch, Ring, pool_block, record_batch, scan_pool_block, stand_in};
 use crate::testkit::*;
+use crate::types::Height;
 
 fn unwrap<T>(r: std::result::Result<Json<T>, crate::rest::ApiError>) -> T {
     match r {
@@ -60,7 +61,7 @@ async fn unspent(app: &Arc<App>, w: &Wallet) -> UnspentOuts {
 
 /// What each way of scanning writes for these accounts: (account, global
 /// index, out index, amount, height), sorted.
-fn outputs_of(db: &Db, accounts: &[Account]) -> Vec<(crate::types::AccountId, u64, u16, u64, u64)> {
+fn outputs_of(db: &Db, accounts: &[Account]) -> Vec<(crate::types::AccountId, u64, u16, u64, Height)> {
     let mut all: Vec<_> = accounts
         .iter()
         .flat_map(|a| {
@@ -482,7 +483,7 @@ async fn subaddresses_through_additional_keys_and_the_lookahead() {
         100,
     )
     .unwrap();
-    db.rescan(&[w.address()], 100).unwrap();
+    db.rescan(&[w.address()], Height::new(100)).unwrap();
     let account = db.account(&w.address()).unwrap().unwrap();
     write(&db, &[account], make(), 100, true, Some(&every_hit));
     let outs = db.outputs(accounts[0].id).unwrap();
@@ -550,25 +551,25 @@ fn a_reorg_drops_what_the_orphaned_blocks_held_and_the_new_chain_is_scanned() {
     let accounts = vec![a.add(&db, 100), b.add(&db, 100)];
     write(&db, &accounts, pay_then_ring()(&a, &b), 100, true, None);
     assert_eq!(db.spends(accounts[0].id).unwrap().len(), 1);
-    assert!(db.block_hash(101).unwrap().is_some());
+    assert!(db.block_hash(Height::new(101)).unwrap().is_some());
 
     // Block 101 is orphaned: the spend goes, the outputs of 100 stay.
-    db.rewind(101).unwrap();
+    db.rewind(Height::new(101)).unwrap();
     assert!(db.spends(accounts[0].id).unwrap().is_empty());
     assert_eq!(db.txs(accounts[0].id).unwrap().len(), 1);
     assert_eq!(db.txs(accounts[0].id).unwrap()[0].total_sent, 0);
-    assert!(db.block_hash(101).unwrap().is_none());
-    assert_eq!(db.account(&a.address()).unwrap().unwrap().scan_height, 101);
+    assert!(db.block_hash(Height::new(101)).unwrap().is_none());
+    assert_eq!(db.account(&a.address()).unwrap().unwrap().scan_height, Height::new(101));
 
     // Then 100 too: and the new 100 pays `a` at another index.
-    db.rewind(100).unwrap();
+    db.rewind(Height::new(100)).unwrap();
     assert!(db.outputs(accounts[0].id).unwrap().is_empty());
     assert!(db.txs(accounts[0].id).unwrap().is_empty());
     let accounts: Vec<Account> = [&a, &b]
         .iter()
         .map(|w| db.account(&w.address()).unwrap().unwrap())
         .collect();
-    assert_eq!(accounts[0].scan_height, 100);
+    assert_eq!(accounts[0].scan_height, Height::new(100));
     let (_, k) = tx_key(90);
     let other = Tx::new(k, vec![stranger(1), stranger(2), a.pay(&k, 0, 0, 2, 555)]);
     let new_100 = block(100, [9; 32], dull_miner(100), vec![other.build()], 1_000, 1);
@@ -580,7 +581,7 @@ fn a_reorg_drops_what_the_orphaned_blocks_held_and_the_new_chain_is_scanned() {
         vec![(1_003, 555)]
     );
     assert!(db.outputs(accounts[1].id).unwrap().is_empty());
-    assert_eq!(db.block_hash(100).unwrap(), Some(hash));
+    assert_eq!(db.block_hash(Height::new(100)).unwrap(), Some(hash));
 }
 
 /// Every block's hash is kept while under `KEEP_HASHES` behind the tip (the
@@ -605,10 +606,10 @@ fn block_hashes_are_kept_behind_the_tip() {
     }
     let kept = db.recent_blocks().unwrap();
     const { assert!(crate::scanner::KEEP_HASHES > 250) };
-    assert_eq!(kept.first().unwrap().0, 250);
-    assert_eq!(kept.last().unwrap().0, 1);
+    assert_eq!(kept.first().unwrap().0, Height::new(250));
+    assert_eq!(kept.last().unwrap().0, Height::new(1));
     assert_eq!(kept.len(), 250);
-    assert_eq!(account.scan_height, 251);
+    assert_eq!(account.scan_height, Height::new(251));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -717,18 +718,18 @@ fn a_batch_leaves_alone_an_account_rescanned_or_hidden_meanwhile() {
     let accounts = vec![a.add(&db, 100), b.add(&db, 100), c.add(&db, 100)];
     // The batch is planned, then (while it is fetched) `a` is rescanned from 0
     // and `c` hidden.
-    db.rescan(&[a.address()], 0).unwrap();
+    db.rescan(&[a.address()], Height::new(0)).unwrap();
     db.set_status(&[c.address()], Status::Hidden).unwrap();
     write(&db, &accounts, pay_then_ring()(&a, &b), 100, true, Some(&every_hit));
     assert_eq!(
         db.account(&a.address()).unwrap().unwrap().scan_height,
-        0,
+        Height::ZERO,
         "the rescan holds"
     );
     assert!(db.outputs(accounts[0].id).unwrap().is_empty());
-    assert_eq!(db.account(&b.address()).unwrap().unwrap().scan_height, 102);
+    assert_eq!(db.account(&b.address()).unwrap().unwrap().scan_height, Height::new(102));
     assert_eq!(db.outputs(accounts[1].id).unwrap().len(), 1);
-    assert_eq!(db.account(&c.address()).unwrap().unwrap().scan_height, 100);
+    assert_eq!(db.account(&c.address()).unwrap().unwrap().scan_height, Height::new(100));
 }
 
 #[test]
@@ -757,9 +758,15 @@ fn an_account_joining_mid_batch_sees_only_its_own_blocks() {
         write(&db, &accounts, make(), 100, false, hits);
         assert_eq!(db.outputs(accounts[0].id).unwrap().len(), 3);
         let b_outs = db.outputs(accounts[1].id).unwrap();
-        assert_eq!(b_outs.iter().map(|o| o.height).collect::<Vec<_>>(), vec![102]);
-        assert_eq!(db.account(&b.address()).unwrap().unwrap().scan_height, 103);
-        assert!(db.block_hash(100).unwrap().is_none(), "a catch-up lane keeps no hashes");
+        assert_eq!(
+            b_outs.iter().map(|o| o.height).collect::<Vec<_>>(),
+            vec![Height::new(102)]
+        );
+        assert_eq!(db.account(&b.address()).unwrap().unwrap().scan_height, Height::new(103));
+        assert!(
+            db.block_hash(Height::new(100)).unwrap().is_none(),
+            "a catch-up lane keeps no hashes"
+        );
     }
 }
 
@@ -790,7 +797,7 @@ fn a_batch_cut_short_leaves_nothing_behind() {
             LOOKAHEAD,
             std::slice::from_ref(&account),
             &batch,
-            100,
+            Height::new(100),
             None,
             true,
         )?;
@@ -799,9 +806,9 @@ fn a_batch_cut_short_leaves_nothing_behind() {
     assert!(result.is_err());
     assert!(db.outputs(account.id).unwrap().is_empty());
     assert!(db.txs(account.id).unwrap().is_empty());
-    assert!(db.block_hash(100).unwrap().is_none());
+    assert!(db.block_hash(Height::new(100)).unwrap().is_none());
     assert_eq!(db.scanner_height().unwrap(), None);
-    assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, 100);
+    assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, Height::new(100));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -901,7 +908,10 @@ async fn login_starts_a_new_account_at_the_top_block() {
     assert!(made.new_address);
     assert_eq!(made.start_height, Some(999), "the top block, scanned too");
     let account = db.account(&w.address()).unwrap().unwrap();
-    assert_eq!((account.start_height, account.scan_height), (999, 999));
+    assert_eq!(
+        (account.start_height, account.scan_height),
+        (Height::new(999), Height::new(999))
+    );
     let again = unwrap(wallet::login(State(app.clone()), None, ApiJson(request(true))).await);
     assert!(!again.new_address);
     assert_eq!(again.start_height, Some(999));
@@ -929,7 +939,10 @@ async fn an_import_starts_the_account_at_block_zero() {
     let reply = unwrap(wallet::import_wallet_request(State(app.clone()), None, ApiJson(w.login())).await);
     assert!(reply.request_fulfilled && reply.new_request);
     let account = db.account(&w.address()).unwrap().unwrap();
-    assert_eq!((account.start_height, account.scan_height), (0, 0));
+    assert_eq!(
+        (account.start_height, account.scan_height),
+        (Height::ZERO, Height::ZERO)
+    );
     assert_eq!(info(&app, &w).await.start_height, 0);
     let again = unwrap(wallet::import_wallet_request(State(app.clone()), None, ApiJson(w.login())).await);
     assert!(!again.new_request, "already from 0: nothing more to do");
@@ -981,9 +994,16 @@ async fn a_mined_receive_comes_with_a_proof_of_its_block() {
         let (made, _, _) = paying_block(&w);
         let hash = made.block.block.hash();
         write(&db, &[account], vec![made], 100, true, hits);
-        let (kept_hash, blob) = db.kept_block(100).unwrap().expect("the paying block is kept");
+        let (kept_hash, blob) = db
+            .kept_block(Height::new(100))
+            .unwrap()
+            .expect("the paying block is kept");
         assert_eq!(kept_hash, hash);
-        assert_eq!(db.block_hash(100).unwrap(), Some(hash), "the hash the live lane keeps");
+        assert_eq!(
+            db.block_hash(Height::new(100)).unwrap(),
+            Some(hash),
+            "the hash the live lane keeps"
+        );
         assert_eq!(
             crate::proof::block_hash(&blob),
             Some(hash),
@@ -1013,9 +1033,12 @@ async fn proofs_are_kept_only_where_an_account_is_paid() {
     let accounts = vec![a.add(&db, 100), b.add(&db, 100)];
     // A catch-up lane (no hashes kept) keeps proofs all the same.
     write(&db, &accounts, pay_then_ring()(&a, &b), 100, false, Some(&every_hit));
-    assert!(db.block_hash(100).unwrap().is_none());
-    assert!(db.kept_block(100).unwrap().is_some(), "100 pays both");
-    assert!(db.kept_block(101).unwrap().is_none(), "101 only spends from a ring");
+    assert!(db.block_hash(Height::new(100)).unwrap().is_none());
+    assert!(db.kept_block(Height::new(100)).unwrap().is_some(), "100 pays both");
+    assert!(
+        db.kept_block(Height::new(101)).unwrap().is_none(),
+        "101 only spends from a ring"
+    );
     assert_eq!(db.kept_counts().unwrap(), (1, 1), "one transaction pays both");
     let app = app(db.clone(), 200);
     let served = txs(&app, &a).await;
@@ -1029,10 +1052,10 @@ async fn proofs_are_kept_only_where_an_account_is_paid() {
 
     // A rescan of one account leaves what the other still needs, and a
     // rescan of both lets it go.
-    db.rescan(&[a.address()], 0).unwrap();
+    db.rescan(&[a.address()], Height::new(0)).unwrap();
     assert_eq!(db.kept_counts().unwrap(), (1, 1));
     check_proof(&txs(&app, &b).await.transactions[0], block);
-    db.rescan(&[b.address()], 50).unwrap();
+    db.rescan(&[b.address()], Height::new(50)).unwrap();
     assert_eq!(db.kept_counts().unwrap(), (0, 0));
 }
 
@@ -1044,8 +1067,8 @@ async fn a_reorg_drops_the_kept_block_and_the_new_one_is_proved() {
     let (made, _, _) = paying_block(&w);
     write(&db, &[account], vec![made], 100, true, None);
     assert_eq!(db.kept_counts().unwrap(), (1, 1));
-    db.rewind(100).unwrap();
-    assert!(db.kept_block(100).unwrap().is_none());
+    db.rewind(Height::new(100)).unwrap();
+    assert!(db.kept_block(Height::new(100)).unwrap().is_none());
     assert_eq!(db.kept_counts().unwrap(), (0, 0));
 
     let account = db.account(&w.address()).unwrap().unwrap();
@@ -1054,7 +1077,7 @@ async fn a_reorg_drops_the_kept_block_and_the_new_one_is_proved() {
     let new_100 = block(100, [9; 32], dull_miner(100), vec![other.build()], 1_000, 1);
     let hash = new_100.block.block.hash();
     write(&db, &[account], vec![new_100], 100, true, None);
-    assert_eq!(db.kept_block(100).unwrap().map(|k| k.0), Some(hash));
+    assert_eq!(db.kept_block(Height::new(100)).unwrap().map(|k| k.0), Some(hash));
     let served = txs(&app(db, 200), &w).await;
     assert_eq!(served.transactions.len(), 1);
     check_proof(&served.transactions[0], hash);

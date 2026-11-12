@@ -27,6 +27,7 @@ use crate::decoys::Picker;
 use crate::lanes::Join;
 use crate::rest::{App, Config, Policy};
 use crate::scanner::{Batch, LaneConfig, Ring, ScanConfig, Scanner, record_batch};
+use crate::types::Height;
 
 /// A minor range, `lo <= hi`.
 pub fn mr(lo: u32, hi: u32) -> lws_api::MinorRange {
@@ -103,7 +104,7 @@ impl Wallet {
             &NewAccount {
                 address: self.address(),
                 view_key: self.view_key(),
-                start_height: start,
+                start_height: Height::new(start),
                 generated_locally: false,
             },
             Status::Active,
@@ -381,7 +382,16 @@ pub fn write(db: &Db, accounts: &[Account], blocks: Vec<Made>, start: u64, live:
         let w = ScanWriter::new(tx);
         let ring = Ring::get(&mut slot, tx, accounts, LOOKAHEAD, &monokulo_8ar::Arena::new())?;
         let hits = hits.map(|f| f(ring, &batch));
-        record_batch(&w, ring, LOOKAHEAD, accounts, &batch, start, hits.as_deref(), live)
+        record_batch(
+            &w,
+            ring,
+            LOOKAHEAD,
+            accounts,
+            &batch,
+            Height::new(start),
+            hits.as_deref(),
+            live,
+        )
     })
     .unwrap();
 }
@@ -511,7 +521,7 @@ pub fn app_with_node(db: Arc<Db>, chain_height: u64, node: &str) -> Arc<App> {
             },
         },
     );
-    scanner.status.write().unwrap().chain_height = chain_height;
+    scanner.status.write().unwrap().chain_height = Height::new(chain_height);
     Arc::new(App {
         db: crate::db::AsyncDb::new(db),
         daemon,

@@ -27,7 +27,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use crate::address::Address;
 use crate::error::{Error, Result, bad};
-use crate::types::{AccountId, OutputId, SqlU64, TxId};
+use crate::types::{AccountId, Height, OutputId, SqlU64, TxId};
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -150,8 +150,8 @@ pub struct Account {
     pub address: Address,
     pub view_key: PrivateViewKey,
     pub status: Status,
-    pub start_height: u64,
-    pub scan_height: u64,
+    pub start_height: Height,
+    pub scan_height: Height,
     pub access_time: u64,
     pub generated_locally: bool,
 }
@@ -162,7 +162,7 @@ pub struct Account {
 pub struct NewAccount {
     pub address: Address,
     pub view_key: PrivateViewKey,
-    pub start_height: u64,
+    pub start_height: Height,
     pub generated_locally: bool,
 }
 
@@ -172,7 +172,7 @@ pub struct TxRow {
     pub id: TxId,
     pub hash: [u8; 32],
     pub prefix_hash: [u8; 32],
-    pub height: u64,
+    pub height: Height,
     pub timestamp: u64,
     pub unlock_time: u64,
     pub coinbase: bool,
@@ -197,7 +197,7 @@ pub struct OutputRow {
     pub tx_pub_key: [u8; 32],
     /// The unencrypted RingCT mask; `None` for a pre-RingCT output.
     pub mask: Option<[u8; 32]>,
-    pub height: u64,
+    pub height: Height,
     pub maj: u32,
     pub min: u32,
     /// The Pedersen commitment the chain holds for the output (the RingCT
@@ -213,7 +213,7 @@ pub struct SpendRow {
     pub output: OutputId,
     pub key_image: [u8; 32],
     pub mixin: u32,
-    pub height: u64,
+    pub height: Height,
 }
 
 /// What a transaction is proved in: its block's blob, and for a transaction
@@ -233,7 +233,7 @@ pub type Pending = ([u8; 32], Vec<u8>, Vec<u8>);
 pub struct NewTx<'a> {
     pub hash: [u8; 32],
     pub prefix_hash: [u8; 32],
-    pub height: u64,
+    pub height: Height,
     pub timestamp: u64,
     pub unlock_time: u64,
     pub coinbase: bool,
@@ -250,7 +250,7 @@ pub struct NewOutput {
     pub public_key: [u8; 32],
     pub tx_pub_key: [u8; 32],
     pub mask: Option<[u8; 32]>,
-    pub height: u64,
+    pub height: Height,
     pub maj: u32,
     pub min: u32,
     pub commitment: Option<[u8; 32]>,
@@ -337,8 +337,8 @@ fn account_row(r: &rusqlite::Row) -> rusqlite::Result<Account> {
         address: r.get(1)?,
         view_key: view_key_col(r, 2)?,
         status: status_col(r, 3)?,
-        start_height: r.get::<_, i64>(4)? as u64,
-        scan_height: r.get::<_, i64>(5)? as u64,
+        start_height: r.get(4)?,
+        scan_height: r.get(5)?,
         access_time: r.get::<_, i64>(6)? as u64,
         generated_locally: r.get::<_, i64>(7)? != 0,
     })
@@ -646,7 +646,7 @@ impl Db {
     }
 
     /// Scan these accounts again from `height`: their rows from there on go.
-    pub fn rescan(&self, addresses: &[Address], height: u64) -> Result<Vec<Address>> {
+    pub fn rescan(&self, addresses: &[Address], height: Height) -> Result<Vec<Address>> {
         self.write(|tx| rescan_in(tx, addresses, height))
     }
 
@@ -663,13 +663,13 @@ impl Db {
                     .optional()?;
                 tx.execute("DELETE FROM requests WHERE address = ?1", [a])?;
                 let Some(id) = id else { continue };
-                delete_account_from(tx, id, 0)?;
+                delete_account_from(tx, id, Height::ZERO)?;
                 tx.execute("DELETE FROM subaddrs WHERE account = ?1", [id])?;
                 tx.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
                 done.push(a.clone());
             }
             if !done.is_empty() {
-                drop_unused_kept(tx, 0)?;
+                drop_unused_kept(tx, Height::ZERO)?;
             }
             Ok(done)
         })
@@ -849,24 +849,22 @@ impl Db {
 
     // ---- blocks ----
 
-    pub fn block_hash(&self, height: u64) -> Result<Option<[u8; 32]>> {
+    pub fn block_hash(&self, height: Height) -> Result<Option<[u8; 32]>> {
         self.read(|c| {
-            Ok(
-                c.query_row("SELECT hash FROM blocks WHERE height = ?1", [height as i64], |r| {
-                    r.get::<_, Vec<u8>>(0)
-                })
-                .optional()?
-                .map(blob32)
-                .transpose()?,
-            )
+            Ok(c.query_row("SELECT hash FROM blocks WHERE height = ?1", [height], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .optional()?
+            .map(blob32)
+            .transpose()?)
         })
     }
 
-    pub fn recent_blocks(&self) -> Result<Vec<(u64, [u8; 32])>> {
+    pub fn recent_blocks(&self) -> Result<Vec<(Height, [u8; 32])>> {
         self.read(|c| {
             let mut st = c.prepare("SELECT height, hash FROM blocks ORDER BY height DESC")?;
             let rows = st
-                .query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, blob32(r.get(1)?)?)))?
+                .query_map([], |r| Ok((r.get(0)?, blob32(r.get(1)?)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -874,20 +872,21 @@ impl Db {
 
     /// The scanner's own height: the block after the last one it finished.
     #[cfg(test)]
-    pub fn scanner_height(&self) -> Result<Option<u64>> {
+    pub fn scanner_height(&self) -> Result<Option<Height>> {
         self.read(|c| {
             Ok(
                 c.query_row("SELECT value FROM meta WHERE key = 'scanner_height'", [], |r| {
                     r.get::<_, String>(0)
                 })
                 .optional()?
-                .and_then(|s| s.parse().ok()),
+                .and_then(|s| s.parse().ok())
+                .map(Height::new),
             )
         })
     }
 
     /// Forget everything from `height` on: a reorg went deeper than it.
-    pub fn rewind(&self, height: u64) -> Result<()> {
+    pub fn rewind(&self, height: Height) -> Result<()> {
         self.write(|tx| rewind_in(tx, height))
     }
 
@@ -900,25 +899,25 @@ impl Db {
 
     /// The lowest kept height, if scanning is stopped for a reorg deeper
     /// than the kept hashes (`halt`).
-    pub fn halted(&self) -> Result<Option<u64>> {
-        self.read(|c| meta_u64(c, "halted_below"))
+    pub fn halted(&self) -> Result<Option<Height>> {
+        self.read(|c| Ok(meta_u64(c, "halted_below")?.map(Height::new)))
     }
 
     /// Stops scanning for a reorg deeper than the kept hashes, the lowest of
     /// which is at `lowest`; kept across restarts until `resume`. Nothing is
     /// rewound: below `lowest` the server can't tell which rows are from the
     /// orphaned chain, so the operator rescans.
-    pub fn halt(&self, lowest: u64) -> Result<()> {
+    pub fn halt(&self, lowest: Height) -> Result<()> {
         self.write(|tx| {
             bump_generation(tx)?;
-            set_meta(tx, "halted_below", lowest)
+            set_meta(tx, "halted_below", lowest.get())
         })
     }
 
     /// Scanning goes on after `halt(lowest)`, the accounts having been
     /// rescanned from below it: everything from `lowest` on, all of it from
     /// the orphaned chain (the hashes kept there among it), goes.
-    pub fn resume(&self, lowest: u64) -> Result<()> {
+    pub fn resume(&self, lowest: Height) -> Result<()> {
         self.write(|tx| {
             rewind_in(tx, lowest)?;
             tx.execute("DELETE FROM meta WHERE key = 'halted_below'", [])?;
@@ -981,7 +980,7 @@ impl Db {
                 tx.execute("DELETE FROM txs_kept WHERE hash = ?1", [hash.as_slice()])?;
             }
             if !dropped.is_empty() {
-                drop_unused_kept(tx, 0)?;
+                drop_unused_kept(tx, Height::ZERO)?;
             }
             Ok(())
         })
@@ -989,14 +988,14 @@ impl Db {
 
     /// The block kept for proofs at `height`: its hash and blob.
     #[cfg(test)]
-    pub fn kept_block(&self, height: u64) -> Result<Option<([u8; 32], Vec<u8>)>> {
+    pub fn kept_block(&self, height: Height) -> Result<Option<([u8; 32], Vec<u8>)>> {
         self.read(|c| {
-            Ok(c.query_row(
-                "SELECT hash, blob FROM blocks_kept WHERE height = ?1",
-                [height as i64],
-                |r| Ok((blob32(r.get(0)?)?, r.get(1)?)),
+            Ok(
+                c.query_row("SELECT hash, blob FROM blocks_kept WHERE height = ?1", [height], |r| {
+                    Ok((blob32(r.get(0)?)?, r.get(1)?))
+                })
+                .optional()?,
             )
-            .optional()?)
         })
     }
 
@@ -1077,7 +1076,7 @@ fn txs_in(c: &Connection, account: AccountId) -> Result<Vec<TxRow>> {
                 id: r.get(0)?,
                 hash: blob32(r.get(1)?)?,
                 prefix_hash: blob32(r.get(2)?)?,
-                height: r.get::<_, i64>(3)? as u64,
+                height: r.get(3)?,
                 timestamp: r.get::<_, i64>(4)? as u64,
                 unlock_time: r.get::<_, i64>(5)? as u64,
                 coinbase: r.get::<_, i64>(6)? != 0,
@@ -1103,7 +1102,7 @@ fn spends_in(c: &Connection, account: AccountId) -> Result<Vec<SpendRow>> {
                 output: r.get(1)?,
                 key_image: blob32(r.get(2)?)?,
                 mixin: r.get::<_, i64>(3)? as u32,
-                height: r.get::<_, i64>(4)? as u64,
+                height: r.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1144,10 +1143,14 @@ fn account_id(c: &Connection, address: &Address) -> Result<Option<AccountId>> {
     )
 }
 
-/// A height as SQLite stores it. One past `i64::MAX` would be stored
-/// negative (and `u64::MAX` read back from -1), so it is refused: 400.
-fn sql_height(height: u64) -> Result<i64> {
-    i64::try_from(height).map_err(|_| bad(format!("a height must be at most {}", i64::MAX)))
+/// A height asked for by a client or the admin, refused with a 400 past
+/// what SQLite stores (`Height`'s `ToSql` would refuse it too, but as the
+/// server's own failure).
+fn sql_height(height: Height) -> Result<Height> {
+    if height > Height::MAX_STORED {
+        return Err(bad(format!("a height must be at most {}", Height::MAX_STORED)));
+    }
+    Ok(height)
 }
 
 /// Adds an account inside `tx`; `Err(Conflict)` if the address is already here.
@@ -1179,7 +1182,7 @@ fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<
 }
 
 /// [`Db::rescan`] inside `tx`.
-fn rescan_in(tx: &Transaction, addresses: &[Address], height: u64) -> Result<Vec<Address>> {
+fn rescan_in(tx: &Transaction, addresses: &[Address], height: Height) -> Result<Vec<Address>> {
     let h = sql_height(height)?;
     let mut done = vec![];
     for a in addresses {
@@ -1197,7 +1200,7 @@ fn rescan_in(tx: &Transaction, addresses: &[Address], height: u64) -> Result<Vec
 
 /// [`Db::import`] inside `tx`.
 fn import_in(tx: &Transaction, addresses: &[Address]) -> Result<Vec<Address>> {
-    let done = rescan_in(tx, addresses, 0)?;
+    let done = rescan_in(tx, addresses, Height::ZERO)?;
     for a in &done {
         tx.execute("UPDATE accounts SET start_height = 0 WHERE address = ?1", [a])?;
     }
@@ -1213,7 +1216,7 @@ fn request_row(r: &rusqlite::Row) -> rusqlite::Result<(RequestKind, NewAccount)>
         NewAccount {
             address: r.get(1)?,
             view_key: view_key_col(r, 2)?,
-            start_height: r.get::<_, i64>(3)? as u64,
+            start_height: r.get(3)?,
             generated_locally: r.get::<_, i64>(4)? != 0,
         },
     ))
@@ -1321,7 +1324,7 @@ fn outputs_in(c: &Connection, account: AccountId) -> Result<Vec<OutputRow>> {
                 public_key: blob32(r.get(5)?)?,
                 tx_pub_key: blob32(r.get(6)?)?,
                 mask: r.get::<_, Option<Vec<u8>>>(7)?.map(blob32).transpose()?,
-                height: r.get::<_, i64>(8)? as u64,
+                height: r.get(8)?,
                 maj: r.get(9)?,
                 min: r.get(10)?,
                 commitment: r.get::<_, Option<Vec<u8>>>(11)?.map(blob32).transpose()?,
@@ -1331,8 +1334,7 @@ fn outputs_in(c: &Connection, account: AccountId) -> Result<Vec<OutputRow>> {
     Ok(rows)
 }
 
-fn delete_account_from(tx: &Transaction, account: AccountId, height: u64) -> Result<()> {
-    let h = height as i64;
+fn delete_account_from(tx: &Transaction, account: AccountId, h: Height) -> Result<()> {
     tx.execute(
         "DELETE FROM spends WHERE account = ?1 AND height >= ?2",
         params![account, h],
@@ -1351,8 +1353,7 @@ fn delete_account_from(tx: &Transaction, account: AccountId, height: u64) -> Res
 /// Forgets what proofs were kept from `height` on that no transaction row
 /// needs any more (after a rescan dropped an account's rows; other accounts
 /// may still need the same block or transaction).
-fn drop_unused_kept(tx: &Transaction, height: u64) -> Result<()> {
-    let h = height as i64;
+fn drop_unused_kept(tx: &Transaction, h: Height) -> Result<()> {
     tx.execute(
         "DELETE FROM txs_kept WHERE height >= ?1 AND hash NOT IN (SELECT hash FROM txs WHERE height >= ?1)",
         [h],
@@ -1370,8 +1371,7 @@ fn drop_unused_kept(tx: &Transaction, height: u64) -> Result<()> {
 /// reorg. The totals of the transactions left need no recomputing: an
 /// output or spend is written at its transaction's height, so every one
 /// deleted belonged to a transaction deleted with it.
-fn rewind_in(tx: &Transaction, height: u64) -> Result<()> {
-    let h = height as i64;
+fn rewind_in(tx: &Transaction, h: Height) -> Result<()> {
     tx.execute("DELETE FROM spends WHERE height >= ?1", [h])?;
     tx.execute("DELETE FROM outputs WHERE height >= ?1", [h])?;
     tx.execute("DELETE FROM txs WHERE height >= ?1", [h])?;
@@ -1379,7 +1379,7 @@ fn rewind_in(tx: &Transaction, height: u64) -> Result<()> {
     tx.execute("DELETE FROM blocks_kept WHERE height >= ?1", [h])?;
     tx.execute("DELETE FROM txs_kept WHERE height >= ?1", [h])?;
     tx.execute("UPDATE accounts SET scan_height = MIN(scan_height, ?1)", [h])?;
-    set_meta(tx, "scanner_height", height)?;
+    set_meta(tx, "scanner_height", h.get())?;
     bump_generation(tx)
 }
 
@@ -1421,18 +1421,16 @@ impl<'a> ScanWriter<'a> {
         ScanWriter { tx }
     }
 
-    pub fn set_block(&self, height: u64, hash: &[u8; 32], keep: u64) -> Result<()> {
+    pub fn set_block(&self, height: Height, hash: &[u8; 32], keep: u64) -> Result<()> {
         self.tx.execute(
             "INSERT OR REPLACE INTO blocks (height, hash) VALUES (?1, ?2)",
-            params![height as i64, hash.as_slice()],
+            params![height, hash.as_slice()],
         )?;
-        self.tx.execute(
-            "DELETE FROM blocks WHERE height < ?1",
-            [height.saturating_sub(keep) as i64],
-        )?;
+        self.tx
+            .execute("DELETE FROM blocks WHERE height < ?1", [height.saturating_sub(keep)])?;
         self.tx.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('scanner_height', ?1)",
-            [(height + 1).to_string()],
+            [height.next().to_string()],
         )?;
         Ok(())
     }
@@ -1440,19 +1438,19 @@ impl<'a> ScanWriter<'a> {
     /// Keeps a block's hash, as a catch-up lane does near the tip: no older
     /// hashes are dropped and the scanner's own height doesn't move, as
     /// both are the live lane's.
-    pub fn keep_hash(&self, height: u64, hash: &[u8; 32]) -> Result<()> {
+    pub fn keep_hash(&self, height: Height, hash: &[u8; 32]) -> Result<()> {
         self.tx.execute(
             "INSERT OR REPLACE INTO blocks (height, hash) VALUES (?1, ?2)",
-            params![height as i64, hash.as_slice()],
+            params![height, hash.as_slice()],
         )?;
         Ok(())
     }
 
     /// The hash kept for `height`, as this transaction sees it.
-    pub fn block_hash(&self, height: u64) -> Result<Option<[u8; 32]>> {
+    pub fn block_hash(&self, height: Height) -> Result<Option<[u8; 32]>> {
         Ok(self
             .tx
-            .query_row("SELECT hash FROM blocks WHERE height = ?1", [height as i64], |r| {
+            .query_row("SELECT hash FROM blocks WHERE height = ?1", [height], |r| {
                 r.get::<_, Vec<u8>>(0)
             })
             .optional()?
@@ -1467,10 +1465,10 @@ impl<'a> ScanWriter<'a> {
 
     /// Keeps a block that pays an account, for proofs: its hash and its blob
     /// as the node sent it.
-    pub fn keep_block(&self, height: u64, hash: &[u8; 32], blob: &[u8]) -> Result<()> {
+    pub fn keep_block(&self, height: Height, hash: &[u8; 32], blob: &[u8]) -> Result<()> {
         self.tx.execute(
             "INSERT OR REPLACE INTO blocks_kept (height, hash, blob) VALUES (?1, ?2, ?3)",
-            params![height as i64, hash.as_slice(), blob],
+            params![height, hash.as_slice(), blob],
         )?;
         Ok(())
     }
@@ -1478,7 +1476,7 @@ impl<'a> ScanWriter<'a> {
     /// Keeps a transaction that pays an account (not a miner transaction,
     /// which its block holds), for proofs: its pruned parts. A prunable hash
     /// already settled stays when the same transaction comes again without.
-    pub fn keep_tx(&self, hash: &[u8; 32], height: u64, parts: &crate::proof::TxParts) -> Result<()> {
+    pub fn keep_tx(&self, hash: &[u8; 32], height: Height, parts: &crate::proof::TxParts) -> Result<()> {
         self.tx.execute(
             "INSERT INTO txs_kept (hash, height, prefix, rct_base, prunable_hash) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(hash) DO UPDATE SET height = excluded.height, prefix = excluded.prefix,
@@ -1486,7 +1484,7 @@ impl<'a> ScanWriter<'a> {
                  prunable_hash = COALESCE(excluded.prunable_hash, txs_kept.prunable_hash)",
             params![
                 hash.as_slice(),
-                height as i64,
+                height,
                 parts.prefix,
                 parts.rct_base,
                 parts.prunable_hash.as_ref().map(|h| h.as_slice())
@@ -1498,21 +1496,21 @@ impl<'a> ScanWriter<'a> {
     /// Where `account` stands now, and whether it is still scanned: what a
     /// batch checks before writing, as the account may have been rescanned,
     /// rewound or hidden while the batch was fetched.
-    pub fn standing(&self, account: AccountId) -> Result<Option<(u64, Status)>> {
+    pub fn standing(&self, account: AccountId) -> Result<Option<(Height, Status)>> {
         Ok(self
             .tx
             .query_row(
                 "SELECT scan_height, status FROM accounts WHERE id = ?1",
                 [account],
-                |r| Ok((r.get::<_, i64>(0)? as u64, status_col(r, 1)?)),
+                |r| Ok((r.get(0)?, status_col(r, 1)?)),
             )
             .optional()?)
     }
 
-    pub fn set_scan_height(&self, account: AccountId, height: u64) -> Result<()> {
+    pub fn set_scan_height(&self, account: AccountId, height: Height) -> Result<()> {
         self.tx.execute(
             "UPDATE accounts SET scan_height = ?1 WHERE id = ?2",
-            params![height as i64, account],
+            params![height, account],
         )?;
         Ok(())
     }
@@ -1525,7 +1523,7 @@ impl<'a> ScanWriter<'a> {
                 account,
                 new.hash.as_slice(),
                 new.prefix_hash.as_slice(),
-                new.height as i64,
+                new.height,
                 new.timestamp as i64,
                 new.unlock_time as i64,
                 new.coinbase as i64,
@@ -1557,7 +1555,7 @@ impl<'a> ScanWriter<'a> {
                 o.public_key.as_slice(),
                 o.tx_pub_key.as_slice(),
                 o.mask.as_ref().map(|m| m.as_slice()),
-                o.height as i64,
+                o.height,
                 o.maj,
                 o.min,
                 o.commitment.as_ref().map(|c| c.as_slice())
@@ -1602,11 +1600,11 @@ impl<'a> ScanWriter<'a> {
         amount: u64,
         key_image: &[u8; 32],
         mixin: u32,
-        height: u64,
+        height: Height,
     ) -> Result<()> {
         let changed = self.tx.execute(
             "INSERT OR IGNORE INTO spends (account, tx, output, key_image, mixin, height) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![account, tx, output, key_image.as_slice(), mixin, height as i64],
+            params![account, tx, output, key_image.as_slice(), mixin, height],
         )?;
         if changed > 0 {
             self.add_to_total(Total::Sent, tx, amount)?;
@@ -1639,7 +1637,7 @@ mod tests {
             &NewAccount {
                 address: addr("A"),
                 view_key: PrivateViewKey::from_bytes(&[1; 32]),
-                start_height: 10,
+                start_height: Height::new(10),
                 generated_locally: false,
             },
             Status::Active,
@@ -1651,13 +1649,13 @@ mod tests {
     fn accounts_round_trip() {
         let db = Db::in_memory();
         let a = acct(&db);
-        assert_eq!(a.scan_height, 10);
+        assert_eq!(a.scan_height, Height::new(10));
         assert!(
             db.add_account(
                 &NewAccount {
                     address: addr("A"),
                     view_key: PrivateViewKey::from_bytes(&[1; 32]),
-                    start_height: 0,
+                    start_height: Height::new(0),
                     generated_locally: false
                 },
                 Status::Active
@@ -1770,7 +1768,7 @@ mod tests {
                 &NewTx {
                     hash: [9; 32],
                     prefix_hash: [8; 32],
-                    height: 12,
+                    height: Height::new(12),
                     timestamp: 5,
                     unlock_time: 0,
                     coinbase: false,
@@ -1791,7 +1789,7 @@ mod tests {
                         public_key: [4; 32],
                         tx_pub_key: [7; 32],
                         mask: Some([5; 32]),
-                        height: 12,
+                        height: Height::new(12),
                         maj: 0,
                         min: 0,
                         commitment: None
@@ -1810,7 +1808,7 @@ mod tests {
                         public_key: [4; 32],
                         tx_pub_key: [7; 32],
                         mask: Some([5; 32]),
-                        height: 12,
+                        height: Height::new(12),
                         maj: 0,
                         min: 0,
                         commitment: None
@@ -1823,7 +1821,7 @@ mod tests {
                 &NewTx {
                     hash: [10; 32],
                     prefix_hash: [8; 32],
-                    height: 14,
+                    height: Height::new(14),
                     timestamp: 6,
                     unlock_time: 0,
                     coinbase: false,
@@ -1835,9 +1833,9 @@ mod tests {
             )?;
             let owned = w.owned_indexes(a.id)?;
             let o = &owned[&100];
-            w.add_spend(a.id, t2, o.id, o.amount, &[6; 32], 15, 14)?;
-            w.set_block(14, &[1; 32], 100)?;
-            w.set_scan_height(a.id, 15)?;
+            w.add_spend(a.id, t2, o.id, o.amount, &[6; 32], 15, Height::new(14))?;
+            w.set_block(Height::new(14), &[1; 32], 100)?;
+            w.set_scan_height(a.id, Height::new(15))?;
             Ok(())
         })
         .unwrap();
@@ -1846,22 +1844,22 @@ mod tests {
         assert_eq!(txs[0].total_received, 50);
         assert_eq!(txs[1].total_sent, 50);
         assert_eq!(db.spends(a.id).unwrap().len(), 1);
-        assert_eq!(db.scanner_height().unwrap(), Some(15));
-        db.rewind(13).unwrap();
+        assert_eq!(db.scanner_height().unwrap(), Some(Height::new(15)));
+        db.rewind(Height::new(13)).unwrap();
         assert_eq!(db.txs(a.id).unwrap().len(), 1);
         assert!(db.spends(a.id).unwrap().is_empty());
-        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, 13);
-        assert_eq!(db.scanner_height().unwrap(), Some(13));
-        db.rescan(&[addr("A")], 0).unwrap();
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, Height::new(13));
+        assert_eq!(db.scanner_height().unwrap(), Some(Height::new(13)));
+        db.rescan(&[addr("A")], Height::new(0)).unwrap();
         assert!(db.outputs(a.id).unwrap().is_empty());
-        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, 0);
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, Height::new(0));
     }
 
     fn new_tx(hash: u8, height: u64) -> NewTx<'static> {
         NewTx {
             hash: [hash; 32],
             prefix_hash: [0; 32],
-            height,
+            height: Height::new(height),
             timestamp: 0,
             unlock_time: 0,
             coinbase: false,
@@ -1880,7 +1878,7 @@ mod tests {
             public_key: [key; 32],
             tx_pub_key: [0; 32],
             mask: Some([1; 32]),
-            height,
+            height: Height::new(height),
             maj: 0,
             min: 0,
             commitment: None,
@@ -1893,14 +1891,14 @@ mod tests {
         db.write(|tx| {
             let w = ScanWriter::new(tx);
             for h in 1..=30 {
-                w.set_block(h, &[h as u8; 32], 10)?;
+                w.set_block(Height::new(h), &[h as u8; 32], 10)?;
             }
             Ok(())
         })
         .unwrap();
         let kept = db.recent_blocks().unwrap();
         assert_eq!(kept.len(), 11);
-        assert_eq!((kept[0].0, kept[10].0), (30, 20));
+        assert_eq!((kept[0].0, kept[10].0), (Height::new(30), Height::new(20)));
     }
 
     /// A rewind and a stop for a reorg too deep each count a reorg; a stop
@@ -1916,25 +1914,25 @@ mod tests {
             let t = w.tx_row(a.id, &new_tx(1, 20))?;
             w.add_output(a.id, t, &new_output(1, 100, 5, 20))?;
             for h in 15..=25 {
-                w.set_block(h, &[h as u8; 32], 100)?;
+                w.set_block(Height::new(h), &[h as u8; 32], 100)?;
             }
-            w.set_scan_height(a.id, 26)?;
+            w.set_scan_height(a.id, Height::new(26))?;
             Ok(())
         })
         .unwrap();
         assert_eq!(db.reorg_generation().unwrap(), 0);
-        db.rewind(24).unwrap();
+        db.rewind(Height::new(24)).unwrap();
         assert_eq!(db.reorg_generation().unwrap(), 1);
         assert_eq!(db.halted().unwrap(), None);
-        db.halt(15).unwrap();
+        db.halt(Height::new(15)).unwrap();
         assert_eq!(db.reorg_generation().unwrap(), 2);
-        assert_eq!(db.halted().unwrap(), Some(15));
+        assert_eq!(db.halted().unwrap(), Some(Height::new(15)));
         assert_eq!(db.outputs(a.id).unwrap().len(), 1, "a stop rewinds nothing");
-        db.resume(15).unwrap();
+        db.resume(Height::new(15)).unwrap();
         assert_eq!(db.halted().unwrap(), None);
         assert!(db.recent_blocks().unwrap().is_empty());
         assert!(db.outputs(a.id).unwrap().is_empty());
-        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, 15);
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, Height::new(15));
     }
 
     /// A rewind leaves the totals of the transactions before it as they
@@ -1950,10 +1948,10 @@ mod tests {
             let o30 = w.add_output(a.id, t1, &new_output(2, 101, 30, 10))?.unwrap();
             let t2 = w.tx_row(a.id, &new_tx(2, 11))?;
             w.add_output(a.id, t2, &new_output(3, 102, 5, 11))?;
-            w.add_spend(a.id, t2, o70, 70, &[7; 32], 15, 11)?;
+            w.add_spend(a.id, t2, o70, 70, &[7; 32], 15, Height::new(11))?;
             let t3 = w.tx_row(a.id, &new_tx(3, 20))?;
             w.add_output(a.id, t3, &new_output(4, 103, 9, 20))?;
-            w.add_spend(a.id, t3, o30, 30, &[8; 32], 15, 20)?;
+            w.add_spend(a.id, t3, o30, 30, &[8; 32], 15, Height::new(20))?;
             Ok(())
         })
         .unwrap();
@@ -1961,11 +1959,11 @@ mod tests {
             db.txs(a.id)
                 .unwrap()
                 .iter()
-                .map(|t| (t.height, t.total_received, t.total_sent))
+                .map(|t| (t.height.get(), t.total_received, t.total_sent))
                 .collect()
         };
         assert_eq!(totals(&db), vec![(10, 100, 0), (11, 5, 70), (20, 9, 30)]);
-        db.rewind(15).unwrap();
+        db.rewind(Height::new(15)).unwrap();
         assert_eq!(totals(&db), vec![(10, 100, 0), (11, 5, 70)]);
         assert_eq!(db.spends(a.id).unwrap().len(), 1);
     }

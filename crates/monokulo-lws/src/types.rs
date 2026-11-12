@@ -114,6 +114,87 @@ row_id!(
     OutputId
 );
 
+/// A block height: the number of blocks below it, so the genesis block is
+/// at 0 and a chain of `n` blocks has its top at `n - 1`.
+///
+/// There is no `+` or `-`: a step past either end is spelled out at the
+/// call site, as `checked_*` (the caller says what an overflow means) or
+/// `saturating_*` (the end is where it stops).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct Height(u64);
+
+impl Height {
+    pub const ZERO: Height = Height(0);
+    pub const MAX: Height = Height(u64::MAX);
+    /// The highest height the database stores (SQLite's INTEGER is an i64).
+    pub const MAX_STORED: Height = Height(i64::MAX.unsigned_abs());
+
+    pub const fn new(v: u64) -> Height {
+        Height(v)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The height after this one, stopping at `u64::MAX` (which no chain
+    /// reaches, and which the database refuses).
+    pub const fn next(self) -> Height {
+        Height(self.0.saturating_add(1))
+    }
+
+    /// The height before this one; `None` below the genesis block.
+    pub fn prev(self) -> Option<Height> {
+        self.checked_sub(1)
+    }
+
+    pub fn checked_add(self, blocks: u64) -> Option<Height> {
+        self.0.checked_add(blocks).map(Height)
+    }
+
+    pub const fn saturating_add(self, blocks: u64) -> Height {
+        Height(self.0.saturating_add(blocks))
+    }
+
+    pub fn checked_sub(self, blocks: u64) -> Option<Height> {
+        self.0.checked_sub(blocks).map(Height)
+    }
+
+    pub const fn saturating_sub(self, blocks: u64) -> Height {
+        Height(self.0.saturating_sub(blocks))
+    }
+
+    /// Blocks from `earlier` up to this height; `None` if `earlier` is above it.
+    pub fn since(self, earlier: Height) -> Option<u64> {
+        self.0.checked_sub(earlier.0)
+    }
+
+    /// The height `i` blocks on, for the `i`th block of a batch from here;
+    /// `None` past `u64::MAX`.
+    pub fn offset(self, i: usize) -> Option<Height> {
+        u64::try_from(i).ok().and_then(|i| self.checked_add(i))
+    }
+}
+
+impl fmt::Display for Height {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl ToSql for Height {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        u64_to_sql(self.0)
+    }
+}
+
+impl FromSql for Height {
+    fn column_result(v: ValueRef<'_>) -> FromSqlResult<Self> {
+        u64_from_sql(v).map(Height)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +232,33 @@ mod tests {
         assert!(c.query_row("SELECT v FROM t", [], |r| r.get::<_, OutputId>(0)).is_err());
         assert!(OutputId::from_rowid(-1).is_err());
         assert_eq!(OutputId::from_rowid(7).unwrap(), OutputId::new(7));
+        assert!(c.query_row("SELECT v FROM t", [], |r| r.get::<_, Height>(0)).is_err());
+    }
+
+    /// Heights past the database's range are refused on write; the steps
+    /// past either end are explicit.
+    #[test]
+    fn heights_store_checked_and_step_explicitly() {
+        let c = conn();
+        assert!(
+            c.execute("INSERT INTO t VALUES (?1)", [Height::MAX_STORED.next()])
+                .is_err()
+        );
+        assert!(c.execute("INSERT INTO t VALUES (?1)", [Height::MAX]).is_err());
+        c.execute("INSERT INTO t VALUES (?1)", [Height::MAX_STORED]).unwrap();
+        let back: Height = c.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(back, Height::MAX_STORED);
+
+        assert_eq!(Height::ZERO.prev(), None);
+        assert_eq!(Height::ZERO.checked_sub(1), None);
+        assert_eq!(Height::ZERO.saturating_sub(10), Height::ZERO);
+        assert_eq!(Height::new(5).saturating_sub(10), Height::ZERO);
+        assert_eq!(Height::new(5).prev(), Some(Height::new(4)));
+        assert_eq!(Height::MAX.next(), Height::MAX);
+        assert_eq!(Height::MAX.checked_add(1), None);
+        assert_eq!(Height::MAX.offset(1), None);
+        assert_eq!(Height::new(10).offset(3), Some(Height::new(13)));
+        assert_eq!(Height::new(10).since(Height::new(4)), Some(6));
+        assert_eq!(Height::new(4).since(Height::new(10)), None);
     }
 }

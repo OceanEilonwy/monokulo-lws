@@ -508,7 +508,10 @@ fn admin(command: AdminCommand) -> anyhow::Result<()> {
             };
             let key = lws_api::PrivateViewKey::from_hex(&view_key).context("the view key must be 64 hex characters")?;
             let checked = crypto::check_login(network, &address, key)?;
-            let account = db.add_account(&checked.into_new_account(start_height, false), Status::Active)?;
+            let account = db.add_account(
+                &checked.into_new_account(types::Height::new(start_height), false),
+                Status::Active,
+            )?;
             println!(
                 "added {} from height {}",
                 account.address.as_str(),

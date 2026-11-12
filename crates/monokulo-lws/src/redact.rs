@@ -49,6 +49,7 @@ impl fmt::Debug for Checked {
 mod tests {
     use super::*;
     use crate::db::Status;
+    use crate::types::Height;
     use lws_api::PrivateViewKey;
 
     #[test]
@@ -60,15 +61,15 @@ mod tests {
             address: address.clone(),
             view_key: PrivateViewKey::from_bytes(&key),
             status: Status::Active,
-            start_height: 1,
-            scan_height: 2,
+            start_height: Height::new(1),
+            scan_height: Height::new(2),
             access_time: 3,
             generated_locally: false,
         };
         let new = NewAccount {
             address: address.clone(),
             view_key: PrivateViewKey::from_bytes(&key),
-            start_height: 1,
+            start_height: Height::new(1),
             generated_locally: true,
         };
         let checked = Checked::unchecked(address.clone(), PrivateViewKey::from_bytes(&key));

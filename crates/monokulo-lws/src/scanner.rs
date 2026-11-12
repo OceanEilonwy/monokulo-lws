@@ -41,7 +41,7 @@ use crate::daemon::{Daemon, Fetched, RawBlock};
 use crate::db::{Account, Db, NewOutput, NewTx, OutputRow, ScanWriter, Status};
 use crate::error::{Error, Result};
 use crate::lanes::{Join, Plan};
-use crate::types::{AccountId, OutputId};
+use crate::types::{AccountId, Height, OutputId};
 
 /// Blocks the live lane asks for in one request.
 const BATCH: u64 = 100;
@@ -61,9 +61,9 @@ pub const COINBASE_AGE: u64 = 60;
 #[derive(Clone, Debug, Default)]
 pub struct ScanStatus {
     /// The daemon's chain height, as last heard.
-    pub chain_height: u64,
+    pub chain_height: Height,
     /// The next block the live lane (or the single loop) will take.
-    pub scanner_height: u64,
+    pub scanner_height: Height,
     pub last_error: Option<String>,
     pub last_step: Option<Instant>,
     /// The catch-up lanes running.
@@ -74,7 +74,7 @@ pub struct ScanStatus {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct LaneStatus {
     pub id: u64,
-    pub cursor: u64,
+    pub cursor: Height,
     pub accounts: usize,
 }
 
@@ -420,13 +420,13 @@ pub struct Scanner {
 /// Reorgs in a row that ended at the same fork.
 #[derive(Debug, Default)]
 struct ReorgStreak {
-    fork: Option<u64>,
+    fork: Option<Height>,
     count: u32,
 }
 
 impl ReorgStreak {
     /// Counts a reorg unwound to `fork`: how many in a row ended there.
-    fn note(&mut self, fork: u64) -> u32 {
+    fn note(&mut self, fork: Height) -> u32 {
         if self.fork == Some(fork) {
             self.count = self.count.saturating_add(1);
         } else {
@@ -552,7 +552,7 @@ impl Scanner {
     pub async fn step(self: &Arc<Self>) -> Result<bool> {
         let info = self.daemon.info().await?;
         let chain_height = info.height;
-        if chain_height == 0 {
+        if chain_height == Height::ZERO {
             // Even a new chain has its genesis block.
             return Err(Error::Daemon("the node says it has no blocks".into()));
         }
@@ -590,7 +590,7 @@ impl Scanner {
                 .map(|a| a.scan_height)
                 .min()
                 .unwrap_or(chain_height)
-                .max(1);
+                .max(Height::new(1));
             (active, start)
         } else {
             self.live_accounts(active, chain_height)
@@ -599,7 +599,7 @@ impl Scanner {
         if accounts.is_empty() {
             return Ok(false);
         }
-        let kept_top = match chain_height.checked_sub(1) {
+        let kept_top = match chain_height.prev() {
             Some(top) if start == chain_height => self.db.call(move |db| db.block_hash(top)).await?,
             _ => None,
         };
@@ -621,7 +621,8 @@ impl Scanner {
             return Ok(false);
         }
 
-        let count = BATCH.min(chain_height - start);
+        // Below the chain height, as caught up was handled above.
+        let count = BATCH.min(chain_height.since(start).unwrap_or(0));
         let generation = self.db.call(|db| db.reorg_generation()).await?;
         let fetched = self.daemon.blocks(start, count).await?;
         if fetched.is_empty() {
@@ -629,14 +630,14 @@ impl Scanner {
         }
 
         let batch = Batch::new(fetched);
-        let fetched = batch.blocks.len() as u64;
+        let fetched = batch.blocks.len();
         let last = batch.blocks.last().map(|b| b.block.clone());
         let mut ring = self.live_ring.lock().unwrap_or_else(|e| e.into_inner()).take();
         let at = Window {
             start,
             live: true,
             generation,
-            keep_from: 0,
+            keep_from: Height::ZERO,
         };
         let result =
             tokio::task::block_in_place(|| self.scan_batch(&mut ring, &self.arenas[0], &accounts, &batch, &at));
@@ -652,14 +653,14 @@ impl Scanner {
         }
         self.complete_proofs().await;
         *self.last_block.lock().unwrap_or_else(|e| e.into_inner()) = last;
-        let next = start + fetched;
+        let next = height_at(start, fetched)?;
         if self.config.lanes.lanes > 0 {
             self.plan().advance(next);
             self.moved.notify_waiters();
         }
         self.set_status(|s| s.scanner_height = next);
         // A line every thousand blocks, and one on catching up.
-        if next % 1000 < fetched || next >= chain_height {
+        if next.get() % 1000 < u64::try_from(fetched).unwrap_or(u64::MAX) || next >= chain_height {
             tracing::info!("scanned to {next} of {chain_height} for {} accounts", accounts.len());
         }
         Ok(next < chain_height)
@@ -667,7 +668,7 @@ impl Scanner {
 
     /// The live lane's accounts and where it starts: merges lanes that have
     /// caught up, and finds lanes for accounts behind (starting their tasks).
-    fn live_accounts(self: &Arc<Self>, active: Vec<Account>, chain_height: u64) -> (Vec<Account>, u64) {
+    fn live_accounts(self: &Arc<Self>, active: Vec<Account>, chain_height: Height) -> (Vec<Account>, Height) {
         let opened = {
             let mut plan = self.plan();
             let live = *plan.live.get_or_insert_with(|| {
@@ -676,14 +677,14 @@ impl Scanner {
                     .map(|a| a.scan_height)
                     .max()
                     .unwrap_or(chain_height)
-                    .clamp(1, chain_height.max(1))
+                    .clamp(Height::new(1), chain_height.max(Height::new(1)))
             });
             let merged = plan.merge_ready();
             if !merged.is_empty() {
                 tracing::info!("{} accounts caught up: into the live lane at {live}", merged.len());
             }
             plan.keep_only(&active.iter().map(|a| a.id).collect::<BTreeSet<_>>());
-            let behind: Vec<(AccountId, u64)> = active
+            let behind: Vec<(AccountId, Height)> = active
                 .iter()
                 .filter(|a| a.scan_height < live && plan.owner(a.id).is_none())
                 .map(|a| (a.id, a.scan_height))
@@ -706,7 +707,7 @@ impl Scanner {
         for id in opened {
             tracing::info!(
                 "catch-up lane {id} from {}",
-                self.plan().lane(id).map_or(0, |l| l.cursor)
+                self.plan().lane(id).map_or(Height::ZERO, |l| l.cursor)
             );
             let scanner = self.clone();
             let task = LaneTask {
@@ -765,7 +766,12 @@ impl Scanner {
             // Stopped for a reorg too deep: the live lane says when it's over.
             return Ok(LaneStep::Wait);
         }
-        let cursor = accounts.iter().map(|a| a.scan_height).min().unwrap_or(0).max(1);
+        let cursor = accounts
+            .iter()
+            .map(|a| a.scan_height)
+            .min()
+            .unwrap_or(Height::ZERO)
+            .max(Height::new(1));
         let (ready, live) = {
             let mut plan = self.plan();
             (plan.reached(task.id, cursor), plan.live.unwrap_or(cursor))
@@ -775,7 +781,8 @@ impl Scanner {
             self.wake.notify_one();
             return Ok(LaneStep::Wait);
         }
-        let count = self.config.lanes.blocks.max(1).min(live - cursor);
+        // Below the live cursor, as not ready.
+        let count = self.config.lanes.blocks.max(1).min(live.since(cursor).unwrap_or(0));
         // Read before fetching: a reorg unwound while the blocks were on
         // their way may have orphaned them.
         let generation = self.db.call(|db| db.reorg_generation()).await?;
@@ -854,7 +861,7 @@ impl Scanner {
             write_scanned(&w, accounts, batch, at.start, scanned, at.live)?;
             if !at.live {
                 for (i, block) in batch.blocks.iter().enumerate() {
-                    let height = at.start + i as u64;
+                    let height = height_at(at.start, i)?;
                     if height >= at.keep_from {
                         w.keep_hash(height, &block.block.hash())?;
                     }
@@ -998,7 +1005,7 @@ impl Scanner {
                 hi = at;
             }
         }
-        Ok(Fork::At(kept[lo].0 + 1))
+        Ok(Fork::At(kept[lo].0.next()))
     }
 
     /// Scans pool transactions not yet seen, in a stand-in block made of
@@ -1224,10 +1231,10 @@ fn submitted_block(
 /// it is the live lane's, the reorg generation read before it was fetched,
 /// and (for a catch-up lane) the height from which its block hashes are kept.
 struct Window {
-    start: u64,
+    start: Height,
     live: bool,
     generation: u64,
-    keep_from: u64,
+    keep_from: Height,
 }
 
 /// What came of writing a batch.
@@ -1245,16 +1252,16 @@ enum Outcome {
 #[derive(Debug, PartialEq, Eq)]
 enum Fork {
     /// Scan again from here.
-    At(u64),
+    At(Height),
     /// Even the lowest kept hash, at this height, isn't the node's.
-    Deeper(u64),
+    Deeper(Height),
     /// No hashes kept.
     Nothing,
 }
 
 /// What the log and `/daemon_status` say while the scan is stopped for a
 /// reorg deeper than the hashes kept, the lowest at `lowest`.
-fn halt_message(lowest: u64) -> String {
+fn halt_message(lowest: Height) -> String {
     format!(
         "the node's chain differs from every block hash kept (the last {KEEP_HASHES}, from height {lowest} up): \
          a reorg deeper than that, or a node on another chain. Scanning is stopped; the API goes on serving \
@@ -1268,21 +1275,30 @@ fn halt_message(lowest: u64) -> String {
 /// it, and each of its blocks is the one whose hash is kept at its height,
 /// where one is: checked in the batch's own transaction, so it holds for
 /// what is written.
-fn follows_kept(w: &ScanWriter, batch: &Batch, start: u64) -> Result<bool> {
-    if let (Some(before), Some(first)) = (start.checked_sub(1), batch.blocks.first())
+fn follows_kept(w: &ScanWriter, batch: &Batch, start: Height) -> Result<bool> {
+    if let (Some(before), Some(first)) = (start.prev(), batch.blocks.first())
         && w.block_hash(before)?
             .is_some_and(|kept| kept != first.block.header.previous)
     {
         return Ok(false);
     }
     for (i, block) in batch.blocks.iter().enumerate() {
-        if w.block_hash(start + i as u64)?
+        if w.block_hash(height_at(start, i)?)?
             .is_some_and(|kept| kept != block.block.hash())
         {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// The height of the `i`th block of a batch from `start`. Heights stay far
+/// below 2^64 (a node's are checked against `CRYPTONOTE_MAX_BLOCK_NUMBER`),
+/// so past it is the server's own error.
+fn height_at(start: Height, i: usize) -> Result<Height> {
+    start
+        .offset(i)
+        .ok_or_else(|| Error::Internal(format!("block {i} from {start} is past the last height")))
 }
 
 /// What a catch-up lane's step came to.
@@ -1304,7 +1320,7 @@ pub fn record_batch(
     lookahead: u32,
     accounts: &[Account],
     batch: &Batch,
-    start: u64,
+    start: Height,
     hits: Option<&[Hit]>,
     live: bool,
 ) -> Result<()> {
@@ -1329,7 +1345,7 @@ pub fn scan_blocks(
     lookahead: u32,
     accounts: &[Account],
     batch: &Batch,
-    start: u64,
+    start: Height,
     hits: Option<&[Hit]>,
 ) -> Result<Scanned> {
     let by_id: HashMap<AccountId, &Account> = accounts.iter().map(|a| (a.id, a)).collect();
@@ -1341,7 +1357,7 @@ pub fn scan_blocks(
     }
     let mut per_block = Vec::with_capacity(batch.blocks.len());
     for (i, block) in batch.blocks.iter().enumerate() {
-        let height = start + i as u64;
+        let height = height_at(start, i)?;
         let mut found = vec![];
         if hits.is_some() {
             let mut list = std::mem::take(&mut by_block[i]);
@@ -1393,7 +1409,7 @@ pub fn write_scanned(
     w: &ScanWriter,
     accounts: &[Account],
     batch: &Batch,
-    start: u64,
+    start: Height,
     scanned: Scanned,
     live: bool,
 ) -> Result<()> {
@@ -1409,7 +1425,7 @@ pub fn write_scanned(
     let mut spends = SpendMap::of(w, accounts.iter().copied())?;
     let mut per_block = scanned.per_block.into_iter();
     for (i, block) in batch.blocks.iter().enumerate() {
-        let height = start + i as u64;
+        let height = height_at(start, i)?;
         let raw = batch.raw.get(i).and_then(Option::as_ref);
         for (id, outputs) in per_block.next().unwrap_or_default() {
             let Some(account) = by_id.get(&id).copied() else {
@@ -1423,7 +1439,7 @@ pub fn write_scanned(
             w.set_block(height, &block.block.hash(), KEEP_HASHES)?;
         }
     }
-    let next = start + batch.blocks.len() as u64;
+    let next = height_at(start, batch.blocks.len())?;
     for account in accounts {
         if account.scan_height < next {
             w.set_scan_height(account.id, next)?;
@@ -1437,7 +1453,7 @@ pub fn write_scanned(
 struct Place<'a> {
     block: &'a ScannableBlock,
     raw: Option<&'a RawBlock>,
-    height: u64,
+    height: Height,
 }
 
 /// What `account` receives in `target` (a block, or a stand-in for part of it).
@@ -1508,7 +1524,7 @@ impl TxMeta {
         }
     }
 
-    fn new_tx<'a>(&'a self, hash: [u8; 32], height: u64, timestamp: u64) -> NewTx<'a> {
+    fn new_tx<'a>(&'a self, hash: [u8; 32], height: Height, timestamp: u64) -> NewTx<'a> {
         NewTx {
             hash,
             prefix_hash: self.prefix_hash,
@@ -1755,7 +1771,7 @@ fn record_spends(
     w: &ScanWriter,
     accounts: &HashMap<AccountId, &Account>,
     block: &ScannableBlock,
-    height: u64,
+    height: Height,
     spends: &SpendMap,
 ) -> Result<()> {
     if spends.is_empty() {
@@ -1943,9 +1959,9 @@ pub fn prefix_hash(tx: &Transaction<Pruned>) -> [u8; 32] {
 }
 
 /// Whether an output can be spent (or used as a decoy) at `chain_height`.
-pub fn unlocked(height: u64, coinbase: bool, unlock_time: u64, chain_height: u64, now: u64) -> bool {
+pub fn unlocked(height: Height, coinbase: bool, unlock_time: u64, chain_height: Height, now: u64) -> bool {
     let age = if coinbase { COINBASE_AGE } else { SPENDABLE_AGE };
-    if height + age > chain_height {
+    if height.checked_add(age).is_none_or(|spendable| spendable > chain_height) {
         return false;
     }
     if unlock_time == 0 {
@@ -1956,7 +1972,7 @@ pub fn unlocked(height: u64, coinbase: bool, unlock_time: u64, chain_height: u64
     const BLOCK_OR_TIME: u64 = 500_000_000;
     const TIME_LEEWAY: u64 = 120;
     if unlock_time < BLOCK_OR_TIME {
-        unlock_time <= chain_height
+        unlock_time <= chain_height.get()
     } else {
         unlock_time <= now.saturating_add(TIME_LEEWAY)
     }
@@ -2120,7 +2136,7 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
                         monero_wallet::ed25519::Point::from(view_pub),
                     ),
                     view_key: PrivateViewKey::from_bytes(&view.to_bytes()),
-                    start_height: 3_797_000,
+                    start_height: Height::new(3_797_000),
                     generated_locally: false,
                 },
                 Status::Active,
@@ -2136,7 +2152,7 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
         let (mut filtered, mut unfiltered, mut hits) = (0, 0, 0);
         let mut flagging = 0.0;
         for (at, part) in blocks.chunks(step).enumerate() {
-            let start = 3_797_000 + (at * step) as u64;
+            let start = height_at(Height::new(3_797_000), at * step)?;
             let batch = Batch {
                 blocks: part.to_vec(),
                 first_indexes: first_indexes[at * step..at * step + part.len()].to_vec(),
@@ -2189,15 +2205,33 @@ mod tests {
 
     #[test]
     fn unlock_rules() {
-        assert!(unlocked(100, false, 0, 110, 0));
-        assert!(!unlocked(100, false, 0, 109, 0));
-        assert!(!unlocked(100, true, 0, 150, 0));
-        assert!(unlocked(100, true, 0, 160, 0));
-        assert!(!unlocked(100, false, 200, 150, 0));
-        assert!(unlocked(100, false, 200, 200, 0));
-        assert!(!unlocked(100, false, 1_700_000_000, 150, 1_699_999_879));
-        assert!(unlocked(100, false, 1_700_000_000, 150, 1_699_999_880));
-        assert!(unlocked(100, false, 1_700_000_000, 150, 1_700_000_000));
+        assert!(unlocked(Height::new(100), false, 0, Height::new(110), 0));
+        assert!(!unlocked(Height::new(100), false, 0, Height::new(109), 0));
+        assert!(!unlocked(Height::new(100), true, 0, Height::new(150), 0));
+        assert!(unlocked(Height::new(100), true, 0, Height::new(160), 0));
+        assert!(!unlocked(Height::new(100), false, 200, Height::new(150), 0));
+        assert!(unlocked(Height::new(100), false, 200, Height::new(200), 0));
+        assert!(!unlocked(
+            Height::new(100),
+            false,
+            1_700_000_000,
+            Height::new(150),
+            1_699_999_879
+        ));
+        assert!(unlocked(
+            Height::new(100),
+            false,
+            1_700_000_000,
+            Height::new(150),
+            1_699_999_880
+        ));
+        assert!(unlocked(
+            Height::new(100),
+            false,
+            1_700_000_000,
+            Height::new(150),
+            1_700_000_000
+        ));
     }
 
     #[test]
@@ -2396,7 +2430,7 @@ mod tests {
             public_key: [0; 32],
             tx_pub_key: [0; 32],
             mask: Some([0; 32]),
-            height: 1,
+            height: Height::new(1),
             maj: 0,
             min: 0,
             commitment: None,
@@ -2438,7 +2472,7 @@ mod tests {
             &NewAccount {
                 address: addr(keys, name),
                 view_key: PrivateViewKey::from_bytes(keys.view.as_bytes()),
-                start_height: start,
+                start_height: Height::new(start),
                 generated_locally: false,
             },
             Status::Active,
@@ -2468,7 +2502,7 @@ mod tests {
             let w = ScanWriter::new(tx);
             let ring = Ring::get(&mut slot, tx, &accounts, 1, &Arena::new())?;
             let hits = hits.map(|f| f(ring));
-            record_batch(&w, ring, 1, &accounts, &batch, 100, hits.as_deref(), true)
+            record_batch(&w, ring, 1, &accounts, &batch, Height::new(100), hits.as_deref(), true)
         })
         .unwrap();
         (db, a, b)
@@ -2478,16 +2512,25 @@ mod tests {
         let outputs = db.outputs(a.id).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].global_index, 1006);
-        assert_eq!(outputs[0].height, 100);
+        assert_eq!(outputs[0].height, Height::new(100));
         let spends = db.spends(a.id).unwrap();
         assert_eq!(spends.len(), 1, "the ring at 101 holds 1006");
         assert!(
             db.outputs(b.id).unwrap().is_empty() && db.spends(b.id).unwrap().is_empty(),
             "B starts at 200"
         );
-        assert_eq!(db.account(&addr(&keys(), "A")).unwrap().unwrap().scan_height, 102);
-        assert_eq!(db.account(&addr(&keys(), "B")).unwrap().unwrap().scan_height, 200);
-        assert!(db.block_hash(101).unwrap().is_some(), "the live lane keeps hashes");
+        assert_eq!(
+            db.account(&addr(&keys(), "A")).unwrap().unwrap().scan_height,
+            Height::new(102)
+        );
+        assert_eq!(
+            db.account(&addr(&keys(), "B")).unwrap().unwrap().scan_height,
+            Height::new(200)
+        );
+        assert!(
+            db.block_hash(Height::new(101)).unwrap().is_some(),
+            "the live lane keeps hashes"
+        );
     }
 
     #[test]
@@ -2557,25 +2600,34 @@ mod tests {
             })
         };
         held.recv().unwrap();
-        let scanned = scan_blocks(slot.as_mut().unwrap(), 1, &accounts, &batch, 100, None).unwrap();
+        let scanned = scan_blocks(slot.as_mut().unwrap(), 1, &accounts, &batch, Height::new(100), None).unwrap();
         go.send(()).unwrap();
         writer.join().unwrap();
 
-        db.rescan(&[addr(&keys, "B")], 50).unwrap();
-        db.write(|tx| write_scanned(&ScanWriter::new(tx), &accounts, &batch, 100, scanned, true))
+        db.rescan(&[addr(&keys, "B")], Height::new(50)).unwrap();
+        db.write(|tx| write_scanned(&ScanWriter::new(tx), &accounts, &batch, Height::new(100), scanned, true))
             .unwrap();
         assert_eq!(db.outputs(a.id).unwrap().len(), 1);
         assert_eq!(db.spends(a.id).unwrap().len(), 1);
-        assert_eq!(db.account(&addr(&keys, "A")).unwrap().unwrap().scan_height, 102);
+        assert_eq!(
+            db.account(&addr(&keys, "A")).unwrap().unwrap().scan_height,
+            Height::new(102)
+        );
         assert!(db.outputs(b.id).unwrap().is_empty(), "rescanned meanwhile");
-        assert_eq!(db.account(&addr(&keys, "B")).unwrap().unwrap().scan_height, 50);
+        assert_eq!(
+            db.account(&addr(&keys, "B")).unwrap().unwrap().scan_height,
+            Height::new(50)
+        );
     }
 
     #[test]
     fn no_hits_no_outputs_but_scan_heights_move_on() {
         let (db, a, _) = record(Some(&|_: &Ring| vec![]));
         assert!(db.outputs(a.id).unwrap().is_empty());
-        assert_eq!(db.account(&addr(&keys(), "A")).unwrap().unwrap().scan_height, 102);
+        assert_eq!(
+            db.account(&addr(&keys(), "A")).unwrap().unwrap().scan_height,
+            Height::new(102)
+        );
     }
 
     #[test]
@@ -2689,7 +2741,7 @@ mod tests {
         db.write(|tx| {
             let w = ScanWriter::new(tx);
             for h in heights {
-                w.set_block(h, &chain_hash(h, 0), KEEP_HASHES)?;
+                w.set_block(Height::new(h), &chain_hash(h, 0), KEEP_HASHES)?;
             }
             Ok(())
         })
@@ -2707,7 +2759,7 @@ mod tests {
             let db = Arc::new(Db::in_memory());
             keep_chain(&db, 1..=10_000);
             let account = crate::testkit::Wallet::new(8).add(&db, 0);
-            db.write(|tx| ScanWriter::new(tx).set_scan_height(account.id, 10_001))
+            db.write(|tx| ScanWriter::new(tx).set_scan_height(account.id, Height::new(10_001)))
                 .unwrap();
             db.set_status(std::slice::from_ref(&account.address), Status::Hidden)
                 .unwrap();
@@ -2715,9 +2767,15 @@ mod tests {
             app.scanner.suspect.store(true, Ordering::SeqCst);
             assert!(app.scanner.step().await.unwrap());
             assert!(!app.scanner.suspect.load(Ordering::SeqCst));
-            assert_eq!(db.block_hash(fork - 1).unwrap(), Some(chain_hash(fork - 1, 0)));
-            assert_eq!(db.block_hash(fork).unwrap(), None);
-            assert_eq!(db.account(&account.address).unwrap().unwrap().scan_height, fork);
+            assert_eq!(
+                db.block_hash(Height::new(fork - 1)).unwrap(),
+                Some(chain_hash(fork - 1, 0))
+            );
+            assert_eq!(db.block_hash(Height::new(fork)).unwrap(), None);
+            assert_eq!(
+                db.account(&account.address).unwrap().unwrap().scan_height,
+                Height::new(fork)
+            );
             let asked = node
                 .routes()
                 .iter()
@@ -2736,10 +2794,10 @@ mod tests {
         assert_eq!(secs, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
         assert_eq!(reorg_backoff(u32::MAX), Some(Duration::from_secs(60)));
         let mut streak = ReorgStreak::default();
-        assert_eq!(streak.note(100), 1);
-        assert_eq!(streak.note(100), 2);
-        assert_eq!(streak.note(90), 1, "another fork starts again");
-        assert_eq!(streak.note(90), 2);
+        assert_eq!(streak.note(Height::new(100)), 1);
+        assert_eq!(streak.note(Height::new(100)), 2);
+        assert_eq!(streak.note(Height::new(90)), 1, "another fork starts again");
+        assert_eq!(streak.note(Height::new(90)), 2);
     }
 
     /// A node whose top block hash disagrees with its own headers makes
@@ -2763,7 +2821,7 @@ mod tests {
         let db = Arc::new(Db::in_memory());
         keep_chain(&db, 1..=99);
         let account = crate::testkit::Wallet::new(11).add(&db, 0);
-        db.write(|tx| ScanWriter::new(tx).set_scan_height(account.id, 100))
+        db.write(|tx| ScanWriter::new(tx).set_scan_height(account.id, Height::new(100)))
             .unwrap();
         let app = crate::testkit::app_with_node(db.clone(), 100, &node.url);
         let wait = || app.scanner.reorg_wait.lock().unwrap().take();
@@ -2773,7 +2831,11 @@ mod tests {
             waits.push(wait().map(|d| d.as_secs()));
         }
         assert_eq!(waits, [None, Some(1), Some(2), Some(4)]);
-        assert_eq!(db.block_hash(99).unwrap(), Some(chain_hash(99, 0)), "nothing lost");
+        assert_eq!(
+            db.block_hash(Height::new(99)).unwrap(),
+            Some(chain_hash(99, 0)),
+            "nothing lost"
+        );
         app.scanner.scanned_on();
         assert!(app.scanner.step().await.unwrap());
         assert_eq!(wait(), None, "a new streak after scanning on");
@@ -2795,12 +2857,12 @@ mod tests {
         let made = testkit::block(600, [0; 32], testkit::dull_miner(600), vec![pays], 0, 0);
         testkit::write(&db, std::slice::from_ref(&account), vec![made], 600, false, None);
         keep_chain(&db, 500..=800);
-        db.write(|tx| ScanWriter::new(tx).set_scan_height(account.id, 801))
+        db.write(|tx| ScanWriter::new(tx).set_scan_height(account.id, Height::new(801)))
             .unwrap();
         let app = testkit::app_with_node(db.clone(), 900, &node.url);
 
         app.scanner.reorg().await.unwrap();
-        assert_eq!(db.halted().unwrap(), Some(500));
+        assert_eq!(db.halted().unwrap(), Some(Height::new(500)));
         assert_eq!(db.outputs(account.id).unwrap().len(), 1, "nothing rewound");
         assert_eq!(db.recent_blocks().unwrap().len(), 301);
         let error = app.scanner.status().last_error.unwrap();
@@ -2808,11 +2870,11 @@ mod tests {
 
         // Steps change nothing while an account stands at or above 500.
         assert!(!app.scanner.step().await.unwrap());
-        assert_eq!(db.halted().unwrap(), Some(500));
+        assert_eq!(db.halted().unwrap(), Some(Height::new(500)));
         assert!(app.scanner.status().last_error.unwrap().contains("rescan"));
-        assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, 801);
+        assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, Height::new(801));
 
-        db.rescan(&[w.address()], 99).unwrap();
+        db.rescan(&[w.address()], Height::new(99)).unwrap();
         // The step resumes, then fails at fetching blocks from this node.
         let _ = app.scanner.step().await;
         assert_eq!(db.halted().unwrap(), None);
@@ -2845,10 +2907,10 @@ mod tests {
         };
         let (mut slot, arena) = (None, Arena::new());
         let window = |start: u64, generation: u64| Window {
-            start,
+            start: Height::new(start),
             live: false,
             generation,
-            keep_from: 101,
+            keep_from: Height::new(101),
         };
         let scan = |slot: &mut Option<Ring>, accounts: &[Account], b: &Batch, at: &Window| {
             app.scanner.scan_batch(slot, &arena, accounts, b, at).unwrap()
@@ -2856,22 +2918,25 @@ mod tests {
         let accounts = vec![again(&db, &account)];
 
         let before = db.reorg_generation().unwrap();
-        db.rewind(1_000).unwrap();
+        db.rewind(Height::new(1_000)).unwrap();
         assert_eq!(
             scan(&mut slot, &accounts, &batch(0..3), &window(100, before)),
             Outcome::Stale
         );
-        assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, 100);
+        assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, Height::new(100));
 
         let now = db.reorg_generation().unwrap();
         assert_eq!(
             scan(&mut slot, &accounts, &batch(0..3), &window(100, now)),
             Outcome::Written
         );
-        assert_eq!(db.block_hash(100).unwrap(), None, "below keep_from");
-        assert_eq!(db.block_hash(102).unwrap(), Some(made[2].block.block.hash()));
+        assert_eq!(db.block_hash(Height::new(100)).unwrap(), None, "below keep_from");
+        assert_eq!(
+            db.block_hash(Height::new(102)).unwrap(),
+            Some(made[2].block.block.hash())
+        );
         let accounts = vec![db.account(&w.address()).unwrap().unwrap()];
-        assert_eq!(accounts[0].scan_height, 103);
+        assert_eq!(accounts[0].scan_height, Height::new(103));
 
         // Block 103 of another chain: it doesn't follow the 102 kept.
         let other = testkit::block(103, [5; 32], testkit::dull_miner(103), vec![], first, 1);
@@ -2881,7 +2946,7 @@ mod tests {
             raw: vec![other.raw],
         };
         assert_eq!(scan(&mut slot, &accounts, &stray, &window(103, now)), Outcome::Diverged);
-        assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, 103);
+        assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, Height::new(103));
         assert_eq!(
             scan(&mut slot, &accounts, &batch(3..4), &window(103, now)),
             Outcome::Written

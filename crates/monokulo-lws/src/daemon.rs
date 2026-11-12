@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
+use crate::types::Height;
 
 /// The most one `get_blocks.bin` response may be; the body is read in
 /// chunks and given up on as soon as it passes this, whatever
@@ -46,7 +47,7 @@ const INITIAL_BODY_CAPACITY: usize = 1024 * 1024;
 /// the node packs its answer.
 const MAX_DISTRIBUTION_ENTRIES: usize = 16 * 1024 * 1024;
 /// monerod's `CRYPTONOTE_MAX_BLOCK_NUMBER`: no height reaches it.
-const MAX_BLOCK_NUMBER: u64 = 500_000_000;
+const MAX_BLOCK_NUMBER: Height = Height::new(500_000_000);
 /// Time a JSON call may take in all, and a `get_blocks.bin` call (up to
 /// 200 MB from a node that may be across the world).
 const JSON_TIMEOUT: Duration = Duration::from_secs(60);
@@ -69,7 +70,7 @@ pub struct Daemon {
 #[derive(Clone, Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct Info {
-    pub height: u64,
+    pub height: Height,
     #[serde(default)]
     pub target_height: u64,
     #[serde(default)]
@@ -100,7 +101,7 @@ fn one() -> u64 {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct Distribution {
-    pub start_height: u64,
+    pub start_height: Height,
     pub cumulative: Vec<u64>,
 }
 
@@ -234,7 +235,7 @@ impl Daemon {
     }
 
     /// The hash of the block at `height`.
-    pub async fn block_hash(&self, height: u64) -> Result<[u8; 32]> {
+    pub async fn block_hash(&self, height: Height) -> Result<[u8; 32]> {
         #[derive(Deserialize)]
         struct Header {
             hash: String,
@@ -263,7 +264,7 @@ impl Daemon {
     pub async fn output_distribution(&self) -> Result<Distribution> {
         #[derive(Deserialize)]
         struct Entry {
-            start_height: u64,
+            start_height: Height,
             #[serde(deserialize_with = "capped_u64s")]
             distribution: Vec<u64>,
             #[serde(default)]
@@ -290,7 +291,7 @@ impl Daemon {
         // node making things up.
         let top = e
             .start_height
-            .checked_add(e.distribution.len() as u64)
+            .offset(e.distribution.len())
             .filter(|top| *top <= MAX_BLOCK_NUMBER);
         if top.is_none() {
             return Err(Error::Daemon(
@@ -453,11 +454,16 @@ impl Daemon {
     /// Up to `count` blocks from `start` (at least 1: monerod ignores a zero
     /// start height), with their pruned transactions and each transaction's
     /// first RingCT output index. The node may send fewer than asked.
-    pub async fn blocks(&self, start: u64, count: u64) -> Result<Vec<Fetched>> {
-        let start = start.max(1);
+    pub async fn blocks(&self, start: Height, count: u64) -> Result<Vec<Fetched>> {
+        let start = start.max(Height::new(1));
         let count = count.clamp(1, MAX_BLOCKS_PER_REQUEST);
         let response = self
-            .post("get_blocks.bin", request(start, count), false, MAX_BLOCKS_RESPONSE)
+            .post(
+                "get_blocks.bin",
+                request(start.get(), count),
+                false,
+                MAX_BLOCKS_RESPONSE,
+            )
             .await?;
         let blocks = parse(&response, count as usize)?;
         check_chain(&blocks, start)?;
@@ -468,11 +474,11 @@ impl Daemon {
 /// Refuses blocks that aren't the chain from `start` on: the scanner files
 /// each block's outputs and hash under `start + i`, so block `i` must be at
 /// that height and follow block `i - 1`.
-pub(crate) fn check_chain(blocks: &[Fetched], start: u64) -> Result<()> {
+pub(crate) fn check_chain(blocks: &[Fetched], start: Height) -> Result<()> {
     let mut previous: Option<[u8; 32]> = None;
     for (i, f) in blocks.iter().enumerate() {
         let block = &f.block.block;
-        if Some(block.number() as u64) != start.checked_add(i as u64) {
+        if u64::try_from(block.number()).ok().map(Height::new) != start.offset(i) {
             return Err(invalid("get_blocks.bin sent a block from the wrong height"));
         }
         if previous.is_some_and(|p| p != block.header.previous) {
@@ -858,18 +864,24 @@ mod tests {
     #[test]
     fn blocks_must_be_the_chain_from_the_start_asked() {
         let blocks = parse(FIXTURE, 3).unwrap();
-        check_chain(&blocks, 3_300_000).unwrap();
-        check_chain(&blocks[1..], 3_300_001).unwrap();
-        check_chain(&[], 7).unwrap();
-        assert!(check_chain(&blocks, 3_300_001).is_err(), "the wrong start");
+        check_chain(&blocks, Height::new(3_300_000)).unwrap();
+        check_chain(&blocks[1..], Height::new(3_300_001)).unwrap();
+        check_chain(&[], Height::new(7)).unwrap();
+        assert!(check_chain(&blocks, Height::new(3_300_001)).is_err(), "the wrong start");
         let skipped = vec![blocks[0].clone(), blocks[2].clone()];
-        assert!(check_chain(&skipped, 3_300_000).is_err(), "a block left out");
+        assert!(
+            check_chain(&skipped, Height::new(3_300_000)).is_err(),
+            "a block left out"
+        );
         let repeated = vec![blocks[0].clone(), blocks[0].clone()];
-        assert!(check_chain(&repeated, 3_300_000).is_err(), "a block twice");
+        assert!(check_chain(&repeated, Height::new(3_300_000)).is_err(), "a block twice");
         // At the right height but on another chain.
         let mut forked = blocks.clone();
         forked[1].block.block.header.previous = [7; 32];
-        assert!(check_chain(&forked, 3_300_000).is_err(), "not following its parent");
+        assert!(
+            check_chain(&forked, Height::new(3_300_000)).is_err(),
+            "not following its parent"
+        );
     }
 
     /// A little fuzzing: thousands of random mutations of a real response,
@@ -1040,7 +1052,7 @@ mod tests {
             .info()
             .await
             .unwrap();
-        assert_eq!(ok.height, 5);
+        assert_eq!(ok.height, Height::new(5));
     }
 
     #[tokio::test]
@@ -1076,8 +1088,8 @@ mod tests {
             format!(r#"{{"result":{{"distributions":[{{"start_height":{start},"distribution":[1,2,3],"base":0}}]}}}}"#)
         };
         let d = answering(at(10)).await.output_distribution().await.unwrap();
-        assert_eq!((d.start_height, d.cumulative), (10, vec![1, 2, 3]));
-        for bad in [u64::MAX, u64::MAX - 2, MAX_BLOCK_NUMBER] {
+        assert_eq!((d.start_height, d.cumulative), (Height::new(10), vec![1, 2, 3]));
+        for bad in [u64::MAX, u64::MAX - 2, MAX_BLOCK_NUMBER.get()] {
             let e = answering(at(bad)).await.output_distribution().await.unwrap_err();
             assert!(e.to_string().contains("out of range"), "{bad}: {e}");
         }

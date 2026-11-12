@@ -21,6 +21,7 @@ use rand_distr::{Distribution as _, Gamma};
 use crate::daemon::{Daemon, Distribution};
 use crate::error::{Error, Result};
 use crate::scanner::SPENDABLE_AGE;
+use crate::types::Height;
 
 const GAMMA_SHAPE: f64 = 19.28;
 const GAMMA_SCALE: f64 = 1.0 / 1.61;
@@ -70,11 +71,13 @@ impl Picker {
     /// The node's distribution; a cached one while it is fresh, which is
     /// while it reaches `chain_height` (the scanner's last word; 0 for
     /// unknown) and is under two minutes old, and always for 5 s.
-    async fn distribution(&self, daemon: &Daemon, chain_height: u64) -> Result<Arc<Distribution>> {
+    async fn distribution(&self, daemon: &Daemon, chain_height: Height) -> Result<Arc<Distribution>> {
         let mut cached = self.distribution.lock().await;
         if let Some((at, d)) = cached.as_ref() {
-            let top = d.start_height.saturating_add(d.cumulative.len() as u64);
-            let current = chain_height == 0 || top >= chain_height;
+            let top = d
+                .start_height
+                .saturating_add(u64::try_from(d.cumulative.len()).unwrap_or(u64::MAX));
+            let current = chain_height == Height::ZERO || top >= chain_height;
             if at.elapsed() < FRESH_AT_LEAST || (current && at.elapsed() < FRESH_FOR) {
                 return Ok(d.clone());
             }
@@ -96,7 +99,7 @@ impl Picker {
         daemon: &Daemon,
         count: usize,
         rings: usize,
-        chain_height: u64,
+        chain_height: Height,
     ) -> Result<Vec<Vec<Member>>> {
         let d = self.distribution(daemon, chain_height).await?;
         let Some(picker) = GammaPicker::new(&d.cumulative) else {

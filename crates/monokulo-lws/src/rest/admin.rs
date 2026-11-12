@@ -22,6 +22,7 @@ use super::{ApiError, ApiJson, App, parse_value};
 use crate::address::Address;
 use crate::db::{Accepted, Status};
 use crate::error::{Error, Result, bad};
+use crate::types::Height;
 use crate::{admin_keys, crypto};
 
 async fn authorize(app: &App, auth: Option<lws_api::AdminKey>) -> Result<()> {
@@ -123,7 +124,7 @@ async fn list_accounts(app: &App) -> Result<Value> {
     for a in app.db.call(|db| db.accounts(None)).await? {
         let row = AccountRow {
             address: a.address.as_str().to_owned(),
-            scan_height: a.scan_height,
+            scan_height: a.scan_height.get(),
             access_time: a.access_time,
         };
         match a.status {
@@ -140,7 +141,7 @@ async fn list_requests(app: &App) -> Result<Value> {
     for (kind, new) in app.db.call(|db| db.requests()).await? {
         let row = RequestRow {
             address: new.address.as_str().to_owned(),
-            start_height: new.start_height,
+            start_height: new.start_height.get(),
         };
         match kind {
             RequestKind::Create => out.create.push(row),
@@ -160,7 +161,7 @@ async fn modify_status(app: &App, p: ModifyStatus) -> Result<Value> {
 
 async fn rescan(app: &App, p: Rescan) -> Result<Value> {
     let named = addresses(app, &p.addresses)?;
-    let done = app.db.call(move |db| db.rescan(&named, p.height)).await?;
+    let done = app.db.call(move |db| db.rescan(&named, Height::new(p.height))).await?;
     app.scanner.wake.notify_one();
     Ok(json!({ "updated": done }))
 }

@@ -20,7 +20,7 @@ use crate::db::{Account, Holdings, NewAccount, OutputRow, Queued, SpendRow, Stat
 use crate::error::{Error, Result, bad};
 use crate::limits::ClientIp;
 use crate::scanner::{PoolReceipt, PoolSpend, unlocked};
-use crate::types::{AccountId, OutputId, TxId};
+use crate::types::{AccountId, Height, OutputId, TxId};
 
 type Reply<T> = std::result::Result<Json<T>, ApiError>;
 
@@ -105,16 +105,16 @@ fn meta(maj: u32, min: u32) -> AddressMeta {
     AddressMeta { maj_i: maj, min_i: min }
 }
 
-fn chain_height(app: &App) -> u64 {
+fn chain_height(app: &App) -> Height {
     app.scanner.status().chain_height
 }
 
 /// The chain height a new account starts below: the scanner's last word, or
 /// the node's if the scanner has not heard from it yet. Never 0 for want of
 /// an answer, which would mean a scan of the whole chain.
-async fn creation_height(app: &App) -> Result<u64> {
+async fn creation_height(app: &App) -> Result<Height> {
     match chain_height(app) {
-        0 => Ok(app.info().await?.height),
+        Height::ZERO => Ok(app.info().await?.height),
         h => Ok(h),
     }
 }
@@ -166,7 +166,7 @@ pub async fn login(
         return Ok(Json(LoginResponse {
             new_address: false,
             generated_locally: Some(account.generated_locally),
-            start_height: Some(account.start_height),
+            start_height: Some(account.start_height.get()),
             lookahead: lookahead(&app),
         }));
     }
@@ -207,7 +207,7 @@ pub async fn login(
     Ok(Json(LoginResponse {
         new_address: true,
         generated_locally: Some(req.generated_locally),
-        start_height: Some(start_height),
+        start_height: Some(start_height.get()),
         lookahead: lookahead(&app),
     }))
 }
@@ -239,11 +239,11 @@ pub async fn get_address_info(State(app): State<Arc<App>>, ApiJson(login): ApiJs
         locked_funds: Amount(locked),
         total_received: Amount(total_received),
         total_sent: Amount(total_sent),
-        scanned_height: account.scan_height,
-        scanned_block_height: account.scan_height,
-        start_height: account.start_height,
-        transaction_height: account.scan_height,
-        blockchain_height: chain,
+        scanned_height: account.scan_height.get(),
+        scanned_block_height: account.scan_height.get(),
+        start_height: account.start_height.get(),
+        transaction_height: account.scan_height.get(),
+        blockchain_height: chain.get(),
         spent_outputs,
         lookahead: lookahead(&app),
         rates: None,
@@ -312,7 +312,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
                 total_received: Amount(t.total_received),
                 total_sent: Amount(t.total_sent),
                 unlock_time: t.unlock_time,
-                height: Some(t.height),
+                height: Some(t.height.get()),
                 spent_outputs: spends.remove(&t.id).unwrap_or_default(),
                 receives,
                 payment_id: t.payment_id.map(HexBytes),
@@ -396,11 +396,11 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
     }
     Ok(Json(AddressTxs {
         total_received: Amount(total_received),
-        scanned_height: account.scan_height,
-        scanned_block_height: account.scan_height,
-        start_height: account.start_height,
-        transaction_height: account.scan_height,
-        blockchain_height: chain,
+        scanned_height: account.scan_height.get(),
+        scanned_block_height: account.scan_height.get(),
+        start_height: account.start_height.get(),
+        transaction_height: account.scan_height.get(),
+        blockchain_height: chain.get(),
         transactions,
         lookahead: lookahead(&app),
     }))
@@ -470,7 +470,7 @@ pub async fn get_unspent_outs(
             tx_prefix_hash: Hex(tx.prefix_hash),
             tx_pub_key: Hex(o.tx_pub_key),
             timestamp: Timestamp::from_unix(tx.timestamp),
-            height: o.height,
+            height: o.height.get(),
             spend_key_images: images.remove(&o.id).unwrap_or_default(),
             rct,
             recipient: Some(meta(o.maj, o.min)),
@@ -671,7 +671,7 @@ pub async fn import_wallet_request(
         Policy::Auto => {
             // Nothing to do for an account that starts at 0, or whose
             // import hasn't got past block 0 yet.
-            if account.start_height == 0 || account.scan_height == 0 {
+            if account.start_height == Height::ZERO || account.scan_height == Height::ZERO {
                 return Ok(reply(false, true, "Approved"));
             }
             creation_allowed(&app, client.as_ref())?;
@@ -685,7 +685,7 @@ pub async fn import_wallet_request(
             let new = NewAccount {
                 address: account.address,
                 view_key: account.view_key,
-                start_height: 0,
+                start_height: Height::ZERO,
                 generated_locally: account.generated_locally,
             };
             let address = new.address.clone();
@@ -821,7 +821,7 @@ pub async fn get_version(State(app): State<Arc<App>>) -> Reply<Version> {
         last_git_commit_hash: option_env!("MONOKULO_LWS_COMMIT").map(String::from),
         last_commit_date: None,
         monero_version_full: info.as_ref().map(|i| i.version.clone()).unwrap_or_default(),
-        blockchain_height: info.map(|i| i.height).unwrap_or(status.chain_height),
+        blockchain_height: info.map(|i| i.height).unwrap_or(status.chain_height).get(),
         api: 2,
         max_subaddresses: app.config.max_subaddresses,
         network: crypto::network_name(network),

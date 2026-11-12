@@ -36,7 +36,7 @@ impl Checked {
     }
 
     /// A new account (or request) for this login.
-    pub fn into_new_account(self, start_height: u64, generated_locally: bool) -> NewAccount {
+    pub fn into_new_account(self, start_height: crate::types::Height, generated_locally: bool) -> NewAccount {
         NewAccount {
             address: self.address,
             view_key: self.view_key,
@@ -269,7 +269,7 @@ mod tests {
         let checked = check_login(Network::Stagenet, &address, key(&view)).unwrap();
         assert_eq!(checked.address().as_str(), address);
         assert!(*checked.view_key() == key(&view));
-        let new = checked.into_new_account(0, false);
+        let new = checked.into_new_account(crate::types::Height::ZERO, false);
         assert!(view_pair(new.address.spend_pub(), &new.view_key).is_ok());
     }
 

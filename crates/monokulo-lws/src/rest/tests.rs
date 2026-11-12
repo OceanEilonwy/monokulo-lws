@@ -19,6 +19,7 @@ use crate::address::Address;
 use crate::db::{Db, Status};
 use crate::limits::{ClientIpConfig, Limits};
 use crate::scanner::{LaneConfig, ScanConfig, Scanner};
+use crate::types::Height;
 use lws_api::PrivateViewKey;
 
 /// A stagenet wallet: its address and private view key.
@@ -74,7 +75,7 @@ fn app(setup: Setup) -> Arc<App> {
         },
     );
     // As if the scanner had heard from the node: a new account starts below this.
-    scanner.status.write().unwrap().chain_height = 1_000;
+    scanner.status.write().unwrap().chain_height = Height::new(1_000);
     Arc::new(App {
         db: crate::db::AsyncDb::new(db),
         daemon,
@@ -100,7 +101,7 @@ fn add(app: &App, seed: u64, status: Status) -> (String, [u8; 32]) {
     let (address, key) = wallet(seed);
     let checked = crate::crypto::check_login(Network::Stagenet, &address, PrivateViewKey::from_bytes(&key)).unwrap();
     app.db
-        .add_account(&checked.into_new_account(10, false), status)
+        .add_account(&checked.into_new_account(Height::new(10), false), status)
         .unwrap();
     (address, key)
 }
@@ -902,7 +903,7 @@ fn subaddress_upserts_match_a_set_and_scale() {
     let (address, key) = wallet(97);
     let checked = crate::crypto::check_login(Network::Stagenet, &address, PrivateViewKey::from_bytes(&key)).unwrap();
     let account = db
-        .add_account(&checked.into_new_account(0, false), Status::Active)
+        .add_account(&checked.into_new_account(Height::ZERO, false), Status::Active)
         .unwrap()
         .id;
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -1002,7 +1003,10 @@ async fn rescan_heights_past_i64_are_refused() {
         .await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
     }
-    assert_eq!(app.db.account(&parsed(&address)).unwrap().unwrap().scan_height, 10);
+    assert_eq!(
+        app.db.account(&parsed(&address)).unwrap().unwrap().scan_height,
+        Height::new(10)
+    );
     let r = call(
         &admin,
         "/rescan",
@@ -1010,14 +1014,17 @@ async fn rescan_heights_past_i64_are_refused() {
     )
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(app.db.account(&parsed(&address)).unwrap().unwrap().scan_height, 5);
+    assert_eq!(
+        app.db.account(&parsed(&address)).unwrap().unwrap().scan_height,
+        Height::new(5)
+    );
     assert_eq!(app.db.import(&[parsed(&address)]).unwrap(), vec![parsed(&address)]);
     let a = app.db.account(&parsed(&address)).unwrap().unwrap();
-    assert_eq!((a.start_height, a.scan_height), (0, 0));
+    assert_eq!((a.start_height, a.scan_height), (Height::ZERO, Height::ZERO));
     // A new account can't start there either.
     let (other, key) = wallet(99);
     let checked = crate::crypto::check_login(Network::Stagenet, &other, PrivateViewKey::from_bytes(&key)).unwrap();
-    let new = checked.into_new_account(u64::MAX, false);
+    let new = checked.into_new_account(Height::MAX, false);
     assert!(matches!(
         app.db.add_account(&new, Status::Active),
         Err(crate::error::Error::BadRequest(_))
@@ -1061,7 +1068,7 @@ fn the_request_queue_cap_is_exact_under_concurrency() {
         let (address, key) = wallet(seed);
         let checked =
             crate::crypto::check_login(Network::Stagenet, &address, PrivateViewKey::from_bytes(&key)).unwrap();
-        checked.into_new_account(0, false)
+        checked.into_new_account(Height::ZERO, false)
     };
     let threads: Vec<_> = (0..16u64)
         .map(|i| {
