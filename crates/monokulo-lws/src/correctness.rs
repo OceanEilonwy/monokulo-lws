@@ -456,7 +456,7 @@ async fn subaddresses_through_additional_keys_and_the_lookahead() {
     let outs = db.outputs(accounts[0].id).unwrap();
     assert_eq!(
         outs.iter()
-            .map(|o| (o.maj, o.min, o.global_index.get()))
+            .map(|o| (o.subaddress.major, o.subaddress.minor, o.global_index.get()))
             .collect::<Vec<_>>(),
         vec![(0, 2, 51), (0, 0, 52)]
     );
@@ -490,7 +490,9 @@ async fn subaddresses_through_additional_keys_and_the_lookahead() {
     write(&db, &[account], make(), 100, true, Some(&every_hit));
     let outs = db.outputs(accounts[0].id).unwrap();
     assert_eq!(
-        outs.iter().map(|o| (o.maj, o.min)).collect::<Vec<_>>(),
+        outs.iter()
+            .map(|o| (o.subaddress.major, o.subaddress.minor))
+            .collect::<Vec<_>>(),
         vec![(0, 2), (0, 0), (1, 5)]
     );
     let app = app(db, 200);

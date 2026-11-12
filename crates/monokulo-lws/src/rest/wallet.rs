@@ -20,7 +20,7 @@ use crate::db::{Account, Holdings, NewAccount, OutputRow, Queued, SpendRow, Stat
 use crate::error::{Error, Result, bad};
 use crate::limits::ClientIp;
 use crate::scanner::{PoolReceipt, PoolSpend, unlocked};
-use crate::types::{AccountId, Height, KeyImage, OutputId, TxHash, TxId};
+use crate::types::{AccountId, Height, KeyImage, OutputId, SubaddressIndex, TxHash, TxId};
 
 type Reply<T> = std::result::Result<Json<T>, ApiError>;
 
@@ -101,8 +101,11 @@ fn lookahead(app: &App) -> Option<AddressMeta> {
     })
 }
 
-fn meta(maj: u32, min: u32) -> AddressMeta {
-    AddressMeta { maj_i: maj, min_i: min }
+fn meta(sub: SubaddressIndex) -> AddressMeta {
+    AddressMeta {
+        maj_i: sub.major,
+        min_i: sub.minor,
+    }
 }
 
 fn chain_height(app: &App) -> Height {
@@ -132,7 +135,7 @@ fn spend_of(o: &OutputRow, key_image: KeyImage, mixin: u32) -> Spend {
         tx_pub_key: o.tx_pub_key.into(),
         out_index: o.out_index.get(),
         mixin,
-        sender: Some(meta(o.maj, o.min)),
+        sender: Some(meta(o.subaddress)),
     }
 }
 
@@ -292,7 +295,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
             global_index: Amount(o.global_index.get()),
             tx_pub_key: o.tx_pub_key.into(),
             rct: o.mask.map(Hex),
-            recipient: meta(o.maj, o.min),
+            recipient: meta(o.subaddress),
         });
     }
     let mut spends = spends_by_tx(&spends, &outputs);
@@ -315,7 +318,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
                 height: Some(t.height.get()),
                 spent_outputs: spends.remove(&t.id).unwrap_or_default(),
                 receives,
-                payment_id: t.payment_id.map(HexBytes),
+                payment_id: t.payment_id.map(HexBytes::from),
                 coinbase: t.coinbase,
                 mempool: false,
                 mixin: t.mixin,
@@ -360,7 +363,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
             .filter_map(|s| Some(spend_of(outputs.get(&s.output)?, s.key_image, s.mixin)))
             .collect();
         let (unlock_time, mixin, fee, payment_id) = match (receipts.first(), spent.first()) {
-            (Some(r), _) => (r.unlock_time, r.mixin, r.fee, r.payment_id.clone()),
+            (Some(r), _) => (r.unlock_time, r.mixin, r.fee, r.payment_id),
             (None, Some(s)) => (s.unlock_time, s.mixin, s.fee, None),
             (None, None) => continue,
         };
@@ -385,10 +388,10 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
                     global_index: Amount(0),
                     tx_pub_key: r.tx_pub_key.into(),
                     rct: r.mask.map(Hex),
-                    recipient: meta(r.maj, r.min),
+                    recipient: meta(r.subaddress),
                 })
                 .collect(),
-            payment_id: payment_id.map(HexBytes),
+            payment_id: payment_id.map(HexBytes::from),
             coinbase: false,
             mempool: true,
             mixin,
@@ -473,7 +476,7 @@ pub async fn get_unspent_outs(
             height: o.height.get(),
             spend_key_images: images.remove(&o.id).unwrap_or_default(),
             rct,
-            recipient: Some(meta(o.maj, o.min)),
+            recipient: Some(meta(o.subaddress)),
         });
     }
     if total < req.amount.0 {

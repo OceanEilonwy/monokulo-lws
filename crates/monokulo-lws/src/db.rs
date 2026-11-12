@@ -28,7 +28,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use crate::address::Address;
 use crate::error::{Error, Result, bad};
 use crate::types::{
-    AccountId, BlockHash, GlobalIndex, Height, KeyImage, OutIndex, OutputId, PublicKey, SqlU64, TxHash, TxId,
+    AccountId, BlockHash, GlobalIndex, Height, KeyImage, OutIndex, OutputId, PaymentId, PublicKey, SqlU64,
+    SubaddressIndex, TxHash, TxId,
 };
 
 pub(crate) const SCHEMA: &str = r#"
@@ -180,7 +181,7 @@ pub struct TxRow {
     pub coinbase: bool,
     pub mixin: u32,
     pub fee: Amount,
-    pub payment_id: Option<Vec<u8>>,
+    pub payment_id: Option<PaymentId>,
     pub tx_pub_key: PublicKey,
     pub total_received: Amount,
     pub total_sent: Amount,
@@ -200,8 +201,7 @@ pub struct OutputRow {
     /// The unencrypted RingCT mask; `None` for a pre-RingCT output.
     pub mask: Option<[u8; 32]>,
     pub height: Height,
-    pub maj: u32,
-    pub min: u32,
+    pub subaddress: SubaddressIndex,
     /// The Pedersen commitment the chain holds for the output (the RingCT
     /// base's `outPk`; `G + amount·H` for a miner output); `None` for a
     /// pre-RingCT output.
@@ -232,7 +232,7 @@ pub type Pending = (TxHash, Vec<u8>, Vec<u8>);
 
 /// What a new transaction row carries. `total_received`/`total_sent` grow
 /// as outputs and spends are added to it.
-pub struct NewTx<'a> {
+pub struct NewTx {
     pub hash: TxHash,
     pub prefix_hash: [u8; 32],
     pub height: Height,
@@ -241,7 +241,7 @@ pub struct NewTx<'a> {
     pub coinbase: bool,
     pub mixin: u32,
     pub fee: Amount,
-    pub payment_id: Option<&'a [u8]>,
+    pub payment_id: Option<PaymentId>,
     pub tx_pub_key: PublicKey,
 }
 
@@ -253,8 +253,7 @@ pub struct NewOutput {
     pub tx_pub_key: PublicKey,
     pub mask: Option<[u8; 32]>,
     pub height: Height,
-    pub maj: u32,
-    pub min: u32,
+    pub subaddress: SubaddressIndex,
     pub commitment: Option<[u8; 32]>,
 }
 
@@ -1332,8 +1331,10 @@ fn outputs_in(c: &Connection, account: AccountId) -> Result<Vec<OutputRow>> {
                 tx_pub_key: r.get(6)?,
                 mask: r.get(7)?,
                 height: r.get(8)?,
-                maj: r.get(9)?,
-                min: r.get(10)?,
+                subaddress: SubaddressIndex {
+                    major: r.get(9)?,
+                    minor: r.get(10)?,
+                },
                 commitment: r.get(11)?,
             })
         })?
@@ -1559,8 +1560,8 @@ impl<'a> ScanWriter<'a> {
                 o.tx_pub_key,
                 o.mask.as_ref().map(|m| m.as_slice()),
                 o.height,
-                o.maj,
-                o.min,
+                o.subaddress.major,
+                o.subaddress.minor,
                 o.commitment.as_ref().map(|c| c.as_slice())
             ],
         )?;
@@ -1795,8 +1796,7 @@ mod tests {
                         tx_pub_key: PublicKey([7; 32]),
                         mask: Some([5; 32]),
                         height: Height::new(12),
-                        maj: 0,
-                        min: 0,
+                        subaddress: SubaddressIndex::default(),
                         commitment: None
                     }
                 )?
@@ -1814,8 +1814,7 @@ mod tests {
                         tx_pub_key: PublicKey([7; 32]),
                         mask: Some([5; 32]),
                         height: Height::new(12),
-                        maj: 0,
-                        min: 0,
+                        subaddress: SubaddressIndex::default(),
                         commitment: None
                     }
                 )?
@@ -1860,7 +1859,7 @@ mod tests {
         assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, Height::new(0));
     }
 
-    fn new_tx(hash: u8, height: u64) -> NewTx<'static> {
+    fn new_tx(hash: u8, height: u64) -> NewTx {
         NewTx {
             hash: TxHash([hash; 32]),
             prefix_hash: [0; 32],
@@ -1884,8 +1883,7 @@ mod tests {
             tx_pub_key: PublicKey([0; 32]),
             mask: Some([1; 32]),
             height: Height::new(height),
-            maj: 0,
-            min: 0,
+            subaddress: SubaddressIndex::default(),
             commitment: None,
         }
     }

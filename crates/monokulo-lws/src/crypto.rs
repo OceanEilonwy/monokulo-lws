@@ -159,11 +159,11 @@ pub fn derived_by(
     view_key: &PrivateViewKey,
     index: u64,
     key_offset: &DScalar,
-    (major, minor): (u32, u32),
+    subaddress: crate::types::SubaddressIndex,
     main: &[u8; 32],
     additional: Option<&[u8; 32]>,
 ) -> [u8; 32] {
-    let sub = subaddress_derivation(view_key, major, minor);
+    let sub = subaddress_derivation(view_key, subaddress.major, subaddress.minor);
     let fits = |r: &[u8; 32]| {
         shared_scalar(view_key, r, index)
             .map(|s| *s + sub == *key_offset)

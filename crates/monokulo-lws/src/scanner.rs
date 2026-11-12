@@ -41,7 +41,10 @@ use crate::daemon::{Daemon, Fetched, RawBlock};
 use crate::db::{Account, Db, NewOutput, NewTx, OutputRow, ScanWriter, Status};
 use crate::error::{Error, Result};
 use crate::lanes::{Join, Plan};
-use crate::types::{AccountId, BlockHash, GlobalIndex, Height, KeyImage, OutIndex, OutputId, PublicKey, TxHash};
+use crate::types::{
+    AccountId, BlockHash, GlobalIndex, Height, KeyImage, OutIndex, OutputId, PaymentId as Pid, PublicKey,
+    SubaddressIndex as Sub, TxHash,
+};
 
 /// Blocks the live lane asks for in one request.
 const BATCH: u64 = 100;
@@ -93,9 +96,8 @@ pub struct PoolReceipt {
     pub unlock_time: u64,
     pub mixin: u32,
     pub fee: Amount,
-    pub payment_id: Option<Vec<u8>>,
-    pub maj: u32,
-    pub min: u32,
+    pub payment_id: Option<Pid>,
+    pub subaddress: Sub,
     pub seen: u64,
 }
 
@@ -1491,7 +1493,7 @@ struct TxMeta {
     coinbase: bool,
     mixin: u32,
     fee: Amount,
-    payment_id: Option<Vec<u8>>,
+    payment_id: Option<Pid>,
     main_key: PublicKey,
     /// The key the output in hand was derived from.
     derived_key: PublicKey,
@@ -1502,10 +1504,7 @@ impl TxMeta {
         let prefix = tx.prefix();
         let (main_key, additional) = extra_keys(&prefix.extra);
         let index = output.index_in_transaction();
-        let sub = output
-            .subaddress()
-            .map(|s| (s.account(), s.address()))
-            .unwrap_or((0, 0));
+        let sub = subaddress_of(output);
         let key_offset: DScalar = output.key_offset().into();
         let extra_key = usize::try_from(index).ok().and_then(|i| additional.get(i));
         let derived_key = crypto::derived_by(view_key, index, &key_offset, sub, &main_key, extra_key);
@@ -1516,15 +1515,15 @@ impl TxMeta {
             mixin: mixin(tx),
             fee: fee(tx),
             payment_id: output.payment_id().map(|id| match id {
-                PaymentId::Encrypted(short) => short.to_vec(),
-                PaymentId::Unencrypted(long) => long.to_vec(),
+                PaymentId::Encrypted(short) => Pid::Short(short),
+                PaymentId::Unencrypted(long) => Pid::Long(long),
             }),
             main_key: PublicKey(main_key),
             derived_key: PublicKey(derived_key),
         }
     }
 
-    fn new_tx<'a>(&'a self, hash: TxHash, height: Height, timestamp: u64) -> NewTx<'a> {
+    fn new_tx(&self, hash: TxHash, height: Height, timestamp: u64) -> NewTx {
         NewTx {
             hash,
             prefix_hash: self.prefix_hash,
@@ -1534,7 +1533,7 @@ impl TxMeta {
             coinbase: self.coinbase,
             mixin: self.mixin,
             fee: self.fee,
-            payment_id: self.payment_id.as_deref(),
+            payment_id: self.payment_id,
             tx_pub_key: self.main_key,
         }
     }
@@ -1589,8 +1588,7 @@ fn record_received(
             tx_pub_key: meta.derived_key,
             mask: rct.then(|| *mask.as_bytes()),
             height,
-            maj: output.subaddress().map(|s| s.account()).unwrap_or(0),
-            min: output.subaddress().map(|s| s.address()).unwrap_or(0),
+            subaddress: subaddress_of(&output),
             commitment: onchain_commitment(tx, index, &output),
         };
         if let Some(id) = w.add_output(account.id, tx_id, &new)?
@@ -1608,8 +1606,7 @@ fn record_received(
                     tx_pub_key: new.tx_pub_key,
                     mask: new.mask,
                     height,
-                    maj: new.maj,
-                    min: new.min,
+                    subaddress: new.subaddress,
                     commitment: new.commitment,
                 },
             );
@@ -1713,9 +1710,8 @@ pub fn scan_pool_block(
                 unlock_time: meta.unlock_time,
                 mixin: meta.mixin,
                 fee: meta.fee,
-                payment_id: meta.payment_id.clone(),
-                maj: output.subaddress().map(|s| s.account()).unwrap_or(0),
-                min: output.subaddress().map(|s| s.address()).unwrap_or(0),
+                payment_id: meta.payment_id,
+                subaddress: subaddress_of(&output),
                 seen: now,
             });
         }
@@ -1865,6 +1861,14 @@ fn unlock_time(timelock: Timelock) -> u64 {
         Timelock::Block(b) => b as u64,
         Timelock::Time(t) => t,
     }
+}
+
+/// The subaddress an output paid; the primary address's (0, 0) if none.
+fn subaddress_of(output: &WalletOutput) -> Sub {
+    output.subaddress().map_or(Sub::default(), |s| Sub {
+        major: s.account(),
+        minor: s.address(),
+    })
 }
 
 fn is_coinbase(tx: &Transaction<Pruned>) -> bool {
@@ -2435,8 +2439,7 @@ mod tests {
             tx_pub_key: PublicKey([0; 32]),
             mask: Some([0; 32]),
             height: Height::new(1),
-            maj: 0,
-            min: 0,
+            subaddress: Sub::default(),
             commitment: None,
         };
         let a = AccountId::new;

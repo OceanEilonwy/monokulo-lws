@@ -1,5 +1,5 @@
-//! The server's own value types: row ids, heights, indexes, hashes and
-//! keys, and how each is stored.
+//! The server's own value types: row ids, heights, indexes, hashes, keys,
+//! payment ids and subaddress indexes, and how each is stored.
 //!
 //! Each is its own type so that passing one where another belongs (an
 //! output's row id where a transaction's goes) doesn't compile. Each that is
@@ -315,6 +315,61 @@ bytes32!(
     PublicKey
 );
 
+/// A payment id: 8 bytes (encrypted, in an integrated address's payments)
+/// or 32 (the old unencrypted kind), nothing else. Stored as a blob of
+/// its bytes; a blob of another length is an error on read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PaymentId {
+    Short([u8; 8]),
+    Long([u8; 32]),
+}
+
+impl PaymentId {
+    /// 8 or 32 bytes; `None` for any other length.
+    pub fn from_slice(bytes: &[u8]) -> Option<PaymentId> {
+        if let Ok(short) = <[u8; 8]>::try_from(bytes) {
+            return Some(PaymentId::Short(short));
+        }
+        <[u8; 32]>::try_from(bytes).ok().map(PaymentId::Long)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            PaymentId::Short(b) => b,
+            PaymentId::Long(b) => b,
+        }
+    }
+}
+
+impl From<PaymentId> for lws_api::HexBytes {
+    fn from(v: PaymentId) -> Self {
+        lws_api::HexBytes(v.as_bytes().to_vec())
+    }
+}
+
+impl ToSql for PaymentId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_bytes()))
+    }
+}
+
+impl FromSql for PaymentId {
+    fn column_result(v: ValueRef<'_>) -> FromSqlResult<Self> {
+        let bytes = v.as_blob()?;
+        PaymentId::from_slice(bytes)
+            .ok_or_else(|| FromSqlError::Other(format!("a payment id of {} bytes", bytes.len()).into()))
+    }
+}
+
+/// A subaddress by its indexes; (0, 0) is the primary address. Stored in
+/// two INTEGER columns (`maj`, `min`), which rusqlite reads as u32 with a
+/// range check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubaddressIndex {
+    pub major: u32,
+    pub minor: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +447,27 @@ mod tests {
         }
         assert_eq!(PublicKey::from_hex(&"00".repeat(32)), Some(PublicKey([0; 32])));
         assert_eq!(PublicKey::from_hex(&"00".repeat(33)), None);
+    }
+
+    /// A payment id is 8 or 32 bytes, in memory and in the database.
+    #[test]
+    fn payment_ids_are_8_or_32_bytes() {
+        assert_eq!(PaymentId::from_slice(&[1; 8]), Some(PaymentId::Short([1; 8])));
+        assert_eq!(PaymentId::from_slice(&[2; 32]), Some(PaymentId::Long([2; 32])));
+        for len in [0, 7, 9, 16, 31, 33] {
+            assert_eq!(PaymentId::from_slice(&vec![0; len]), None, "{len}");
+        }
+        assert_eq!(PaymentId::Short([3; 8]).as_bytes(), &[3; 8]);
+        let c = conn();
+        c.execute("INSERT INTO t VALUES (?1)", [PaymentId::Long([4; 32])])
+            .unwrap();
+        let back: PaymentId = c.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(back, PaymentId::Long([4; 32]));
+        c.execute("UPDATE t SET v = x'010203'", []).unwrap();
+        let e = c
+            .query_row("SELECT v FROM t", [], |r| r.get::<_, PaymentId>(0))
+            .unwrap_err();
+        assert!(e.to_string().contains("a payment id of 3 bytes"), "{e}");
     }
 
     /// An out index past 65,535 in the database is an error, not truncated.
