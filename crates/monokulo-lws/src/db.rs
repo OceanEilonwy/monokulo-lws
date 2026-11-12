@@ -666,21 +666,40 @@ impl Db {
 
     /// Forget everything from `height` on: a reorg went deeper than it.
     pub fn rewind(&self, height: u64) -> Result<()> {
+        self.write(|tx| rewind_in(tx, height))
+    }
+
+    /// How many reorgs (rewinds, and stops for one too deep) there have
+    /// been. A batch fetched before it changed may hold blocks of an
+    /// orphaned chain, and is not written (`ScanWriter::reorg_generation`).
+    pub fn reorg_generation(&self) -> Result<u64> {
+        self.read(|c| meta_u64(c, "reorg_generation").map(|g| g.unwrap_or(0)))
+    }
+
+    /// The lowest kept height, if scanning is stopped for a reorg deeper
+    /// than the kept hashes (`halt`).
+    pub fn halted(&self) -> Result<Option<u64>> {
+        self.read(|c| meta_u64(c, "halted_below"))
+    }
+
+    /// Stops scanning for a reorg deeper than the kept hashes, the lowest of
+    /// which is at `lowest`; kept across restarts until `resume`. Nothing is
+    /// rewound: below `lowest` the server can't tell which rows are from the
+    /// orphaned chain, so the operator rescans.
+    pub fn halt(&self, lowest: u64) -> Result<()> {
         self.write(|tx| {
-            let h = height as i64;
-            tx.execute("DELETE FROM spends WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM outputs WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM txs WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM blocks WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM blocks_kept WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM txs_kept WHERE height >= ?1", [h])?;
-            tx.execute("UPDATE accounts SET scan_height = MIN(scan_height, ?1)", [h])?;
-            tx.execute("UPDATE txs SET total_received = (SELECT COALESCE(SUM(amount), 0) FROM outputs WHERE outputs.tx = txs.id)", [])?;
-            tx.execute(
-                "UPDATE txs SET total_sent = (SELECT COALESCE(SUM(o.amount), 0) FROM spends s JOIN outputs o ON o.id = s.output WHERE s.tx = txs.id)",
-                [],
-            )?;
-            tx.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('scanner_height', ?1)", [height.to_string()])?;
+            bump_generation(tx)?;
+            set_meta(tx, "halted_below", lowest)
+        })
+    }
+
+    /// Scanning goes on after `halt(lowest)`, the accounts having been
+    /// rescanned from below it: everything from `lowest` on, all of it from
+    /// the orphaned chain (the hashes kept there among it), goes.
+    pub fn resume(&self, lowest: u64) -> Result<()> {
+        self.write(|tx| {
+            rewind_in(tx, lowest)?;
+            tx.execute("DELETE FROM meta WHERE key = 'halted_below'", [])?;
             Ok(())
         })
     }
@@ -1116,6 +1135,51 @@ fn drop_unused_kept(tx: &Transaction, height: u64) -> Result<()> {
     Ok(())
 }
 
+/// Forgets everything from `height` on, for every account, and counts a
+/// reorg. The totals of the transactions left need no recomputing: an
+/// output or spend is written at its transaction's height, so every one
+/// deleted belonged to a transaction deleted with it.
+fn rewind_in(tx: &Transaction, height: u64) -> Result<()> {
+    let h = height as i64;
+    tx.execute("DELETE FROM spends WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM outputs WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM txs WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM blocks WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM blocks_kept WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM txs_kept WHERE height >= ?1", [h])?;
+    tx.execute("UPDATE accounts SET scan_height = MIN(scan_height, ?1)", [h])?;
+    set_meta(tx, "scanner_height", height)?;
+    bump_generation(tx)
+}
+
+fn meta_u64(c: &Connection, key: &str) -> Result<Option<u64>> {
+    Ok(c.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+        r.get::<_, String>(0)
+    })
+    .optional()?
+    .and_then(|s| s.parse().ok()))
+}
+
+fn set_meta(tx: &Transaction, key: &str, value: u64) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![key, value.to_string()],
+    )?;
+    Ok(())
+}
+
+fn bump_generation(tx: &Transaction) -> Result<()> {
+    let generation = meta_u64(tx, "reorg_generation")?.unwrap_or(0);
+    set_meta(tx, "reorg_generation", generation.wrapping_add(1))
+}
+
+/// A transaction's running total.
+#[derive(Clone, Copy)]
+enum Total {
+    Received,
+    Sent,
+}
+
 /// Writes the scanner makes, inside one transaction per batch of blocks.
 pub struct ScanWriter<'a> {
     tx: &'a Transaction<'a>,
@@ -1140,6 +1204,34 @@ impl<'a> ScanWriter<'a> {
             [(height + 1).to_string()],
         )?;
         Ok(())
+    }
+
+    /// Keeps a block's hash, as a catch-up lane does near the tip: no older
+    /// hashes are dropped and the scanner's own height doesn't move, as
+    /// both are the live lane's.
+    pub fn keep_hash(&self, height: u64, hash: &[u8; 32]) -> Result<()> {
+        self.tx.execute(
+            "INSERT OR REPLACE INTO blocks (height, hash) VALUES (?1, ?2)",
+            params![height as i64, hash.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// The hash kept for `height`, as this transaction sees it.
+    pub fn block_hash(&self, height: u64) -> Result<Option<[u8; 32]>> {
+        Ok(self
+            .tx
+            .query_row("SELECT hash FROM blocks WHERE height = ?1", [height as i64], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .optional()?
+            .map(blob32)
+            .transpose()?)
+    }
+
+    /// `Db::reorg_generation`, as this transaction sees it.
+    pub fn reorg_generation(&self) -> Result<u64> {
+        Ok(meta_u64(self.tx, "reorg_generation")?.unwrap_or(0))
     }
 
     /// Keeps a block that pays an account, for proofs: its hash and its blob
@@ -1244,11 +1336,31 @@ impl<'a> ScanWriter<'a> {
         if changed == 0 {
             return Ok(None);
         }
-        self.tx.execute(
-            "UPDATE txs SET total_received = total_received + ?1 WHERE id = ?2",
-            params![o.amount as i64, tx],
-        )?;
-        Ok(Some(self.tx.last_insert_rowid()))
+        let id = self.tx.last_insert_rowid();
+        self.add_to_total(Total::Received, tx, o.amount)?;
+        Ok(Some(id))
+    }
+
+    /// Adds `amount` to a transaction's total, in Rust: the column holds a
+    /// u64 bit-cast to i64, which SQL's `+` would add as signed (and turn
+    /// into a REAL past i64's range). A sum past u64's range is an error.
+    fn add_to_total(&self, total: Total, tx: i64, amount: u64) -> Result<()> {
+        let (select, update) = match total {
+            Total::Received => (
+                "SELECT total_received FROM txs WHERE id = ?1",
+                "UPDATE txs SET total_received = ?1 WHERE id = ?2",
+            ),
+            Total::Sent => (
+                "SELECT total_sent FROM txs WHERE id = ?1",
+                "UPDATE txs SET total_sent = ?1 WHERE id = ?2",
+            ),
+        };
+        let now: i64 = self.tx.query_row(select, [tx], |r| r.get(0))?;
+        let sum = (now as u64)
+            .checked_add(amount)
+            .ok_or_else(|| Error::Internal("a transaction's total would pass 2^64".into()))?;
+        self.tx.execute(update, params![sum as i64, tx])?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1267,10 +1379,7 @@ impl<'a> ScanWriter<'a> {
             params![account, tx, output, key_image.as_slice(), mixin, height as i64],
         )?;
         if changed > 0 {
-            self.tx.execute(
-                "UPDATE txs SET total_sent = total_sent + ?1 WHERE id = ?2",
-                params![amount as i64, tx],
-            )?;
+            self.add_to_total(Total::Sent, tx, amount)?;
         }
         Ok(())
     }
@@ -1501,6 +1610,145 @@ mod tests {
         db.rescan(&["A".into()], 0).unwrap();
         assert!(db.outputs(a.id).unwrap().is_empty());
         assert_eq!(db.account("A").unwrap().unwrap().scan_height, 0);
+    }
+
+    fn new_tx(hash: u8, height: u64) -> NewTx<'static> {
+        NewTx {
+            hash: [hash; 32],
+            prefix_hash: [0; 32],
+            height,
+            timestamp: 0,
+            unlock_time: 0,
+            coinbase: false,
+            mixin: 15,
+            fee: 0,
+            payment_id: None,
+            tx_pub_key: [0; 32],
+        }
+    }
+
+    fn new_output(key: u8, global_index: u64, amount: u64, height: u64) -> NewOutput {
+        NewOutput {
+            out_index: 0,
+            global_index,
+            amount,
+            public_key: [key; 32],
+            tx_pub_key: [0; 32],
+            mask: Some([1; 32]),
+            height,
+            maj: 0,
+            min: 0,
+            commitment: None,
+        }
+    }
+
+    #[test]
+    fn set_block_keeps_only_the_last_hashes() {
+        let db = Db::in_memory();
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            for h in 1..=30 {
+                w.set_block(h, &[h as u8; 32], 10)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let kept = db.recent_blocks().unwrap();
+        assert_eq!(kept.len(), 11);
+        assert_eq!((kept[0].0, kept[10].0), (30, 20));
+    }
+
+    /// A rewind and a stop for a reorg too deep each count a reorg; a stop
+    /// lasts until `resume`, which drops everything from the lowest kept
+    /// height on.
+    #[test]
+    fn reorgs_are_counted_and_a_stop_lasts_until_resumed() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            assert_eq!(w.reorg_generation()?, 0);
+            let t = w.tx_row(a.id, &new_tx(1, 20))?;
+            w.add_output(a.id, t, &new_output(1, 100, 5, 20))?;
+            for h in 15..=25 {
+                w.set_block(h, &[h as u8; 32], 100)?;
+            }
+            w.set_scan_height(a.id, 26)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.reorg_generation().unwrap(), 0);
+        db.rewind(24).unwrap();
+        assert_eq!(db.reorg_generation().unwrap(), 1);
+        assert_eq!(db.halted().unwrap(), None);
+        db.halt(15).unwrap();
+        assert_eq!(db.reorg_generation().unwrap(), 2);
+        assert_eq!(db.halted().unwrap(), Some(15));
+        assert_eq!(db.outputs(a.id).unwrap().len(), 1, "a stop rewinds nothing");
+        db.resume(15).unwrap();
+        assert_eq!(db.halted().unwrap(), None);
+        assert!(db.recent_blocks().unwrap().is_empty());
+        assert!(db.outputs(a.id).unwrap().is_empty());
+        assert_eq!(db.account("A").unwrap().unwrap().scan_height, 15);
+    }
+
+    /// A rewind leaves the totals of the transactions before it as they
+    /// were, received and sent, without recomputing them.
+    #[test]
+    fn totals_stay_right_after_a_rewind() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t1 = w.tx_row(a.id, &new_tx(1, 10))?;
+            let o70 = w.add_output(a.id, t1, &new_output(1, 100, 70, 10))?.unwrap();
+            let o30 = w.add_output(a.id, t1, &new_output(2, 101, 30, 10))?.unwrap();
+            let t2 = w.tx_row(a.id, &new_tx(2, 11))?;
+            w.add_output(a.id, t2, &new_output(3, 102, 5, 11))?;
+            w.add_spend(a.id, t2, o70, 70, &[7; 32], 15, 11)?;
+            let t3 = w.tx_row(a.id, &new_tx(3, 20))?;
+            w.add_output(a.id, t3, &new_output(4, 103, 9, 20))?;
+            w.add_spend(a.id, t3, o30, 30, &[8; 32], 15, 20)?;
+            Ok(())
+        })
+        .unwrap();
+        let totals = |db: &Db| -> Vec<(u64, u64, u64)> {
+            db.txs(a.id)
+                .unwrap()
+                .iter()
+                .map(|t| (t.height, t.total_received, t.total_sent))
+                .collect()
+        };
+        assert_eq!(totals(&db), vec![(10, 100, 0), (11, 5, 70), (20, 9, 30)]);
+        db.rewind(15).unwrap();
+        assert_eq!(totals(&db), vec![(10, 100, 0), (11, 5, 70)]);
+        assert_eq!(db.spends(a.id).unwrap().len(), 1);
+    }
+
+    /// Totals are added as the u64s they are: past 2^63 they read back
+    /// whole, and past 2^64 the write fails rather than wrapping.
+    #[test]
+    fn totals_add_as_u64_and_never_wrap() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        let big = (1u64 << 63) + 5;
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t = w.tx_row(a.id, &new_tx(1, 10))?;
+            w.add_output(a.id, t, &new_output(1, 100, big, 10))?;
+            w.add_output(a.id, t, &new_output(2, 101, 7, 10))?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.txs(a.id).unwrap()[0].total_received, big + 7);
+        let over = db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t = w.tx_row(a.id, &new_tx(1, 10))?;
+            w.add_output(a.id, t, &new_output(3, 102, u64::MAX - big, 10))?;
+            Ok(())
+        });
+        assert!(over.is_err());
+        assert_eq!(db.txs(a.id).unwrap()[0].total_received, big + 7, "nothing written");
     }
 
     #[test]

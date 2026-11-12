@@ -18,6 +18,7 @@
 //! at, as the first version did.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -43,8 +44,12 @@ use crate::lanes::{Join, Plan};
 
 /// Blocks the live lane asks for in one request.
 const BATCH: u64 = 100;
-/// Block hashes kept behind the tip, to find where a reorg forked.
-const KEEP_HASHES: u64 = 200;
+/// Block hashes kept behind the tip, to find where a reorg forked (about two
+/// weeks of blocks; finding the fork bisects them). A reorg deeper than
+/// this stops the scan until the operator rescans.
+pub(crate) const KEEP_HASHES: u64 = 10_000;
+/// While stopped for a reorg too deep, the error is logged again this often.
+const HALT_LOG_EVERY: Duration = Duration::from_secs(300);
 /// Outputs are unspendable for this many blocks; new ones can't be ring
 /// members either.
 pub const SPENDABLE_AGE: u64 = 10;
@@ -398,6 +403,11 @@ pub struct Scanner {
     arenas: Vec<Arena>,
     catch_up: Semaphore,
     live_ring: Mutex<Option<Ring>>,
+    /// Set by a catch-up lane whose blocks don't follow the hashes kept: the
+    /// live lane looks for a reorg on its next step, accounts or not.
+    suspect: AtomicBool,
+    /// When the stop for a reorg too deep was last logged.
+    halt_logged: Mutex<Option<Instant>>,
 }
 
 impl Scanner {
@@ -416,6 +426,8 @@ impl Scanner {
             moved: Notify::new(),
             arenas,
             live_ring: Mutex::new(None),
+            suspect: AtomicBool::new(false),
+            halt_logged: Mutex::new(None),
         })
     }
 
@@ -489,12 +501,38 @@ impl Scanner {
     pub async fn step(self: &Arc<Self>) -> Result<bool> {
         let info = self.daemon.info().await?;
         let chain_height = info.height;
+        if chain_height == 0 {
+            // Even a new chain has its genesis block.
+            return Err(Error::Daemon("the node says it has no blocks".into()));
+        }
         self.set_status(|s| {
             s.chain_height = chain_height;
             s.last_error = None;
             s.last_step = Some(Instant::now());
         });
         let active = self.db.accounts(Some(Status::Active))?;
+        if let Some(lowest) = self.db.halted()? {
+            if !active.iter().all(|a| a.scan_height < lowest) {
+                let message = halt_message(lowest);
+                let mut logged = self.halt_logged.lock().unwrap_or_else(|e| e.into_inner());
+                if logged.is_none_or(|at| at.elapsed() >= HALT_LOG_EVERY) {
+                    tracing::error!("scan stopped: {message}");
+                    *logged = Some(Instant::now());
+                }
+                self.set_status(|s| s.last_error = Some(message));
+                return Ok(false);
+            }
+            self.db.resume(lowest)?;
+            *self.halt_logged.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            tracing::warn!(
+                "scan resumed after the deep reorg: no active account stands at or above {lowest}; what was kept from there on is dropped"
+            );
+        }
+        if self.suspect.swap(false, Ordering::SeqCst) {
+            // A catch-up lane fetched blocks that don't follow the hashes kept.
+            self.reorg().await?;
+            return Ok(true);
+        }
         let (accounts, start) = if self.config.lanes.lanes == 0 {
             let start = active
                 .iter()
@@ -514,8 +552,9 @@ impl Scanner {
             // Caught up: a reorg that replaced the top block without making the
             // chain longer shows only in the top block's hash.
             let top = crate::daemon::hex32(&info.top_block_hash);
-            if let (Some(kept), Some(top)) = (self.db.block_hash(chain_height - 1)?, top)
-                && start == chain_height
+            if start == chain_height
+                && let Some(top) = top
+                && let Some(kept) = self.db.block_hash(chain_height - 1)?
                 && kept != top
             {
                 self.reorg().await?;
@@ -527,30 +566,34 @@ impl Scanner {
         }
 
         let count = BATCH.min(chain_height - start);
+        let generation = self.db.reorg_generation()?;
         let fetched = self.daemon.blocks(start, count).await?;
         if fetched.is_empty() {
             return Err(Error::Daemon("the node sent no blocks".into()));
-        }
-        if fetched[0].block.block.number() as u64 != start {
-            return Err(Error::Daemon("the node sent blocks from the wrong height".into()));
-        }
-
-        // A reorg shows as the first block not following the one we kept.
-        if let Some(kept) = self.db.block_hash(start - 1)?
-            && kept != fetched[0].block.block.header.previous
-        {
-            self.reorg().await?;
-            return Ok(true);
         }
 
         let batch = Batch::new(fetched);
         let fetched = batch.blocks.len() as u64;
         let last = batch.blocks.last().map(|b| b.block.clone());
         let mut ring = self.live_ring.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let at = Window {
+            start,
+            live: true,
+            generation,
+            keep_from: 0,
+        };
         let result =
-            tokio::task::block_in_place(|| self.scan_batch(&mut ring, &self.arenas[0], &accounts, &batch, start, true));
+            tokio::task::block_in_place(|| self.scan_batch(&mut ring, &self.arenas[0], &accounts, &batch, &at));
         *self.live_ring.lock().unwrap_or_else(|e| e.into_inner()) = ring;
-        result?;
+        match result? {
+            Outcome::Written => {}
+            // A reorg shows as a block not following, or not being, the one kept.
+            Outcome::Diverged => {
+                self.reorg().await?;
+                return Ok(true);
+            }
+            Outcome::Stale => return Ok(true),
+        }
         self.complete_proofs().await;
         *self.last_block.lock().unwrap_or_else(|e| e.into_inner()) = last;
         let next = start + fetched;
@@ -661,6 +704,10 @@ impl Scanner {
             self.plan().end(task.id);
             return Ok(LaneStep::Done);
         }
+        if self.db.halted()?.is_some() {
+            // Stopped for a reorg too deep: the live lane says when it's over.
+            return Ok(LaneStep::Wait);
+        }
         let cursor = accounts.iter().map(|a| a.scan_height).min().unwrap_or(0).max(1);
         let (ready, live) = {
             let mut plan = self.plan();
@@ -672,6 +719,9 @@ impl Scanner {
             return Ok(LaneStep::Wait);
         }
         let count = self.config.lanes.blocks.max(1).min(live - cursor);
+        // Read before fetching: a reorg unwound while the blocks were on
+        // their way may have orphaned them.
+        let generation = self.db.reorg_generation()?;
         let fetched = {
             let _permit = self
                 .catch_up
@@ -680,27 +730,51 @@ impl Scanner {
                 .map_err(|e| Error::Internal(e.to_string()))?;
             self.daemon.blocks(cursor, count).await?
         };
-        if fetched.first().map(|f| f.block.block.number() as u64) != Some(cursor) {
-            return Err(Error::Daemon("the node sent blocks from the wrong height".into()));
+        if fetched.is_empty() {
+            return Err(Error::Daemon("the node sent no blocks".into()));
         }
         let batch = Batch::new(fetched);
-        tokio::task::block_in_place(|| self.scan_batch(&mut task.ring, &task.arena, &accounts, &batch, cursor, false))?;
-        self.complete_proofs().await;
+        let at = Window {
+            start: cursor,
+            live: false,
+            generation,
+            keep_from: live.saturating_sub(KEEP_HASHES),
+        };
+        let outcome =
+            tokio::task::block_in_place(|| self.scan_batch(&mut task.ring, &task.arena, &accounts, &batch, &at))?;
+        match outcome {
+            Outcome::Written => self.complete_proofs().await,
+            Outcome::Stale => tracing::info!("catch-up lane {}: a reorg came while fetching; again", task.id),
+            Outcome::Diverged => {
+                // The node's chain isn't the one whose hashes are kept: the
+                // live lane, which alone unwinds reorgs, looks for the fork.
+                tracing::info!(
+                    "catch-up lane {}: blocks from {cursor} don't follow the hashes kept",
+                    task.id
+                );
+                self.suspect.store(true, Ordering::SeqCst);
+                self.wake.notify_one();
+                return Ok(LaneStep::Wait);
+            }
+        }
         Ok(LaneStep::More)
     }
 
-    /// Scans `batch` (from height `start`) for `accounts`, each only in the
-    /// blocks at or above its scan height, writing outputs, spends and scan
-    /// heights, and the block hashes for the live lane.
+    /// Scans `batch` (from `at.start`) for `accounts`, each only in the
+    /// blocks at or above its scan height, writing outputs, spends, scan
+    /// heights and block hashes (the live lane's all, a catch-up lane's
+    /// from `at.keep_from` on), in one transaction. Nothing is written if a
+    /// reorg was unwound since `at.generation` was read (`Stale`), or if
+    /// the blocks don't follow, or aren't, the ones whose hashes are kept
+    /// (`Diverged`).
     fn scan_batch(
         &self,
         slot: &mut Option<Ring>,
         arena: &Arena,
         accounts: &[Account],
         batch: &Batch,
-        start: u64,
-        live: bool,
-    ) -> Result<()> {
+        at: &Window,
+    ) -> Result<Outcome> {
         let ring = self
             .db
             .write(|tx| Ring::get(slot, &ScanWriter::new(tx), accounts, self.config.lookahead, arena).map(|_| ()));
@@ -709,16 +783,32 @@ impl Scanner {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         let hits = ring.keyring.flag_many(&batch.blocks, threads, 0);
         self.db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            if w.reorg_generation()? != at.generation {
+                return Ok(Outcome::Stale);
+            }
+            if !follows_kept(&w, batch, at.start)? {
+                return Ok(Outcome::Diverged);
+            }
             record_batch(
-                &ScanWriter::new(tx),
+                &w,
                 ring,
                 self.config.lookahead,
                 accounts,
                 batch,
-                start,
+                at.start,
                 hits.as_deref(),
-                live,
-            )
+                at.live,
+            )?;
+            if !at.live {
+                for (i, block) in batch.blocks.iter().enumerate() {
+                    let height = at.start + i as u64;
+                    if height >= at.keep_from {
+                        w.keep_hash(height, &block.block.hash())?;
+                    }
+                }
+            }
+            Ok(Outcome::Written)
         })
     }
 
@@ -726,8 +816,29 @@ impl Scanner {
     /// transactions, kept hashes) goes, every account at or past it moves back
     /// to it, and the pool is looked at afresh, as the orphaned blocks'
     /// transactions may be back in it.
+    ///
+    /// A reorg deeper than every hash kept can't be unwound safely: below
+    /// the lowest kept hash the server can't tell which rows came from the
+    /// orphaned chain. Scanning stops instead, loudly, until the operator
+    /// rescans (`Db::halt`, and `step`); the API goes on serving.
     async fn reorg(&self) -> Result<()> {
-        let fork = self.find_fork().await?;
+        let fork = match self.find_fork().await? {
+            Fork::At(fork) => fork,
+            Fork::Nothing => {
+                tracing::warn!("reorg: no block hashes kept to find the fork with; going on");
+                return Ok(());
+            }
+            Fork::Deeper(lowest) => {
+                self.db.halt(lowest)?;
+                let message = halt_message(lowest);
+                tracing::error!("scan stopped: {message}");
+                *self.halt_logged.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                self.set_status(|s| s.last_error = Some(message));
+                self.mempool.lock().unwrap_or_else(|e| e.into_inner()).reset(vec![]);
+                *self.last_block.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                return Ok(());
+            }
+        };
         tracing::info!("reorg: rewinding to {fork}");
         self.db.rewind(fork)?;
         self.mempool.lock().unwrap_or_else(|e| e.into_inner()).reset(vec![]);
@@ -785,16 +896,42 @@ impl Scanner {
     }
 
     /// The highest kept block the daemon still has; its successor is where
-    /// to scan again from.
-    async fn find_fork(&self) -> Result<u64> {
-        for (height, hash) in self.db.recent_blocks()? {
+    /// to scan again from. The last few kept are tried one by one (a reorg
+    /// is usually a block or two), then the rest by bisection, as the node
+    /// has every kept block below the fork and none above it: a few dozen
+    /// requests at most for `KEEP_HASHES`. Should the kept hashes not be one
+    /// chain, the block found still matches, and rewinding past a match is
+    /// only more work, never wrong.
+    async fn find_fork(&self) -> Result<Fork> {
+        /// Kept hashes tried one by one from the top.
+        const TOP: usize = 8;
+        let mut kept = self.db.recent_blocks()?;
+        kept.reverse();
+        let Some(&(lowest, hash)) = kept.first() else {
+            return Ok(Fork::Nothing);
+        };
+        if self.daemon.block_hash(lowest).await? != hash {
+            return Ok(Fork::Deeper(lowest));
+        }
+        // kept[lo] is on the node's chain; nothing from kept[hi] on is.
+        let (mut lo, mut hi) = (0, kept.len());
+        while hi - lo > 1 {
+            let at = if kept.len() - hi < TOP {
+                hi - 1
+            } else {
+                lo + (hi - lo) / 2
+            };
+            let (height, hash) = kept[at];
             if self.daemon.block_hash(height).await? == hash {
-                return Ok(height + 1);
+                lo = at;
+                if kept.len() - hi < TOP {
+                    break;
+                }
+            } else {
+                hi = at;
             }
         }
-        // Nothing kept matches: start over from the lowest kept height.
-        let lowest = self.db.recent_blocks()?.last().map(|(h, _)| *h).unwrap_or(0);
-        Ok(lowest)
+        Ok(Fork::At(kept[lo].0 + 1))
     }
 
     /// Scans pool transactions not yet seen, in a stand-in block made of
@@ -823,10 +960,29 @@ impl Scanner {
         let Some(stand_in) = self.last_block.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
             return Ok(());
         };
-        let txs = self.daemon.transactions(&new).await?;
-        let Some(block) = pool_block(&stand_in, txs) else {
-            return Ok(());
+        // Only what the node sent counts as looked at: a transaction it left
+        // out is asked for again next time. One it sent that doesn't read (or
+        // isn't what it says) is looked at as far as it ever will be.
+        let fetched = self.daemon.transactions(&new).await?;
+        let mut scanned: Vec<[u8; 32]> = fetched.bad;
+        scanned.extend(fetched.txs.iter().map(|(h, _)| *h));
+        let found = if fetched.txs.is_empty() {
+            PoolFound::default()
+        } else {
+            let Some(block) = pool_block(&stand_in, fetched.txs) else {
+                return Ok(());
+            };
+            self.scan_pool_txs(accounts, &block)?
         };
+        let mut pool = self.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.accounts == ids {
+            pool.add(&scanned, found);
+        }
+        Ok(())
+    }
+
+    /// What `block` (of pool transactions) holds for `accounts`, with the live keyring.
+    fn scan_pool_txs(&self, accounts: &[Account], block: &ScannableBlock) -> Result<PoolFound> {
         let now = crate::db::now();
         let mut slot = self.live_ring.lock().unwrap_or_else(|e| e.into_inner()).take();
         let result = tokio::task::block_in_place(|| {
@@ -834,17 +990,18 @@ impl Scanner {
                 let w = ScanWriter::new(tx);
                 let ring = Ring::get(&mut slot, &w, accounts, self.config.lookahead, &self.arenas[0])?;
                 let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-                let hits = ring.keyring.flag_many(std::slice::from_ref(&block), threads, 0);
-                scan_pool_block(&w, ring, self.config.lookahead, accounts, &block, hits.as_deref(), now)
+                let hits = ring.keyring.flag_many(std::slice::from_ref(block), threads, 0);
+                scan_pool_block(&w, ring, self.config.lookahead, accounts, block, hits.as_deref(), now)
             })
         });
         *self.live_ring.lock().unwrap_or_else(|e| e.into_inner()) = slot;
-        let found = result?;
-        let mut pool = self.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        if pool.accounts == ids {
-            pool.add(&new, found);
-        }
-        Ok(())
+        result
+    }
+
+    /// As after the live lane scanned up to `block`.
+    #[cfg(test)]
+    pub fn set_last_block(&self, block: Block) {
+        *self.last_block.lock().unwrap() = Some(block);
     }
 
     /// As after the live lane's look at the pool with `accounts`: its
@@ -986,6 +1143,71 @@ fn submitted_block(
         transactions: vec![tx],
         output_index_for_first_ringct_output: Some(0),
     })
+}
+
+/// Where a batch sits and what its writing checks: its first height, whether
+/// it is the live lane's, the reorg generation read before it was fetched,
+/// and (for a catch-up lane) the height from which its block hashes are kept.
+struct Window {
+    start: u64,
+    live: bool,
+    generation: u64,
+    keep_from: u64,
+}
+
+/// What came of writing a batch.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Written,
+    /// A reorg was unwound while it was fetched; nothing written.
+    Stale,
+    /// It doesn't follow, or isn't, the chain whose hashes are kept;
+    /// nothing written.
+    Diverged,
+}
+
+/// Where a reorg forked, as far as the kept hashes tell.
+#[derive(Debug, PartialEq, Eq)]
+enum Fork {
+    /// Scan again from here.
+    At(u64),
+    /// Even the lowest kept hash, at this height, isn't the node's.
+    Deeper(u64),
+    /// No hashes kept.
+    Nothing,
+}
+
+/// What the log and `/daemon_status` say while the scan is stopped for a
+/// reorg deeper than the hashes kept, the lowest at `lowest`.
+fn halt_message(lowest: u64) -> String {
+    format!(
+        "the node's chain differs from every block hash kept (the last {KEEP_HASHES}, from height {lowest} up): \
+         a reorg deeper than that, or a node on another chain. Scanning is stopped; the API goes on serving \
+         what was scanned. Check that the node is the right one and synced, then rescan every active account \
+         (admin `rescan`) from a height below the fork, which is below {lowest}; scanning resumes once no \
+         active account stands at or above {lowest}"
+    )
+}
+
+/// Whether `batch` (from `start`) follows the hash kept for the block before
+/// it, and each of its blocks is the one whose hash is kept at its height,
+/// where one is: checked in the batch's own transaction, so it holds for
+/// what is written.
+fn follows_kept(w: &ScanWriter, batch: &Batch, start: u64) -> Result<bool> {
+    if let (Some(before), Some(first)) = (start.checked_sub(1), batch.blocks.first())
+        && w.block_hash(before)?
+            .is_some_and(|kept| kept != first.block.header.previous)
+    {
+        return Ok(false);
+    }
+    for (i, block) in batch.blocks.iter().enumerate() {
+        if w.block_hash(start + i as u64)?
+            .is_some_and(|kept| kept != block.block.hash())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// What a catch-up lane's step came to.
@@ -1154,7 +1376,7 @@ impl TxMeta {
             .map(|s| (s.account(), s.address()))
             .unwrap_or((0, 0));
         let key_offset: DScalar = output.key_offset().into();
-        let extra_key = additional.get(index as usize);
+        let extra_key = usize::try_from(index).ok().and_then(|i| additional.get(i));
         let derived_key = crypto::derived_by(view_key, index, &key_offset, sub, &main_key, extra_key);
         TxMeta {
             prefix_hash: prefix_hash(tx),
@@ -1217,6 +1439,7 @@ fn record_received(
     for output in outputs {
         let tx_hash = output.transaction();
         let Some((tx_index, tx)) = tx_of(tx_hash) else { continue };
+        let out_index = out_index(&output)?;
         let meta = TxMeta::of(tx, &output, &account.view_key);
         let tx_id = w.tx_row(account.id, &meta.new_tx(tx_hash, height, timestamp))?;
         if kept.insert(tx_hash) {
@@ -1224,9 +1447,9 @@ fn record_received(
         }
         let mask: DScalar = output.commitment().mask.into();
         let rct = !matches!(tx, Transaction::V1 { .. });
-        let index = output.index_in_transaction() as usize;
+        let index = usize::from(out_index);
         let new = NewOutput {
-            out_index: output.index_in_transaction() as u16,
+            out_index,
             global_index: output.index_on_blockchain(),
             amount: output.commitment().amount,
             public_key: output.key().compress().to_bytes(),
@@ -1335,8 +1558,9 @@ pub fn scan_pool_block(
                 continue;
             };
             let tx = &block.transactions[i];
+            let out_index = out_index(&output)?;
+            let index = usize::from(out_index);
             let meta = TxMeta::of(tx, &output, &account.view_key);
-            let index = output.index_in_transaction() as usize;
             let list = found.received.entry(account.id).or_default();
             let public_key = output.key().compress().to_bytes();
             // The burning bug: a key already received in this pool transaction counts once.
@@ -1347,7 +1571,7 @@ pub fn scan_pool_block(
                 tx_hash,
                 tx_prefix_hash: meta.prefix_hash,
                 tx_pub_key: meta.derived_key,
-                out_index: index as u16,
+                out_index,
                 amount: output.commitment().amount,
                 public_key,
                 mask: Some(output.commitment().mask.into()).map(|m: DScalar| *m.as_bytes()),
@@ -1369,6 +1593,7 @@ pub fn scan_pool_block(
     for (i, tx) in block.transactions.iter().enumerate() {
         let tx_hash = hashes[i];
         let mixin = mixin(tx);
+        let fee = fee(tx);
         let unlock_time = unlock_time(tx.prefix().additional_timelock);
         for input in &tx.prefix().inputs {
             let Input::ToKey {
@@ -1398,7 +1623,7 @@ pub fn scan_pool_block(
                             key_image,
                             mixin,
                             unlock_time,
-                            fee: fee(tx),
+                            fee,
                         });
                     }
                 }
@@ -1424,7 +1649,9 @@ fn record_spends(
     let timestamp = block.block.header.timestamp;
     for (i, tx) in block.transactions.iter().enumerate() {
         let hash = block.block.transactions[i];
-        let ring_size = mixin(tx) + 1;
+        // Worked out (the prefix hashed, the extra read) the first time an
+        // input of this transaction has one of ours in its ring, then reused.
+        let mut meta: Option<TxMeta> = None;
         for input in &tx.prefix().inputs {
             let Input::ToKey {
                 amount,
@@ -1444,7 +1671,7 @@ fn record_spends(
                     if accounts.get(account).is_none_or(|a| a.scan_height > height) {
                         continue;
                     }
-                    let meta = TxMeta::spend_only(tx);
+                    let meta = meta.get_or_insert_with(|| TxMeta::spend_only(tx));
                     let tx_id = w.tx_row(*account, &meta.new_tx(hash, height, timestamp))?;
                     w.add_spend(
                         *account,
@@ -1452,7 +1679,7 @@ fn record_spends(
                         ours.id,
                         ours.amount,
                         &key_image.to_bytes(),
-                        ring_size - 1,
+                        meta.mixin,
                         height,
                     )?;
                 }
@@ -1510,12 +1737,23 @@ fn is_coinbase(tx: &Transaction<Pruned>) -> bool {
     matches!(tx.prefix().inputs.first(), Some(Input::Gen(_)))
 }
 
+/// An output's index in its transaction, which the chain keeps far below
+/// 65,536 (a RingCT transaction has at most 16 outputs; a pre-RingCT one is
+/// bounded by its size): an index past that is a node making things up.
+fn out_index(output: &WalletOutput) -> Result<u16> {
+    u16::try_from(output.index_in_transaction())
+        .map_err(|_| Error::Daemon(format!("an output index of {}", output.index_in_transaction())))
+}
+
+/// Ring members less one (saturating, for a ring no transaction can have).
 fn mixin(tx: &Transaction<Pruned>) -> u32 {
     tx.prefix()
         .inputs
         .iter()
         .find_map(|i| match i {
-            Input::ToKey { key_offsets, .. } => Some(key_offsets.len().saturating_sub(1) as u32),
+            Input::ToKey { key_offsets, .. } => {
+                Some(u32::try_from(key_offsets.len().saturating_sub(1)).unwrap_or(u32::MAX))
+            }
             Input::Gen(_) => None,
         })
         .unwrap_or(0)
@@ -2231,5 +2469,288 @@ mod tests {
         };
         let (db, a, b) = record(Some(&gpu));
         check_recorded(&db, &a, &b);
+    }
+
+    /// Block `height`'s hash on chain `chain`.
+    fn chain_hash(height: u64, chain: u8) -> [u8; 32] {
+        let mut data = height.to_le_bytes().to_vec();
+        data.push(chain);
+        keccak256(data)
+    }
+
+    /// A node whose chain is chain 0 below `fork` and chain 1 from it on, at
+    /// height `top`.
+    async fn forked_node(fork: u64, top: u64) -> crate::testkit::FakeNode {
+        crate::testkit::fake_node(move |route, input| match route {
+            "get_info" => serde_json::json!({
+                "height": top,
+                "top_block_hash": hex::encode(chain_hash(top - 1, 1)),
+            }),
+            "get_block_header_by_height" => {
+                let height = input["height"].as_u64().unwrap();
+                let hash = chain_hash(height, u8::from(height >= fork));
+                serde_json::json!({ "block_header": { "hash": hex::encode(hash) } })
+            }
+            _ => serde_json::json!({}),
+        })
+        .await
+    }
+
+    /// Hashes of chain 0 kept for `heights`.
+    fn keep_chain(db: &Db, heights: std::ops::RangeInclusive<u64>) {
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            for h in heights {
+                w.set_block(h, &chain_hash(h, 0), KEEP_HASHES)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// The fork is found among ten thousand kept hashes in a few dozen
+    /// requests, deep or shallow, and everything from it on is unwound. A
+    /// catch-up lane's word that its blocks don't follow the kept hashes is
+    /// enough for the live lane to look, though it has no accounts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_fork_is_found_by_bisection() {
+        for fork in [7_777u64, 9_999, 2] {
+            let node = forked_node(fork, 10_001).await;
+            let db = Arc::new(Db::in_memory());
+            keep_chain(&db, 1..=10_000);
+            let account = crate::testkit::Wallet::new(8).add(&db, 0);
+            db.write(|tx| ScanWriter::new(tx).set_scan_height(account.id, 10_001))
+                .unwrap();
+            db.set_status(std::slice::from_ref(&account.address), Status::Hidden)
+                .unwrap();
+            let app = crate::testkit::app_with_node(db.clone(), 10_001, &node.url);
+            app.scanner.suspect.store(true, Ordering::SeqCst);
+            assert!(app.scanner.step().await.unwrap());
+            assert!(!app.scanner.suspect.load(Ordering::SeqCst));
+            assert_eq!(db.block_hash(fork - 1).unwrap(), Some(chain_hash(fork - 1, 0)));
+            assert_eq!(db.block_hash(fork).unwrap(), None);
+            assert_eq!(db.account(&account.address).unwrap().unwrap().scan_height, fork);
+            let asked = node
+                .routes()
+                .iter()
+                .filter(|r| *r == "get_block_header_by_height")
+                .count();
+            assert!(asked <= 25, "fork {fork}: {asked} requests");
+            assert_eq!(db.halted().unwrap(), None);
+        }
+    }
+
+    /// A reorg deeper than every kept hash stops the scan, rewinding
+    /// nothing; the stop holds (the API serving on) until every active
+    /// account is rescanned from below the lowest kept hash, and then what
+    /// was kept from there on goes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reorg_deeper_than_the_kept_hashes_stops_the_scan_until_a_rescan() {
+        use crate::testkit::{self, Tx, Wallet, tx_key};
+        let node = forked_node(100, 900).await;
+        let db = Arc::new(Db::in_memory());
+        let w = Wallet::new(9);
+        let account = w.add(&db, 600);
+        let (_, k) = tx_key(5);
+        let pays = Tx::new(k, vec![w.pay(&k, 0, 0, 0, 1_000)]).build();
+        let made = testkit::block(600, [0; 32], testkit::dull_miner(600), vec![pays], 0, 0);
+        testkit::write(&db, std::slice::from_ref(&account), vec![made], 600, false, None);
+        keep_chain(&db, 500..=800);
+        db.write(|tx| ScanWriter::new(tx).set_scan_height(account.id, 801))
+            .unwrap();
+        let app = testkit::app_with_node(db.clone(), 900, &node.url);
+
+        app.scanner.reorg().await.unwrap();
+        assert_eq!(db.halted().unwrap(), Some(500));
+        assert_eq!(db.outputs(account.id).unwrap().len(), 1, "nothing rewound");
+        assert_eq!(db.recent_blocks().unwrap().len(), 301);
+        let error = app.scanner.status().last_error.unwrap();
+        assert!(error.contains("rescan") && error.contains("500"), "{error}");
+
+        // Steps change nothing while an account stands at or above 500.
+        assert!(!app.scanner.step().await.unwrap());
+        assert_eq!(db.halted().unwrap(), Some(500));
+        assert!(app.scanner.status().last_error.unwrap().contains("rescan"));
+        assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, 801);
+
+        db.rescan(&[w.address()], 99).unwrap();
+        // The step resumes, then fails at fetching blocks from this node.
+        let _ = app.scanner.step().await;
+        assert_eq!(db.halted().unwrap(), None);
+        assert!(db.recent_blocks().unwrap().is_empty());
+    }
+
+    /// A catch-up lane's batch is written only if no reorg was unwound
+    /// since it was fetched and it follows the hashes kept; written, it
+    /// keeps the hashes of its blocks near the tip.
+    #[test]
+    fn a_lane_writes_only_on_the_chain_kept_and_keeps_its_hashes() {
+        use crate::testkit::{self, Wallet};
+        let db = Arc::new(Db::in_memory());
+        let w = Wallet::new(10);
+        let account = w.add(&db, 100);
+        let app = testkit::app(db.clone(), 200);
+        let mut previous = [0; 32];
+        let mut first = 0;
+        let mut made = vec![];
+        for n in 100..104 {
+            let m = testkit::block(n, previous, testkit::dull_miner(n), vec![], first, 0);
+            previous = m.block.block.hash();
+            first = m.next;
+            made.push(m);
+        }
+        let batch = |range: std::ops::Range<usize>| Batch {
+            blocks: made[range.clone()].iter().map(|m| m.block.clone()).collect(),
+            first_indexes: made[range.clone()].iter().map(|m| m.first_indexes.clone()).collect(),
+            raw: made[range].iter().map(|m| m.raw.clone()).collect(),
+        };
+        let (mut slot, arena) = (None, Arena::new());
+        let window = |start: u64, generation: u64| Window {
+            start,
+            live: false,
+            generation,
+            keep_from: 101,
+        };
+        let scan = |slot: &mut Option<Ring>, accounts: &[Account], b: &Batch, at: &Window| {
+            app.scanner.scan_batch(slot, &arena, accounts, b, at).unwrap()
+        };
+        let accounts = vec![account.clone()];
+
+        let before = db.reorg_generation().unwrap();
+        db.rewind(1_000).unwrap();
+        assert_eq!(
+            scan(&mut slot, &accounts, &batch(0..3), &window(100, before)),
+            Outcome::Stale
+        );
+        assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, 100);
+
+        let now = db.reorg_generation().unwrap();
+        assert_eq!(
+            scan(&mut slot, &accounts, &batch(0..3), &window(100, now)),
+            Outcome::Written
+        );
+        assert_eq!(db.block_hash(100).unwrap(), None, "below keep_from");
+        assert_eq!(db.block_hash(102).unwrap(), Some(made[2].block.block.hash()));
+        let accounts = vec![db.account(&w.address()).unwrap().unwrap()];
+        assert_eq!(accounts[0].scan_height, 103);
+
+        // Block 103 of another chain: it doesn't follow the 102 kept.
+        let other = testkit::block(103, [5; 32], testkit::dull_miner(103), vec![], first, 1);
+        let stray = Batch {
+            blocks: vec![other.block],
+            first_indexes: vec![other.first_indexes],
+            raw: vec![other.raw],
+        };
+        assert_eq!(scan(&mut slot, &accounts, &stray, &window(103, now)), Outcome::Diverged);
+        assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, 103);
+        assert_eq!(
+            scan(&mut slot, &accounts, &batch(3..4), &window(103, now)),
+            Outcome::Written
+        );
+    }
+
+    /// A node that says it has no blocks is an error, not an underflow.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_at_height_zero_is_an_error() {
+        use crate::testkit::{self, Wallet, fake_node};
+        let node = fake_node(|route, _| match route {
+            "get_info" => serde_json::json!({ "height": 0, "top_block_hash": "00".repeat(32) }),
+            _ => serde_json::json!({}),
+        })
+        .await;
+        let db = Arc::new(Db::in_memory());
+        Wallet::new(5).add(&db, 0);
+        let app = testkit::app_with_node(db, 0, &node.url);
+        let e = app.scanner.step().await.unwrap_err();
+        assert!(e.to_string().contains("no blocks"), "{e}");
+    }
+
+    /// A pool of 150 transactions on a node that answers 100 hashes a
+    /// request and has only some of them: what it sends is looked at once
+    /// (one paying the wallet is found; one that doesn't read and one whose
+    /// bytes aren't its hash are skipped, not retried, and don't fail the
+    /// rest), what it leaves out is asked for again, and a transaction it
+    /// sends unasked is ignored.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pool_is_asked_in_hundreds_and_only_what_came_counts_as_seen() {
+        use crate::testkit::{self, Tx, Wallet, fake_node, tx_key};
+        use serde_json::{Value, json};
+
+        let w = Wallet::new(77);
+        let (_, k) = tx_key(70);
+        let paying = Tx::new(k, vec![w.pay(&k, 0, 0, 0, 42_000), testkit::stranger(3)]).build();
+        let paying_hash = testkit::tx_hash(&paying, 1, 0, 0);
+        let (_, k2) = tx_key(71);
+        let other = Tx::new(k2, vec![testkit::stranger(4)]).build();
+        let other_hash = testkit::tx_hash(&other, 1, 1, 0);
+        let mut pool: Vec<[u8; 32]> = (0..150u8).map(|i| [i; 32]).collect();
+        let (bad, wrong) = (pool[3], pool[120]);
+        pool[0] = paying_hash;
+        let entry = |hash: &[u8; 32], tx: &Transaction<Pruned>, prunable: [u8; 32]| {
+            json!({
+                "tx_hash": hex::encode(hash),
+                "pruned_as_hex": hex::encode(tx.serialize()),
+                "prunable_hash": hex::encode(prunable),
+            })
+        };
+        let known: HashMap<String, Value> = [
+            (
+                paying_hash,
+                entry(&paying_hash, &paying, testkit::prunable_hash(1, 0, 0)),
+            ),
+            (bad, json!({ "tx_hash": hex::encode(bad), "pruned_as_hex": "00ff" })),
+            // `other`'s bytes under another hash.
+            (wrong, entry(&wrong, &other, testkit::prunable_hash(1, 1, 0))),
+        ]
+        .into_iter()
+        .map(|(h, v)| (hex::encode(h), v))
+        .collect();
+        let unasked = entry(&other_hash, &other, testkit::prunable_hash(1, 1, 0));
+        let listed: Vec<String> = pool.iter().map(hex::encode).collect();
+        let node = fake_node(move |route, input| match route {
+            "get_transaction_pool_hashes" => json!({ "status": "OK", "tx_hashes": listed }),
+            "get_transactions" => {
+                let mut txs: Vec<Value> = input["txs_hashes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|h| known.get(h.as_str().unwrap()).cloned())
+                    .collect();
+                txs.push(unasked.clone());
+                json!({ "status": "OK", "txs": txs })
+            }
+            _ => json!({}),
+        })
+        .await;
+
+        let db = Arc::new(Db::in_memory());
+        let account = w.add(&db, 100);
+        let app = testkit::app_with_node(db.clone(), 101, &node.url);
+        let last = testkit::block(100, [0; 32], testkit::dull_miner(100), vec![], 0, 0);
+        app.scanner.set_last_block(last.block.block);
+        let accounts = vec![account.clone()];
+        app.scanner.scan_pool(&accounts).await.unwrap();
+
+        let asked = |from: usize| -> Vec<usize> {
+            node.calls.lock().unwrap()[from..]
+                .iter()
+                .filter(|(r, _)| r == "get_transactions")
+                .map(|(_, v)| v["txs_hashes"].as_array().unwrap().len())
+                .collect()
+        };
+        assert_eq!(asked(0), vec![100, 50], "a hundred at a time");
+        {
+            let pool = app.scanner.mempool.lock().unwrap();
+            let seen: HashSet<[u8; 32]> = pool.seen.iter().copied().collect();
+            assert_eq!(seen, HashSet::from([paying_hash, bad, wrong]));
+        }
+        let received = app.scanner.mempool.lock().unwrap().for_account(account.id);
+        assert_eq!(received.len(), 1);
+        assert_eq!((received[0].tx_hash, received[0].amount), (paying_hash, 42_000));
+
+        let before = node.calls.lock().unwrap().len();
+        app.scanner.scan_pool(&accounts).await.unwrap();
+        assert_eq!(asked(before), vec![100, 47], "only what didn't come is asked again");
+        assert_eq!(app.scanner.mempool.lock().unwrap().for_account(account.id).len(), 1);
     }
 }

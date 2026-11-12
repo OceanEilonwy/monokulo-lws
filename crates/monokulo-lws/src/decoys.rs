@@ -73,7 +73,7 @@ impl Picker {
     async fn distribution(&self, daemon: &Daemon, chain_height: u64) -> Result<Arc<Distribution>> {
         let mut cached = self.distribution.lock().await;
         if let Some((at, d)) = cached.as_ref() {
-            let top = d.start_height + d.cumulative.len() as u64;
+            let top = d.start_height.saturating_add(d.cumulative.len() as u64);
             let current = chain_height == 0 || top >= chain_height;
             if at.elapsed() < FRESH_AT_LEAST || (current && at.elapsed() < FRESH_FOR) {
                 return Ok(d.clone());

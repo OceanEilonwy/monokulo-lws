@@ -579,8 +579,10 @@ fn a_reorg_drops_what_the_orphaned_blocks_held_and_the_new_chain_is_scanned() {
     assert_eq!(db.block_hash(100).unwrap(), Some(hash));
 }
 
+/// Every block's hash is kept while under `KEEP_HASHES` behind the tip (the
+/// pruning past it is `db::tests::set_block_keeps_only_the_last_hashes`).
 #[test]
-fn two_hundred_block_hashes_are_kept() {
+fn block_hashes_are_kept_behind_the_tip() {
     let w = Wallet::new(42);
     let db = Db::in_memory();
     let mut account = w.add(&db, 1);
@@ -598,9 +600,10 @@ fn two_hundred_block_hashes_are_kept() {
         account = db.account(&w.address()).unwrap().unwrap();
     }
     let kept = db.recent_blocks().unwrap();
+    const { assert!(crate::scanner::KEEP_HASHES > 250) };
     assert_eq!(kept.first().unwrap().0, 250);
-    assert_eq!(kept.last().unwrap().0, 50);
-    assert_eq!(kept.len(), 201);
+    assert_eq!(kept.last().unwrap().0, 1);
+    assert_eq!(kept.len(), 250);
     assert_eq!(account.scan_height, 251);
 }
 

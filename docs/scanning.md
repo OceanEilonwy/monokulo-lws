@@ -111,8 +111,8 @@ fetching back to 2019 and every other account sees no new block until it
 has caught up. The design is lanes:
 
 - **The live lane**: the keyring of every caught-up account. Follows the
-  tip block by block, looks at the mempool, keeps the 200 block hashes and
-  handles reorgs. Its batches are small (about 57 keys × accounts a block),
+  tip block by block, looks at the mempool, keeps the last 10,000 block
+  hashes and handles reorgs. Its batches are small (about 57 keys × accounts a block),
   so it is never starved.
 - **Catch-up lanes**: each one fetches from the lowest start height of the
   accounts queued for it, with its own keyring of only those accounts. An
@@ -120,9 +120,11 @@ has caught up. The design is lanes:
   lane's keyring when the cursor passes it (`follow`); one below the cursor
   waits for the next run (`wait`). When a lane's cursor reaches the live
   lane's height, its accounts move into the live keyring and the lane ends;
-  if anything is queued, a new run starts. Catch-up lanes are below the
-  reorg window by construction until they merge, so they don't check
-  hashes.
+  if anything is queued, a new run starts. A catch-up lane writes a batch
+  only if it follows the hashes kept and no reorg was unwound while it was
+  fetched; within 10,000 blocks of the tip it keeps its blocks' hashes, so
+  the live lane can check what it merges, and blocks that don't follow the
+  kept hashes make the live lane look for a reorg, accounts or not.
 - **Shared**: one daemon connection, the live lane's requests first. One
   GPU device, but an *arena* per lane. Today `fob-scanner` keeps one device
   and one arena (the 39 MB state buffer, the output buffer, a command buffer
