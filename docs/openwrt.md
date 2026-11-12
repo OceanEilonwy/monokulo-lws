@@ -102,13 +102,36 @@ proxy's port instead. Read [security.md](security.md) before that.
 the server with cargo for the OpenWrt target, with the C parts (SQLite,
 ring) compiled by the gcc from the official OpenWrt SDK image, checks that
 the result is a static executable, then runs the SDK in Docker to package
-it with [`openwrt/monokulo-lws`](../openwrt/monokulo-lws) and sign the
-package and the repository index. `scripts/test-openwrt.sh` boots the
-official x86_64 rootfs image in Docker and installs, starts (against a
-stand-in node), drives through the LuCI backend, upgrades and removes the
-package there; CI runs it after the x86_64 build. Both run locally too,
-given Docker and rustup: without the signing key the package is signed
-with a throwaway one, which the test trusts.
+it with [`openwrt/monokulo-lws`](../openwrt/monokulo-lws). Signing the
+package and the repository index is a separate step (`build-openwrt.sh
+sign`) that runs on the host, not in any container, and runs nothing with
+the key but `openssl` and `apk`: the signing key is never in the
+environment while cargo, a dependency's build script or the SDK's own
+build runs, and no Docker image, however pinned, ever sees it. That `apk`
+is apk-tools built from its upstream source
+([gitlab.alpinelinux.org/alpine/apk-tools](https://gitlab.alpinelinux.org/alpine/apk-tools),
+fetched from its GitHub mirror, which CI runners can reach)
+at a pinned commit, the release the SDK's own `apk` is (3.0.5 for 25.12),
+checked after the fetch; `build-openwrt.sh apk-tools` builds it into
+`~/.cache/monokulo-lws/apk-tools/<commit>/` once (`sign` and `all` do too
+when it is missing), which needs git, a C compiler, meson, ninja,
+pkg-config and the openssl, zlib and zstd headers. `APK_TOOLS=/path/to/apk`
+uses another apk-tools 3.0.5 binary instead. CI builds in one job without
+the secret and signs in another, on a fresh runner, which builds apk-tools
+afresh, from the pinned commit, in a step before the one with the secret
+(never from a cache, so no stored binary is trusted with the key). Every
+Docker image is pinned by digest and every action by commit. A local
+`build-openwrt.sh all` keeps the key out of cargo's environment, but that
+is no defence against a malicious dependency: its build script runs as
+you and can read your key file, or the key in your shell's environment
+through `/proc`. Sign with the real key only in CI, or as a separate user
+the build never runs as.
+`scripts/test-openwrt.sh` boots the official x86_64 rootfs image in Docker
+and installs, starts (against a stand-in node), drives through the LuCI
+backend, upgrades and removes the package there; CI runs it after the
+x86_64 build. Both run locally too, given Docker, rustup and apk-tools'
+build tools: without the signing key the package is signed with a
+throwaway one, which the test trusts.
 
 The LuCI page's backend is an rpcd ucode plugin
 ([`rpcd.uc`](../openwrt/monokulo-lws/files/rpcd.uc), the ubus object

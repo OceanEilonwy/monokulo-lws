@@ -14,18 +14,40 @@ use monero_epee::{Epee, HEADER, Type, VERSION};
 use monero_wallet::{
     block::Block,
     interface::ScannableBlock,
+    primitives::keccak256,
     transaction::{Pruned, Transaction},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
+use crate::types::{BlockHash, Height, PublicKey, TxHash};
 
 /// The most one `get_blocks.bin` response may be; the body is read in
 /// chunks and given up on as soon as it passes this, whatever
 /// `Content-Length` said.
 const MAX_BLOCKS_RESPONSE: usize = 200 * 1024 * 1024;
-const MAX_JSON_RESPONSE: usize = 64 * 1024 * 1024;
+/// Per JSON method, the most its answer may be, sized to what the method
+/// legitimately sends: a small object (`get_info`, a fee estimate, a block
+/// header, `send_raw_transaction`'s flags); 1,000 outputs' keys (`get_outs`,
+/// asked in chunks of 1,000, about 200 bytes each); the pool's hashes (67
+/// bytes each: 16 MB is a quarter of a million transactions); 100 pruned
+/// transactions (`get_transactions`, asked 100 at a time); the RingCT output
+/// distribution (about ten bytes a block, so 64 MB is decades of mainnet).
+const SMALL_JSON_RESPONSE: usize = 64 * 1024;
+const OUTS_RESPONSE: usize = 8 * 1024 * 1024;
+const POOL_HASHES_RESPONSE: usize = 16 * 1024 * 1024;
+const TRANSACTIONS_RESPONSE: usize = 64 * 1024 * 1024;
+const DISTRIBUTION_RESPONSE: usize = 64 * 1024 * 1024;
+/// The most a body buffer is reserved for up front, whatever
+/// `Content-Length` says; past it, it grows as bytes actually arrive.
+const INITIAL_BODY_CAPACITY: usize = 1024 * 1024;
+/// Entries in the output distribution, at most: one per block, so this is
+/// some 60 years of mainnet. Holds the decoded `Vec<u64>` to 128 MB however
+/// the node packs its answer.
+const MAX_DISTRIBUTION_ENTRIES: usize = 16 * 1024 * 1024;
+/// monerod's `CRYPTONOTE_MAX_BLOCK_NUMBER`: no height reaches it.
+const MAX_BLOCK_NUMBER: Height = Height::new(500_000_000);
 /// Time a JSON call may take in all, and a `get_blocks.bin` call (up to
 /// 200 MB from a node that may be across the world).
 const JSON_TIMEOUT: Duration = Duration::from_secs(60);
@@ -48,15 +70,17 @@ pub struct Daemon {
 #[derive(Clone, Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct Info {
-    pub height: u64,
+    pub height: Height,
     #[serde(default)]
     pub target_height: u64,
     #[serde(default)]
     pub nettype: String,
     #[serde(default)]
     pub version: String,
-    #[serde(default)]
-    pub top_block_hash: String,
+    /// `None` from a node that leaves it out or sends it empty; anything
+    /// else that isn't 64 hex characters is a malformed answer.
+    #[serde(default, deserialize_with = "empty_or")]
+    pub top_block_hash: Option<BlockHash>,
     #[serde(default)]
     pub synchronized: bool,
 }
@@ -79,15 +103,16 @@ fn one() -> u64 {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct Distribution {
-    pub start_height: u64,
+    pub start_height: Height,
     pub cumulative: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct OutInfo {
-    pub key: String,
-    pub mask: String,
+    pub key: PublicKey,
+    /// The output's commitment (monerod's name for it).
+    pub mask: lws_api::Hex32,
     pub unlocked: bool,
     pub height: u64,
 }
@@ -113,10 +138,60 @@ pub struct SendResult {
     pub nonzero_unlock_time: bool,
 }
 
+/// A request to the node, as far as sending it goes: JSON (sent as such,
+/// with `JSON_TIMEOUT`) or `get_blocks.bin`'s binary (`BLOCKS_TIMEOUT`),
+/// each with the most bytes its answer may be.
+#[derive(Clone, Copy, Debug)]
+enum Call {
+    Json(usize),
+    Binary(usize),
+}
+
+impl Call {
+    fn timeout(self) -> Duration {
+        match self {
+            Call::Json(_) => JSON_TIMEOUT,
+            Call::Binary(_) => BLOCKS_TIMEOUT,
+        }
+    }
+
+    fn limit(self) -> usize {
+        match self {
+            Call::Json(limit) | Call::Binary(limit) => limit,
+        }
+    }
+}
+
+/// A hex field a node may leave out or send empty: `None` then; anything
+/// else must decode as `T` (64 hex characters for a hash), or the answer
+/// is malformed.
+fn empty_or<'de, D, T>(d: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let s = std::borrow::Cow::<'de, str>::deserialize(d)?;
+    if s.is_empty() {
+        return Ok(None);
+    }
+    T::deserialize(serde::de::value::StrDeserializer::<D::Error>::new(&s)).map(Some)
+}
+
 #[derive(Deserialize)]
 struct JsonRpcResponse<T> {
     result: Option<T>,
-    error: Option<Value>,
+    error: Option<RpcError>,
+}
+
+/// A JSON-RPC error as monerod sends it. Decoded into these two fields only
+/// (anything else in it is skipped without being kept), so a node can't make
+/// an error the size of the response limit cost many times that in memory.
+#[derive(Deserialize)]
+struct RpcError {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
 }
 
 impl Daemon {
@@ -142,14 +217,14 @@ impl Daemon {
         redact_userinfo(&self.base)
     }
 
-    async fn post(&self, route: &str, body: Vec<u8>, json: bool, limit: usize) -> Result<Vec<u8>> {
-        let timeout = if json { JSON_TIMEOUT } else { BLOCKS_TIMEOUT };
+    async fn post(&self, route: &str, body: Vec<u8>, call: Call) -> Result<Vec<u8>> {
+        let limit = call.limit();
         let mut request = self
             .client
             .post(format!("{}/{route}", self.base))
-            .timeout(timeout)
+            .timeout(call.timeout())
             .body(body);
-        if json {
+        if let Call::Json(_) = call {
             request = request.header("Content-Type", "application/json");
         }
         let mut response = request.send().await?;
@@ -159,12 +234,13 @@ impl Daemon {
         }
         let too_large = || Error::Daemon(format!("{route}: the response is over {limit} bytes"));
         let declared = response.content_length().unwrap_or(0);
-        if declared > limit as u64 {
+        let declared = usize::try_from(declared).map_err(|_| too_large())?;
+        if declared > limit {
             return Err(too_large());
         }
         // Read in chunks so a node that sends more than it declared (or
         // declares nothing) is cut off at the limit, not buffered whole.
-        let mut body = Vec::with_capacity((declared as usize).min(limit));
+        let mut body = Vec::with_capacity(declared.min(INITIAL_BODY_CAPACITY));
         while let Some(chunk) = response.chunk().await? {
             if body.len() + chunk.len() > limit {
                 return Err(too_large());
@@ -174,32 +250,27 @@ impl Daemon {
         Ok(body)
     }
 
-    async fn rpc<T: for<'de> Deserialize<'de>>(&self, route: &str, params: Value) -> Result<T> {
+    async fn rpc<T: for<'de> Deserialize<'de>>(&self, route: &str, params: Value, limit: usize) -> Result<T> {
         let body = self
-            .post(
-                route,
-                serde_json::to_vec(&params).expect("json"),
-                true,
-                MAX_JSON_RESPONSE,
-            )
+            .post(route, serde_json::to_vec(&params).expect("json"), Call::Json(limit))
             .await?;
         serde_json::from_slice(&body).map_err(|e| Error::Daemon(format!("{route}: {e}")))
     }
 
-    async fn json_rpc<T: for<'de> Deserialize<'de>>(&self, method: &str, params: Value) -> Result<T> {
+    async fn json_rpc<T: for<'de> Deserialize<'de>>(&self, method: &str, params: Value, limit: usize) -> Result<T> {
         let request = json!({ "jsonrpc": "2.0", "id": "0", "method": method, "params": params });
         let body = self
             .post(
                 "json_rpc",
                 serde_json::to_vec(&request).expect("json"),
-                true,
-                MAX_JSON_RESPONSE,
+                Call::Json(limit),
             )
             .await?;
         let response: JsonRpcResponse<T> =
             serde_json::from_slice(&body).map_err(|e| Error::Daemon(format!("{method}: {e}")))?;
         if let Some(error) = response.error {
-            return Err(Error::Daemon(format!("{method}: {error}")));
+            let message: String = error.message.chars().take(200).collect();
+            return Err(Error::Daemon(format!("{method}: error {}: {message}", error.code)));
         }
         response
             .result
@@ -207,27 +278,32 @@ impl Daemon {
     }
 
     pub async fn info(&self) -> Result<Info> {
-        self.json_rpc("get_info", json!({})).await
+        self.json_rpc("get_info", json!({}), SMALL_JSON_RESPONSE).await
     }
 
     /// The hash of the block at `height`.
-    pub async fn block_hash(&self, height: u64) -> Result<[u8; 32]> {
+    pub async fn block_hash(&self, height: Height) -> Result<BlockHash> {
         #[derive(Deserialize)]
         struct Header {
-            hash: String,
+            hash: BlockHash,
         }
         #[derive(Deserialize)]
         struct R {
             block_header: Header,
         }
         let r: R = self
-            .json_rpc("get_block_header_by_height", json!({ "height": height }))
+            .json_rpc(
+                "get_block_header_by_height",
+                json!({ "height": height }),
+                SMALL_JSON_RESPONSE,
+            )
             .await?;
-        hex32(&r.block_header.hash).ok_or_else(|| Error::Daemon("get_block_header_by_height: bad hash".into()))
+        Ok(r.block_header.hash)
     }
 
     pub async fn fee_estimate(&self) -> Result<FeeEstimate> {
-        self.json_rpc("get_fee_estimate", json!({ "grace_blocks": 10 })).await
+        self.json_rpc("get_fee_estimate", json!({ "grace_blocks": 10 }), SMALL_JSON_RESPONSE)
+            .await
     }
 
     /// The RingCT output distribution, cumulative, from the first block
@@ -235,7 +311,8 @@ impl Daemon {
     pub async fn output_distribution(&self) -> Result<Distribution> {
         #[derive(Deserialize)]
         struct Entry {
-            start_height: u64,
+            start_height: Height,
+            #[serde(deserialize_with = "capped_u64s")]
             distribution: Vec<u64>,
             #[serde(default)]
             base: u64,
@@ -248,6 +325,7 @@ impl Daemon {
             .json_rpc(
                 "get_output_distribution",
                 json!({ "amounts": [0], "cumulative": true, "from_height": 0, "binary": false, "compress": false }),
+                DISTRIBUTION_RESPONSE,
             )
             .await?;
         let e = r
@@ -255,6 +333,18 @@ impl Daemon {
             .into_iter()
             .next()
             .ok_or_else(|| Error::Daemon("get_output_distribution: empty".into()))?;
+        // The picker counts heights from `start_height` on: one that puts
+        // the distribution's end past any height the chain can reach is a
+        // node making things up.
+        let top = e
+            .start_height
+            .offset(e.distribution.len())
+            .filter(|top| *top <= MAX_BLOCK_NUMBER);
+        if top.is_none() {
+            return Err(Error::Daemon(
+                "get_output_distribution: start height out of range".into(),
+            ));
+        }
         Ok(Distribution {
             start_height: e.start_height,
             cumulative: checked_cumulative(e.distribution, e.base)?,
@@ -272,7 +362,11 @@ impl Daemon {
         }
         let outputs: Vec<Value> = indexes.iter().map(|i| json!({ "amount": 0, "index": i })).collect();
         let r: R = self
-            .rpc("get_outs", json!({ "outputs": outputs, "get_txid": false }))
+            .rpc(
+                "get_outs",
+                json!({ "outputs": outputs, "get_txid": false }),
+                OUTS_RESPONSE,
+            )
             .await?;
         if r.status != "OK" {
             return Err(Error::Daemon(format!("get_outs: {}", r.status)));
@@ -287,54 +381,82 @@ impl Daemon {
         self.rpc(
             "send_raw_transaction",
             json!({ "tx_as_hex": tx_hex, "do_not_relay": false }),
+            SMALL_JSON_RESPONSE,
         )
         .await
     }
 
-    pub async fn pool_hashes(&self) -> Result<Vec<[u8; 32]>> {
+    pub async fn pool_hashes(&self) -> Result<Vec<TxHash>> {
         #[derive(Deserialize)]
         struct R {
-            #[serde(default)]
-            tx_hashes: Vec<String>,
+            #[serde(default, deserialize_with = "hashes")]
+            tx_hashes: Vec<TxHash>,
         }
-        let r: R = self.rpc("get_transaction_pool_hashes", json!({})).await?;
-        Ok(r.tx_hashes.iter().filter_map(|h| hex32(h)).collect())
+        let r: R = self
+            .rpc("get_transaction_pool_hashes", json!({}), POOL_HASHES_RESPONSE)
+            .await?;
+        Ok(r.tx_hashes)
     }
 
-    /// Transactions by hash, pruned. Ones the node no longer has are left out.
-    pub async fn transactions(&self, hashes: &[[u8; 32]]) -> Result<Vec<([u8; 32], Transaction<Pruned>)>> {
+    /// Transactions by hash, pruned, asked 100 at a time (a restricted node
+    /// answers no more). Only hashes asked for are taken, each once, and
+    /// each is checked against what its bytes hash to where they say enough
+    /// (a full blob, or a pruned one with its prunable hash). Ones the node
+    /// doesn't send are left out of both lists, to be asked for again; one
+    /// that doesn't read or hashes to something else is in `bad`, so the
+    /// caller can stop asking for it without failing the rest.
+    pub async fn transactions(&self, hashes: &[TxHash]) -> Result<Transactions> {
         #[derive(Deserialize)]
         struct Tx {
-            tx_hash: String,
+            tx_hash: TxHash,
             #[serde(default)]
             pruned_as_hex: String,
             #[serde(default)]
             as_hex: String,
+            #[serde(default, deserialize_with = "empty_or")]
+            prunable_hash: Option<lws_api::Hex32>,
         }
         #[derive(Deserialize)]
         struct R {
             #[serde(default)]
             txs: Vec<Tx>,
+            #[serde(default)]
+            status: String,
         }
-        if hashes.is_empty() {
-            return Ok(vec![]);
-        }
-        let hex_hashes: Vec<String> = hashes.iter().map(hex::encode).collect();
-        let r: R = self
-            .rpc("get_transactions", json!({ "txs_hashes": hex_hashes, "prune": true }))
-            .await?;
-        let mut out = vec![];
-        for tx in r.txs {
-            let Some(hash) = hex32(&tx.tx_hash) else { continue };
-            let blob = if tx.pruned_as_hex.is_empty() {
-                &tx.as_hex
-            } else {
-                &tx.pruned_as_hex
-            };
-            let bytes = hex::decode(blob).map_err(|e| Error::Daemon(format!("get_transactions: {e}")))?;
-            let parsed = Transaction::<Pruned>::read(&mut bytes.as_slice())
-                .map_err(|e| Error::Daemon(format!("get_transactions: transaction: {e}")))?;
-            out.push((hash, parsed));
+        let mut out = Transactions::default();
+        let mut seen = std::collections::HashSet::new();
+        for chunk in hashes.chunks(TXS_PER_REQUEST) {
+            let hex_hashes: Vec<String> = chunk.iter().map(TxHash::to_string).collect();
+            let r: R = self
+                .rpc(
+                    "get_transactions",
+                    json!({ "txs_hashes": hex_hashes, "prune": true }),
+                    TRANSACTIONS_RESPONSE,
+                )
+                .await?;
+            if r.status != "OK" {
+                return Err(Error::Daemon(format!(
+                    "get_transactions: {}",
+                    r.status.chars().take(100).collect::<String>()
+                )));
+            }
+            for tx in r.txs {
+                let hash = tx.tx_hash;
+                if !chunk.contains(&hash) {
+                    tracing::warn!("get_transactions: the node sent a transaction not asked for");
+                    continue;
+                }
+                if !seen.insert(hash) {
+                    continue;
+                }
+                match read_transaction(&tx.pruned_as_hex, &tx.as_hex, tx.prunable_hash.map(|p| p.0), &hash) {
+                    Ok(parsed) => out.txs.push((hash, parsed)),
+                    Err(e) => {
+                        tracing::warn!("get_transactions: skipping {hash}: {e}");
+                        out.bad.push(hash);
+                    }
+                }
+            }
         }
         Ok(out)
     }
@@ -342,12 +464,12 @@ impl Daemon {
     /// The prunable hash of each of these mined transactions the node has,
     /// by transaction hash (`get_transactions`, pruned, which sends it where
     /// `get_blocks.bin` sends zeros).
-    pub async fn prunable_hashes(&self, hashes: &[[u8; 32]]) -> Result<std::collections::HashMap<[u8; 32], [u8; 32]>> {
+    pub async fn prunable_hashes(&self, hashes: &[TxHash]) -> Result<std::collections::HashMap<TxHash, [u8; 32]>> {
         #[derive(Deserialize)]
         struct Tx {
-            tx_hash: String,
-            #[serde(default)]
-            prunable_hash: String,
+            tx_hash: TxHash,
+            #[serde(default, deserialize_with = "empty_or")]
+            prunable_hash: Option<lws_api::Hex32>,
         }
         #[derive(Deserialize)]
         struct R {
@@ -359,16 +481,20 @@ impl Daemon {
         if hashes.is_empty() {
             return Ok(Default::default());
         }
-        let hex_hashes: Vec<String> = hashes.iter().map(hex::encode).collect();
+        let hex_hashes: Vec<String> = hashes.iter().map(TxHash::to_string).collect();
         let r: R = self
-            .rpc("get_transactions", json!({ "txs_hashes": hex_hashes, "prune": true }))
+            .rpc(
+                "get_transactions",
+                json!({ "txs_hashes": hex_hashes, "prune": true }),
+                TRANSACTIONS_RESPONSE,
+            )
             .await?;
         if r.status != "OK" {
             return Err(Error::Daemon(format!("get_transactions: {}", r.status)));
         }
         Ok(r.txs
             .iter()
-            .filter_map(|t| Some((hex32(&t.tx_hash)?, hex32(&t.prunable_hash)?)))
+            .filter_map(|t| Some((t.tx_hash, t.prunable_hash?.0)))
             .filter(|(_, p)| *p != [0; 32])
             .collect())
     }
@@ -376,14 +502,81 @@ impl Daemon {
     /// Up to `count` blocks from `start` (at least 1: monerod ignores a zero
     /// start height), with their pruned transactions and each transaction's
     /// first RingCT output index. The node may send fewer than asked.
-    pub async fn blocks(&self, start: u64, count: u64) -> Result<Vec<Fetched>> {
-        let start = start.max(1);
+    pub async fn blocks(&self, start: Height, count: u64) -> Result<Vec<Fetched>> {
+        let start = start.max(Height::new(1));
         let count = count.clamp(1, MAX_BLOCKS_PER_REQUEST);
         let response = self
-            .post("get_blocks.bin", request(start, count), false, MAX_BLOCKS_RESPONSE)
+            .post(
+                "get_blocks.bin",
+                request(start.get(), count),
+                Call::Binary(MAX_BLOCKS_RESPONSE),
+            )
             .await?;
-        parse(&response, count as usize)
+        let blocks = parse(&response, count as usize)?;
+        check_chain(&blocks, start)?;
+        Ok(blocks)
     }
+}
+
+/// Refuses blocks that aren't the chain from `start` on: the scanner files
+/// each block's outputs and hash under `start + i`, so block `i` must be at
+/// that height and follow block `i - 1`.
+pub(crate) fn check_chain(blocks: &[Fetched], start: Height) -> Result<()> {
+    let mut previous: Option<[u8; 32]> = None;
+    for (i, f) in blocks.iter().enumerate() {
+        let block = &f.block.block;
+        if u64::try_from(block.number()).ok().map(Height::new) != start.offset(i) {
+            return Err(invalid("get_blocks.bin sent a block from the wrong height"));
+        }
+        if previous.is_some_and(|p| p != block.header.previous) {
+            return Err(invalid("get_blocks.bin sent blocks that don't follow each other"));
+        }
+        previous = Some(block.hash());
+    }
+    Ok(())
+}
+
+/// Transactions asked of `get_transactions`: those read, by hash, and those
+/// the node sent but that didn't read or didn't hash to their hash.
+#[derive(Debug, Default)]
+pub struct Transactions {
+    pub txs: Vec<(TxHash, Transaction<Pruned>)>,
+    pub bad: Vec<TxHash>,
+}
+
+/// Hashes asked of `get_transactions` at once (a restricted node answers at
+/// most 100).
+const TXS_PER_REQUEST: usize = 100;
+
+/// A transaction from `get_transactions`: the pruned blob if sent, else the
+/// full one, read and checked against `hash` as far as the bytes allow. A
+/// full blob says everything; a pruned version 2 one needs its prunable
+/// hash (one that isn't sent, or is zeros, can't be checked and is taken as
+/// it is); a pruned version 1 one can't be checked.
+fn read_transaction(
+    pruned_hex: &str,
+    full_hex: &str,
+    prunable_hash: Option<[u8; 32]>,
+    hash: &TxHash,
+) -> Result<Transaction<Pruned>> {
+    let pruned = !pruned_hex.is_empty();
+    let bytes =
+        hex::decode(if pruned { pruned_hex } else { full_hex }).map_err(|e| Error::Daemon(format!("not hex: {e}")))?;
+    let mut rest = bytes.as_slice();
+    let tx = Transaction::<Pruned>::read(&mut rest).map_err(|e| Error::Daemon(format!("transaction: {e}")))?;
+    let computed = match &tx {
+        Transaction::V1 { .. } if !pruned => Some(keccak256(&bytes)),
+        Transaction::V1 { .. } => None,
+        Transaction::V2 { proofs: None, .. } => tx.hash_with_prunable_hash([0; 32]),
+        Transaction::V2 { proofs: Some(_), .. } if !pruned => tx.hash_with_prunable_hash(keccak256(rest)),
+        Transaction::V2 { proofs: Some(_), .. } => prunable_hash
+            .filter(|p| *p != [0; 32])
+            .and_then(|p| tx.hash_with_prunable_hash(p)),
+    };
+    if computed.is_some_and(|c| c != hash.0) {
+        return Err(Error::Daemon("its bytes hash to another hash".into()));
+    }
+    Ok(tx)
 }
 
 /// `user:password@` in a URL as `***@`.
@@ -400,10 +593,11 @@ fn redact_userinfo(url: &str) -> String {
 
 /// The node's cumulative distribution plus its base, refused unless it
 /// never goes down (the picker relies on that) and never overflows.
-fn checked_cumulative(distribution: Vec<u64>, base: u64) -> Result<Vec<u64>> {
+///
+/// Done in place: the distribution is millions of entries.
+fn checked_cumulative(mut distribution: Vec<u64>, base: u64) -> Result<Vec<u64>> {
     let mut last = 0u64;
-    let mut out = Vec::with_capacity(distribution.len());
-    for d in distribution {
+    for d in &mut distribution {
         let c = d
             .checked_add(base)
             .ok_or_else(|| Error::Daemon("get_output_distribution: overflows".into()))?;
@@ -411,9 +605,69 @@ fn checked_cumulative(distribution: Vec<u64>, base: u64) -> Result<Vec<u64>> {
             return Err(Error::Daemon("get_output_distribution: not cumulative".into()));
         }
         last = c;
-        out.push(c);
+        *d = c;
     }
-    Ok(out)
+    Ok(distribution)
+}
+
+/// A JSON array of numbers, refused past `MAX_DISTRIBUTION_ENTRIES`.
+fn capped_u64s<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<u64>, D::Error> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<u64>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "at most {MAX_DISTRIBUTION_ENTRIES} numbers")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Vec<u64>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(n) = seq.next_element::<u64>()? {
+                if out.len() >= MAX_DISTRIBUTION_ENTRIES {
+                    return Err(serde::de::Error::custom("too many entries"));
+                }
+                out.push(n);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_seq(V)
+}
+
+/// A JSON array of hex hashes, decoded as it is read: an entry that isn't 64
+/// hex digits is skipped, so nothing but the 32 bytes of each good hash is
+/// kept (a node can't make a limit's worth of `"",` cost many times that in
+/// `String`s).
+fn hashes<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<TxHash>, D::Error> {
+    struct Hash(Option<TxHash>);
+    impl<'de> Deserialize<'de> for Hash {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Hash, D::Error> {
+            struct V;
+            impl serde::de::Visitor<'_> for V {
+                type Value = Hash;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a hex hash")
+                }
+                fn visit_str<E: serde::de::Error>(self, s: &str) -> std::result::Result<Hash, E> {
+                    Ok(Hash(TxHash::from_hex(s)))
+                }
+            }
+            d.deserialize_str(V)
+        }
+    }
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<TxHash>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an array of hex hashes")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Vec<TxHash>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(Hash(h)) = seq.next_element()? {
+                out.extend(h);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_seq(V)
 }
 
 /// A block as the scanner takes it: what monero-oxide's `Scanner` reads,
@@ -447,11 +701,6 @@ pub struct RawTx {
     pub prunable_hash: [u8; 32],
 }
 
-pub fn hex32(s: &str) -> Option<[u8; 32]> {
-    let mut out = [0u8; 32];
-    (s.len() == 64 && hex::decode_to_slice(s, &mut out).is_ok()).then_some(out)
-}
-
 fn invalid(what: impl Into<String>) -> Error {
     Error::Daemon(what.into())
 }
@@ -461,7 +710,8 @@ fn epee_err(e: monero_epee::EpeeError) -> Error {
 }
 
 fn key(request: &mut Vec<u8>, name: &str, kind: Type) {
-    request.push(name.len() as u8);
+    // The names are the few literals in `request`, all far under 256 bytes.
+    request.push(u8::try_from(name.len()).expect("a field name under 256 bytes"));
     request.extend(name.as_bytes());
     request.push(kind as u8);
 }
@@ -654,6 +904,29 @@ mod tests {
         assert!(parse(FIXTURE, 2).is_err(), "more blocks than asked for is an error");
     }
 
+    #[test]
+    fn blocks_must_be_the_chain_from_the_start_asked() {
+        let blocks = parse(FIXTURE, 3).unwrap();
+        check_chain(&blocks, Height::new(3_300_000)).unwrap();
+        check_chain(&blocks[1..], Height::new(3_300_001)).unwrap();
+        check_chain(&[], Height::new(7)).unwrap();
+        assert!(check_chain(&blocks, Height::new(3_300_001)).is_err(), "the wrong start");
+        let skipped = vec![blocks[0].clone(), blocks[2].clone()];
+        assert!(
+            check_chain(&skipped, Height::new(3_300_000)).is_err(),
+            "a block left out"
+        );
+        let repeated = vec![blocks[0].clone(), blocks[0].clone()];
+        assert!(check_chain(&repeated, Height::new(3_300_000)).is_err(), "a block twice");
+        // At the right height but on another chain.
+        let mut forked = blocks.clone();
+        forked[1].block.block.header.previous = [7; 32];
+        assert!(
+            check_chain(&forked, Height::new(3_300_000)).is_err(),
+            "not following its parent"
+        );
+    }
+
     /// A little fuzzing: thousands of random mutations of a real response,
     /// each of which must come back as `Ok` or `Err`, never a panic (an
     /// allocation the size of a forged length would abort the test).
@@ -781,7 +1054,151 @@ mod tests {
             }
         });
         let d = Daemon::new(&format!("http://{addr}")).unwrap();
-        let e = d.post("get_blocks.bin", vec![], false, 100 * 1024).await.unwrap_err();
+        let e = d
+            .post("get_blocks.bin", vec![], Call::Binary(100 * 1024))
+            .await
+            .unwrap_err();
         assert!(e.to_string().contains("over"), "{e}");
+    }
+
+    /// A node that answers every request with `body`, as JSON.
+    async fn answering(body: String) -> Daemon {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = s.write_all(head.as_bytes()).await;
+                    let _ = s.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+        Daemon::new(&format!("http://{addr}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn each_method_has_its_own_response_limit() {
+        // A `get_info` answer padded past what a small object can be.
+        let padded = format!(
+            r#"{{"result":{{"height":5,"pad":"{}"}}}}"#,
+            "x".repeat(SMALL_JSON_RESPONSE)
+        );
+        let e = answering(padded).await.info().await.unwrap_err();
+        assert!(e.to_string().contains("over"), "{e}");
+        let ok = answering(r#"{"result":{"height":5}}"#.into())
+            .await
+            .info()
+            .await
+            .unwrap();
+        assert_eq!(ok.height, Height::new(5));
+    }
+
+    #[tokio::test]
+    async fn a_json_rpc_error_is_read_without_keeping_its_bulk() {
+        let e = answering(r#"{"error":{"code":-2,"message":"nope","data":[0,0,0,0]}}"#.into())
+            .await
+            .info()
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("error -2: nope"), "{e}");
+        // An error that is a long array: refused, not decoded into values.
+        let array = format!(r#"{{"error":[{}0]}}"#, "0,".repeat(10_000));
+        assert!(answering(array).await.info().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pool_hashes_keep_only_hashes() {
+        let good = "ab".repeat(32);
+        let body = format!(r#"{{"tx_hashes":["","zz",{},"{good}","{}"]}}"#, 7, "a".repeat(63));
+        // A number in the list is malformed JSON for a hash list: an error.
+        assert!(answering(body).await.pool_hashes().await.is_err());
+        let body = format!(
+            r#"{{"tx_hashes":["","zz","{good}","{}"],"status":"OK"}}"#,
+            "a".repeat(63)
+        );
+        let hashes = answering(body).await.pool_hashes().await.unwrap();
+        assert_eq!(hashes, vec![TxHash([0xab; 32])]);
+    }
+
+    /// Hashes and keys from the node decode at the boundary: 64 hex
+    /// characters into their types, an empty optional one as `None`, and
+    /// anything else fails the answer rather than reaching a consumer.
+    #[tokio::test]
+    async fn hashes_and_keys_from_the_node_are_checked_as_they_are_read() {
+        let good = "ab".repeat(32);
+        let info = |top: &str| format!(r#"{{"result":{{"height":5{top}}}}}"#);
+        let read = answering(info(&format!(r#","top_block_hash":"{good}""#)))
+            .await
+            .info()
+            .await;
+        assert_eq!(read.unwrap().top_block_hash, Some(BlockHash([0xab; 32])));
+        for absent in ["", r#","top_block_hash":"""#] {
+            let read = answering(info(absent)).await.info().await.unwrap();
+            assert_eq!(read.top_block_hash, None, "{absent}");
+        }
+        for bad in ["a".repeat(63), "zz".repeat(32), "ab".repeat(33)] {
+            let body = info(&format!(r#","top_block_hash":"{bad}""#));
+            assert!(answering(body).await.info().await.is_err(), "{bad}");
+        }
+
+        let header = |hash: &str| format!(r#"{{"result":{{"block_header":{{"hash":"{hash}"}}}}}}"#);
+        let d = answering(header(&good)).await;
+        assert_eq!(d.block_hash(Height::new(1)).await.unwrap(), BlockHash([0xab; 32]));
+        assert!(answering(header("ab")).await.block_hash(Height::new(1)).await.is_err());
+
+        let outs = |key: &str| {
+            format!(r#"{{"status":"OK","outs":[{{"key":"{key}","mask":"{good}","unlocked":true,"height":1}}]}}"#)
+        };
+        let read = answering(outs(&"cd".repeat(32))).await.outs(&[7]).await.unwrap();
+        assert_eq!(read[0].key, PublicKey([0xcd; 32]));
+        assert_eq!(read[0].mask.0, [0xab; 32]);
+        for bad in [
+            "",
+            "cd",
+            "not hex at all, but sixty-four characters long, give or take a few",
+        ] {
+            assert!(answering(outs(bad)).await.outs(&[7]).await.is_err(), "{bad}");
+        }
+
+        let asked = TxHash([0xab; 32]);
+        let txs = |hash: &str, prunable: &str| {
+            format!(r#"{{"status":"OK","txs":[{{"tx_hash":"{hash}","prunable_hash":"{prunable}"}}]}}"#)
+        };
+        let found = answering(txs(&good, &"01".repeat(32)))
+            .await
+            .prunable_hashes(&[asked])
+            .await;
+        assert_eq!(found.unwrap().get(&asked), Some(&[1; 32]));
+        let none = answering(txs(&good, "")).await.prunable_hashes(&[asked]).await;
+        assert!(none.unwrap().is_empty(), "an empty prunable hash is none");
+        assert!(answering(txs("ab", "")).await.prunable_hashes(&[asked]).await.is_err());
+        assert!(
+            answering(txs(&good, "0102"))
+                .await
+                .prunable_hashes(&[asked])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_distribution_must_start_at_a_height_the_chain_can_reach() {
+        let at = |start: u64| {
+            format!(r#"{{"result":{{"distributions":[{{"start_height":{start},"distribution":[1,2,3],"base":0}}]}}}}"#)
+        };
+        let d = answering(at(10)).await.output_distribution().await.unwrap();
+        assert_eq!((d.start_height, d.cumulative), (Height::new(10), vec![1, 2, 3]));
+        for bad in [u64::MAX, u64::MAX - 2, MAX_BLOCK_NUMBER.get()] {
+            let e = answering(at(bad)).await.output_distribution().await.unwrap_err();
+            assert!(e.to_string().contains("out of range"), "{bad}: {e}");
+        }
     }
 }

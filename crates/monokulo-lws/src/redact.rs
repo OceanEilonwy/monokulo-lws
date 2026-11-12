@@ -49,37 +49,30 @@ impl fmt::Debug for Checked {
 mod tests {
     use super::*;
     use crate::db::Status;
+    use crate::types::Height;
+    use lws_api::PrivateViewKey;
 
     #[test]
     fn debug_leaves_out_keys_and_addresses() {
         let key = [0xab; 32];
-        let address = "5AddressThatMustNotBePrinted".to_string();
+        let address = crate::testkit::Wallet::new(1).address();
         let account = Account {
-            id: 7,
+            id: crate::types::AccountId::new(7),
             address: address.clone(),
-            view_key: key,
-            spend_pub: [1; 32],
-            view_pub: [2; 32],
+            view_key: PrivateViewKey::from_bytes(&key),
             status: Status::Active,
-            start_height: 1,
-            scan_height: 2,
+            start_height: Height::new(1),
+            scan_height: Height::new(2),
             access_time: 3,
             generated_locally: false,
         };
         let new = NewAccount {
             address: address.clone(),
-            view_key: key,
-            spend_pub: [1; 32],
-            view_pub: [2; 32],
-            start_height: 1,
+            view_key: PrivateViewKey::from_bytes(&key),
+            start_height: Height::new(1),
             generated_locally: true,
         };
-        let checked = Checked {
-            address: address.clone(),
-            spend_pub: [1; 32],
-            view_pub: [2; 32],
-            view_key: key,
-        };
+        let checked = Checked::unchecked(address.clone(), PrivateViewKey::from_bytes(&key));
         let hex_key = hex::encode(key);
         for printed in [
             format!("{account:?}"),
@@ -87,7 +80,7 @@ mod tests {
             format!("{checked:?}"),
             format!("{account:#?}"),
         ] {
-            assert!(!printed.contains(&address), "{printed}");
+            assert!(!printed.contains(&address.as_str()[..12]), "{printed}");
             assert!(!printed.contains(&hex_key), "{printed}");
             assert!(!printed.contains("171, 171"), "{printed}");
         }

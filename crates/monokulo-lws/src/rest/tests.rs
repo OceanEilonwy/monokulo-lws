@@ -15,9 +15,12 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 use super::*;
-use crate::db::{NewAccount, Status};
+use crate::address::Address;
+use crate::db::{Db, Status};
 use crate::limits::{ClientIpConfig, Limits};
 use crate::scanner::{LaneConfig, ScanConfig, Scanner};
+use crate::types::Height;
+use lws_api::PrivateViewKey;
 
 /// A stagenet wallet: its address and private view key.
 fn wallet(seed: u64) -> (String, [u8; 32]) {
@@ -52,7 +55,8 @@ impl Default for Setup {
 }
 
 fn app(setup: Setup) -> Arc<App> {
-    let db = Arc::new(Db::in_memory());
+    // A file, so the handlers read through the read pool as when served.
+    let db = Arc::new(Db::scratch());
     let daemon = Daemon::new(&setup.daemon).unwrap();
     let scanner = Scanner::new(
         db.clone(),
@@ -71,9 +75,9 @@ fn app(setup: Setup) -> Arc<App> {
         },
     );
     // As if the scanner had heard from the node: a new account starts below this.
-    scanner.status.write().unwrap().chain_height = 1_000;
+    scanner.status.write().unwrap().chain_height = Height::new(1_000);
     Arc::new(App {
-        db,
+        db: crate::db::AsyncDb::new(db),
         daemon,
         scanner,
         config: Config {
@@ -95,21 +99,16 @@ fn app(setup: Setup) -> Arc<App> {
 
 fn add(app: &App, seed: u64, status: Status) -> (String, [u8; 32]) {
     let (address, key) = wallet(seed);
-    let checked = crate::crypto::check_login(Network::Stagenet, &address, &key).unwrap();
+    let checked = crate::crypto::check_login(Network::Stagenet, &address, PrivateViewKey::from_bytes(&key)).unwrap();
     app.db
-        .add_account(
-            &NewAccount {
-                address: checked.address.clone(),
-                view_key: checked.view_key,
-                spend_pub: checked.spend_pub,
-                view_pub: checked.view_pub,
-                start_height: 10,
-                generated_locally: false,
-            },
-            status,
-        )
+        .add_account(&checked.into_new_account(Height::new(10), false), status)
         .unwrap();
     (address, key)
+}
+
+/// A wallet's address as the server holds it.
+fn parsed(address: &str) -> Address {
+    Address::parse(Network::Stagenet, address).unwrap()
 }
 
 fn login_body(address: &str, key: &[u8; 32]) -> Value {
@@ -238,7 +237,7 @@ async fn unknown_accounts_and_wrong_keys_look_the_same() {
     let mut create = login_body(&unknown, &other_key);
     create["create_account"] = json!(true);
     assert_eq!(call(&router, "/login", &create).await.status, StatusCode::FORBIDDEN);
-    assert!(app.db.account(&unknown).unwrap().is_none());
+    assert!(app.db.account(&parsed(&unknown)).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -323,7 +322,7 @@ async fn create_off_answers_501_and_creation_is_capped() {
     let r = call_from(&router, "/login", &body.to_string(), "198.51.100.99:1", &[]).await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
     assert!(r.headers.contains_key("retry-after"));
-    assert!(capped.db.account(&address).unwrap().is_none());
+    assert!(capped.db.account(&parsed(&address)).unwrap().is_none());
 
     // The approval queue holds one.
     let queued = app(Setup {
@@ -391,6 +390,42 @@ async fn login_with_create_takes_the_strict_limit() {
         call(&router, "/login", &login_body(&address, &key)).await.status,
         StatusCode::OK
     );
+}
+
+/// One /48 can't spend a strict bucket per /64: its own /48 bucket (four
+/// /64s' worth by default) runs out first.
+#[tokio::test]
+async fn a_slash_48_shares_a_strict_bucket() {
+    let app = app(Setup {
+        limits: Limits::new(ClientIpConfig::default(), 0, 1, 0, u64::MAX),
+        ..Setup::default()
+    });
+    let router = wallet_router(app.clone());
+    for n in 1..=5u64 {
+        let (address, key) = wallet(60 + n);
+        let mut body = login_body(&address, &key);
+        body["create_account"] = json!(true);
+        let r = call_from(
+            &router,
+            "/login",
+            &body.to_string(),
+            &format!("[2001:db8:7:{n}::1]:1"),
+            &[],
+        )
+        .await;
+        let wanted = if n <= 4 {
+            StatusCode::OK
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        assert_eq!(r.status, wanted, "/64 number {n}: {}", r.body);
+    }
+    // Another /48 isn't held back.
+    let (address, key) = wallet(70);
+    let mut body = login_body(&address, &key);
+    body["create_account"] = json!(true);
+    let r = call_from(&router, "/login", &body.to_string(), "[2001:db8:8:1::1]:1", &[]).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
 }
 
 #[tokio::test]
@@ -744,10 +779,25 @@ async fn remove_accounts_forgets_the_accounts_whole() {
         serde_json::from_str(&call(&admin, "/list_requests", &json!({ "auth": auth })).await.body).unwrap();
     assert_eq!(listed["create"].as_array().unwrap().len(), 1);
 
+    // A name that isn't an address fails the whole command, unquoted.
     let r = call(
         &admin,
         "/remove_accounts",
-        &json!({ "auth": auth, "params": { "addresses": [address, asking, "not an account"] } }),
+        &json!({ "auth": auth, "params": { "addresses": [address, "not an address"] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(!r.body.contains("not an address"), "{}", r.body);
+    assert!(
+        app.db.account(&parsed(&address)).unwrap().is_some(),
+        "nothing was removed"
+    );
+    // An address without an account is passed over.
+    let (unknown, _) = wallet(43);
+    let r = call(
+        &admin,
+        "/remove_accounts",
+        &json!({ "auth": auth, "params": { "addresses": [address, asking, unknown] } }),
     )
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
@@ -770,7 +820,7 @@ async fn remove_accounts_forgets_the_accounts_whole() {
         listed.get("create").is_none(),
         "the request under the address went too: {listed}"
     );
-    assert!(app.db.account(&address).unwrap().is_none());
+    assert!(app.db.account(&parsed(&address)).unwrap().is_none());
     // The removed wallet asks afresh, as any new one.
     let mut create = login_body(&address, &key);
     create["create_account"] = json!(true);
@@ -783,4 +833,514 @@ async fn remove_accounts_forgets_the_accounts_whole() {
     )
     .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+/// An output whose transaction row isn't there (what a scanner commit
+/// between two reads used to look like) is answered around, not a panic.
+#[tokio::test]
+async fn an_output_without_its_transaction_is_no_panic() {
+    let app = app(Setup::default());
+    let router = wallet_router(app.clone());
+    let (address, key) = add(&app, 95, Status::Active);
+    let id = app.db.account(&parsed(&address)).unwrap().unwrap().id;
+    app.db
+        .raw_writer(|c| {
+            c.execute_batch("PRAGMA foreign_keys=OFF;")?;
+            c.execute(
+                "INSERT INTO outputs (account, tx, out_index, global_index, amount, public_key, tx_pub_key, height, maj, min) VALUES (?1, 999, 0, 5, 7, ?2, ?2, 20, 0, 0)",
+                rusqlite::params![id, [3u8; 32].as_slice()],
+            )?;
+            c.execute_batch("PRAGMA foreign_keys=ON;")?;
+            Ok(())
+        })
+        .unwrap();
+    for path in ["/get_address_info", "/get_address_txs"] {
+        let r = call(&router, path, &login_body(&address, &key)).await;
+        assert_eq!(r.status, StatusCode::OK, "{path}: {}", r.body);
+    }
+}
+
+/// A major whose highest minor is u32::MAX has no room: 409, not an
+/// overflow (a panic in a debug build, minors from 0 in a release one).
+#[tokio::test]
+async fn provisioning_a_full_major_is_a_conflict() {
+    let app = app(Setup::default());
+    let router = wallet_router(app.clone());
+    let (address, key) = add(&app, 96, Status::Active);
+    let mut body = login_body(&address, &key);
+    body["subaddrs"] = json!([{ "key": 0, "value": [[4294967295u32, 4294967295u32]] }]);
+    let r = call(&router, "/upsert_subaddrs", &body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let mut body = login_body(&address, &key);
+    body["maj_i"] = json!(0);
+    body["n_min"] = json!(5);
+    let r = call(&router, "/provision_subaddrs", &body).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.body);
+    // Nor can a range be asked for that runs past the top.
+    let mut body = login_body(&address, &key);
+    body["maj_i"] = json!(1);
+    body["min_i"] = json!(4294967294u32);
+    body["n_min"] = json!(5);
+    let r = call(&router, "/provision_subaddrs", &body).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.body);
+    // Another major still has room.
+    let mut body = login_body(&address, &key);
+    body["maj_i"] = json!(2);
+    body["n_min"] = json!(5);
+    let r = call(&router, "/provision_subaddrs", &body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+}
+
+/// `upsert_subaddrs` against a plain set of minors, over random requests,
+/// and fast on a large account: 10,000 stored singletons and 1,000
+/// requested ones used to take ~1e8 comparisons under the database lock.
+#[test]
+fn subaddress_upserts_match_a_set_and_scale() {
+    use crate::testkit::mr;
+    use lws_api::{MinorRange, SubaddrRanges};
+    use std::collections::BTreeSet;
+    let db = Db::in_memory();
+    let (address, key) = wallet(97);
+    let checked = crate::crypto::check_login(Network::Stagenet, &address, PrivateViewKey::from_bytes(&key)).unwrap();
+    let account = db
+        .add_account(&checked.into_new_account(Height::ZERO, false), Status::Active)
+        .unwrap()
+        .id;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |n: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    let mut model: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let ranges_of = |minors: Vec<(u32, u32)>| -> Vec<SubaddrRanges> {
+        let mut out: Vec<SubaddrRanges> = vec![];
+        for (maj, min) in minors {
+            match out.last_mut() {
+                Some(r) if r.key == maj && r.value.last().unwrap().hi() + 1 == min => {
+                    let last = r.value.last_mut().unwrap();
+                    *last = mr(last.lo(), min);
+                }
+                Some(r) if r.key == maj => r.value.push(mr(min, min)),
+                _ => out.push(SubaddrRanges {
+                    key: maj,
+                    value: vec![mr(min, min)],
+                }),
+            }
+        }
+        out
+    };
+    for _ in 0..200 {
+        let mut wanted: Vec<SubaddrRanges> = vec![];
+        for _ in 0..1 + next(4) {
+            let lo = next(60) as u32;
+            let hi = lo + next(8) as u32;
+            wanted.push(SubaddrRanges {
+                key: next(3) as u32,
+                value: vec![mr(lo, hi)],
+            });
+        }
+        let mut fresh = BTreeSet::new();
+        for w in &wanted {
+            for r in &w.value {
+                for m in r.lo()..=r.hi() {
+                    if !model.contains(&(w.key, m)) {
+                        fresh.insert((w.key, m));
+                    }
+                }
+            }
+        }
+        let added = db.upsert_subaddrs(account, &wanted, 1_000).unwrap();
+        assert_eq!(added, ranges_of(fresh.iter().copied().collect()), "{wanted:?}");
+        model.extend(fresh);
+        assert_eq!(
+            db.subaddrs(account).unwrap(),
+            ranges_of(model.iter().copied().collect())
+        );
+    }
+
+    // Large: every other minor of major 5 stored, then 1,000 more asked for.
+    let stored: Vec<MinorRange> = (0..10_000u32).map(|i| mr(i * 2, i * 2)).collect();
+    db.upsert_subaddrs(account, &[SubaddrRanges { key: 5, value: stored }], 100_000)
+        .unwrap();
+    let asked: Vec<MinorRange> = (0..1_000u32).map(|i| mr(i * 20 + 1, i * 20 + 1)).collect();
+    let started = std::time::Instant::now();
+    let added = db
+        .upsert_subaddrs(
+            account,
+            &[SubaddrRanges {
+                key: 5,
+                value: asked.clone(),
+            }],
+            100_000,
+        )
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    assert_eq!(added, vec![SubaddrRanges { key: 5, value: asked }]);
+    // A minor at the very top is new once and covered after.
+    let top = [SubaddrRanges {
+        key: 9,
+        value: vec![mr(u32::MAX - 1, u32::MAX)],
+    }];
+    assert_eq!(db.upsert_subaddrs(account, &top, 100_000).unwrap().len(), 1);
+    assert!(db.upsert_subaddrs(account, &top, 100_000).unwrap().is_empty());
+}
+
+/// A rescan height past i64::MAX is a 400, not stored as -1 (which deleted
+/// everything and left the account never scanning again); an import is one
+/// transaction that starts the account at 0.
+#[tokio::test]
+async fn rescan_heights_past_i64_are_refused() {
+    let app = app(Setup::default());
+    let admin = admin_router(app.clone());
+    let auth = hex::encode(*crate::admin_keys::create(&app.db).unwrap());
+    let (address, _) = add(&app, 98, Status::Active);
+    for height in [u64::MAX, i64::MAX as u64 + 1] {
+        let r = call(
+            &admin,
+            "/rescan",
+            &json!({ "auth": auth, "params": { "height": height, "addresses": [address] } }),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    }
+    assert_eq!(
+        app.db.account(&parsed(&address)).unwrap().unwrap().scan_height,
+        Height::new(10)
+    );
+    let r = call(
+        &admin,
+        "/rescan",
+        &json!({ "auth": auth, "params": { "height": 5, "addresses": [address] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(
+        app.db.account(&parsed(&address)).unwrap().unwrap().scan_height,
+        Height::new(5)
+    );
+    assert_eq!(app.db.import(&[parsed(&address)]).unwrap(), vec![parsed(&address)]);
+    let a = app.db.account(&parsed(&address)).unwrap().unwrap();
+    assert_eq!((a.start_height, a.scan_height), (Height::ZERO, Height::ZERO));
+    // A new account can't start there either.
+    let (other, key) = wallet(99);
+    let checked = crate::crypto::check_login(Network::Stagenet, &other, PrivateViewKey::from_bytes(&key)).unwrap();
+    let new = checked.into_new_account(Height::MAX, false);
+    assert!(matches!(
+        app.db.add_account(&new, Status::Active),
+        Err(crate::error::Error::BadRequest(_))
+    ));
+    assert!(app.db.account(&parsed(&other)).unwrap().is_none());
+}
+
+/// A repeated create request is refused before it takes a token from the
+/// global bucket, so it can't drain it for everyone.
+#[tokio::test]
+async fn a_repeated_request_spends_no_global_token() {
+    let app = app(Setup {
+        create: Policy::Approve,
+        limits: Limits::new(ClientIpConfig::default(), 0, 0, 2, u64::MAX),
+        ..Setup::default()
+    });
+    let router = wallet_router(app.clone());
+    let (a, ka) = wallet(90);
+    let mut create = login_body(&a, &ka);
+    create["create_account"] = json!(true);
+    assert_eq!(call(&router, "/login", &create).await.status, StatusCode::OK);
+    for _ in 0..5 {
+        assert_eq!(call(&router, "/login", &create).await.status, StatusCode::FORBIDDEN);
+    }
+    let (b, kb) = wallet(91);
+    let mut create = login_body(&b, &kb);
+    create["create_account"] = json!(true);
+    let r = call(&router, "/login", &create).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(app.db.requests().unwrap().len(), 2);
+}
+
+/// The queue's cap holds under concurrent requests: the count and the
+/// insert are one transaction.
+#[test]
+fn the_request_queue_cap_is_exact_under_concurrency() {
+    use crate::db::Queued;
+    use lws_api::admin::RequestKind;
+    let db = Arc::new(Db::in_memory());
+    let new = |seed: u64| {
+        let (address, key) = wallet(seed);
+        let checked =
+            crate::crypto::check_login(Network::Stagenet, &address, PrivateViewKey::from_bytes(&key)).unwrap();
+        checked.into_new_account(Height::ZERO, false)
+    };
+    let threads: Vec<_> = (0..16u64)
+        .map(|i| {
+            let db = db.clone();
+            let n = new(100 + i);
+            std::thread::spawn(move || db.add_request(RequestKind::Create, &n, 5).unwrap())
+        })
+        .collect();
+    let outcomes: Vec<Queued> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(outcomes.iter().filter(|q| **q == Queued::Added).count(), 5);
+    assert_eq!(db.requests().unwrap().len(), 5);
+    let first = new(200);
+    let db = Db::in_memory();
+    assert_eq!(db.add_request(RequestKind::Import, &first, 1).unwrap(), Queued::Added);
+    assert_eq!(
+        db.add_request(RequestKind::Import, &first, 1).unwrap(),
+        Queued::Duplicate
+    );
+    assert!(db.has_request(RequestKind::Import, &first.address).unwrap());
+    assert!(!db.has_request(RequestKind::Create, &first.address).unwrap());
+    assert_eq!(db.add_request(RequestKind::Create, &first, 1).unwrap(), Queued::Full(1));
+}
+
+/// `accept_requests` is all or nothing: one address that already has an
+/// account means 409 naming it, and no request is taken or accepted. An
+/// unknown type is refused before anything is looked at.
+#[tokio::test]
+async fn accept_requests_is_all_or_nothing() {
+    let app = app(Setup {
+        create: Policy::Approve,
+        ..Setup::default()
+    });
+    let wallets = wallet_router(app.clone());
+    let admin = admin_router(app.clone());
+    let auth = hex::encode(*crate::admin_keys::create(&app.db).unwrap());
+    let (a, ka) = wallet(80);
+    let (b, kb) = wallet(81);
+    let (c, kc) = wallet(82);
+    for (address, key) in [(&a, &ka), (&b, &kb), (&c, &kc)] {
+        let mut create = login_body(address, key);
+        create["create_account"] = json!(true);
+        assert_eq!(call(&wallets, "/login", &create).await.status, StatusCode::OK);
+    }
+    // The operator adds one of them by hand meanwhile.
+    let r = call(
+        &admin,
+        "/add_account",
+        &json!({ "auth": auth, "params": { "address": a, "key": hex::encode(ka) } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+    let r = call(
+        &admin,
+        "/accept_requests",
+        &json!({ "auth": auth, "params": { "type": "imports", "addresses": [b] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert_eq!(app.db.requests().unwrap().len(), 3);
+
+    let r = call(
+        &admin,
+        "/accept_requests",
+        &json!({ "auth": auth, "params": { "type": "create", "addresses": [a, b, c] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.body);
+    let body: Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(body["exists"], json!([a]));
+    assert_eq!(app.db.requests().unwrap().len(), 3, "nothing was taken");
+    assert!(app.db.account(&parsed(&b)).unwrap().is_none());
+    assert!(app.db.account(&parsed(&c)).unwrap().is_none());
+
+    let r = call(
+        &admin,
+        "/accept_requests",
+        &json!({ "auth": auth, "params": { "type": "create", "addresses": [b, c, b] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let body: Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(body["updated"], json!([b, c]));
+    assert_eq!(app.db.account(&parsed(&b)).unwrap().unwrap().status, Status::Active);
+    assert!(app.db.account(&parsed(&c)).unwrap().is_some());
+    let left: Vec<String> = app
+        .db
+        .requests()
+        .unwrap()
+        .into_iter()
+        .map(|(_, n)| n.address.as_str().to_owned())
+        .collect();
+    assert_eq!(left, vec![a.clone()]);
+
+    // Rejecting takes the request away; an unknown type is a 400 there too.
+    let r = call(
+        &admin,
+        "/reject_requests",
+        &json!({ "auth": auth, "params": { "type": "nope", "addresses": [a] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = call(
+        &admin,
+        "/reject_requests",
+        &json!({ "auth": auth, "params": { "type": "create", "addresses": [a] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(app.db.requests().unwrap().is_empty());
+}
+
+/// Closed sets on the admin API are enums: a status that isn't one of the
+/// three is refused when the request is read, and nothing changes.
+#[tokio::test]
+async fn an_unknown_account_status_is_refused() {
+    let app = app(Setup::default());
+    let admin = admin_router(app.clone());
+    let auth = hex::encode(*crate::admin_keys::create(&app.db).unwrap());
+    let (address, _) = add(&app, 44, Status::Active);
+    for status in ["Hidden", "deleted", ""] {
+        let r = call(
+            &admin,
+            "/modify_account_status",
+            &json!({ "auth": auth, "params": { "status": status, "addresses": [address] } }),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{status}");
+    }
+    assert_eq!(
+        app.db.account(&parsed(&address)).unwrap().unwrap().status,
+        Status::Active
+    );
+    let r = call(
+        &admin,
+        "/modify_account_status",
+        &json!({ "auth": auth, "params": { "status": "hidden", "addresses": [address] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(
+        app.db.account(&parsed(&address)).unwrap().unwrap().status,
+        Status::Hidden
+    );
+}
+
+/// A body that arrives in the given frames, without a `Content-Length`
+/// (as a chunked upload does).
+struct Frames(std::collections::VecDeque<axum::body::Bytes>);
+
+impl Frames {
+    fn body(chunks: impl IntoIterator<Item = Vec<u8>>) -> Body {
+        Body::new(Frames(chunks.into_iter().map(axum::body::Bytes::from).collect()))
+    }
+}
+
+impl hyper::body::Body for Frames {
+    type Data = axum::body::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(self.0.pop_front().map(|c| Ok(hyper::body::Frame::data(c))))
+    }
+}
+
+async fn call_frames(router: &Router, path: &str, body: Body) -> StatusCode {
+    let mut request = Request::post(path)
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo("198.51.100.1:5000".parse::<SocketAddr>().unwrap()));
+    router.clone().oneshot(request).await.unwrap().status()
+}
+
+/// The body is read into a wiped buffer, frame by frame, whole; the limit
+/// still holds for a body without a `Content-Length` that only grows past
+/// it frame by frame.
+#[tokio::test]
+async fn bodies_are_read_into_a_wiped_buffer_within_the_limit() {
+    let text = br#"{"a": "0123456789", "b": [1, 2, 3]}"#.to_vec();
+    let frames = Frames::body(text.chunks(3).map(<[u8]>::to_vec));
+    // The type is the point: the buffer is wiped when it is dropped.
+    let buf: Zeroizing<Vec<u8>> = read_body(frames, usize::MAX).await.unwrap();
+    assert_eq!(buf.as_slice(), text.as_slice());
+
+    // A lying Content-Length reserves no more than the cap.
+    let small = read_body(Body::from("{}"), usize::MAX).await.unwrap();
+    assert!(small.capacity() <= PRESIZE_CAP, "{}", small.capacity());
+
+    let app = app(Setup::default());
+    let router = wallet_router(app.clone());
+    let (address, key) = add(&app, 50, Status::Active);
+    let login = login_body(&address, &key).to_string().into_bytes();
+    let frames = Frames::body(login.chunks(7).map(<[u8]>::to_vec));
+    assert_eq!(call_frames(&router, "/get_address_info", frames).await, StatusCode::OK);
+
+    // 5 KiB of padding in 1 KiB frames, past the 4 KiB limit.
+    let mut chunks = vec![login[..login.len() - 1].to_vec(), b", \"pad\": \"".to_vec()];
+    chunks.extend(std::iter::repeat_n(vec![b'x'; 1024], 5));
+    chunks.push(b"\"}".to_vec());
+    assert_eq!(
+        call_frames(&router, "/get_address_info", Frames::body(chunks)).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+}
+
+/// Growing the buffer keeps what it held and makes room for what comes.
+#[test]
+fn a_wiped_buffer_grows_whole() {
+    let mut buf = Zeroizing::new(Vec::with_capacity(2));
+    append(&mut buf, b"ab");
+    append(&mut buf, b"cdefg");
+    assert!(buf.capacity() >= 7);
+    append(&mut buf, b"h");
+    assert_eq!(buf.as_slice(), b"abcdefgh");
+}
+
+/// A key written with an escape (which serde_json can't lend from the body,
+/// and copies) is still read, and still refused when it is too short.
+#[tokio::test]
+async fn an_escaped_view_key_still_logs_in() {
+    let app = app(Setup::default());
+    let router = wallet_router(app.clone());
+    let (address, key) = add(&app, 51, Status::Active);
+    let hex_key = hex::encode(key);
+    let escaped = format!("\\u{:04x}{}", hex_key.as_bytes()[0], &hex_key[1..]);
+    let body = format!("{{\"address\": \"{address}\", \"view_key\": \"{escaped}\"}}");
+    let r = call_from(&router, "/get_address_info", &body, "198.51.100.1:5000", &[]).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let short = format!(
+        "{{\"address\": \"{address}\", \"view_key\": \"\\u0030{}\"}}",
+        &hex_key[2..]
+    );
+    let r = call_from(&router, "/get_address_info", &short, "198.51.100.1:5000", &[]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+/// The admin API reads `auth` and each command's `params` from the body
+/// itself: a command that takes none ignores what is there, one that needs
+/// them refuses a body without them, and the key is still checked first.
+#[tokio::test]
+async fn admin_params_are_read_from_the_body() {
+    let app = app(Setup::default());
+    let admin = admin_router(app.clone());
+    let auth = hex::encode(*crate::admin_keys::create(&app.db).unwrap());
+    let (address, key) = wallet(52);
+
+    let r = call(
+        &admin,
+        "/list_accounts",
+        &json!({ "auth": auth, "params": { "x": [1] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(
+        call(&admin, "/add_account", &json!({ "auth": auth })).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    let params = json!({ "address": address, "key": hex::encode(key) });
+    assert_eq!(
+        call(&admin, "/add_account", &json!({ "params": params })).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert!(app.db.account(&parsed(&address)).unwrap().is_none());
+    // `params` before `auth` is the same request.
+    let body = format!("{{\"params\": {params}, \"auth\": \"{auth}\"}}");
+    let r = call_from(&admin, "/add_account", &body, "198.51.100.1:5000", &[]).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(app.db.account(&parsed(&address)).unwrap().is_some());
 }

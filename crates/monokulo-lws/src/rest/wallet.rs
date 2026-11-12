@@ -9,16 +9,18 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use lws_api::admin::RequestKind;
 use lws_api::*;
 use serde_json::json;
 use subtle::ConstantTimeEq;
 
 use super::{ApiError, ApiJson, App, MAX_TX_BYTES, Policy};
 use crate::crypto;
-use crate::db::{Account, NewAccount, OutputRow, Status, TxRow};
+use crate::db::{Account, Holdings, NewAccount, OutputRow, Queued, SpendRow, Status, TxRow};
 use crate::error::{Error, Result, bad};
 use crate::limits::ClientIp;
 use crate::scanner::{PoolReceipt, PoolSpend, unlocked};
+use crate::types::{AccountId, Height, KeyImage, OutputId, SubaddressIndex, TxHash, TxId};
 
 type Reply<T> = std::result::Result<Json<T>, ApiError>;
 
@@ -26,23 +28,26 @@ type Reply<T> = std::result::Result<Json<T>, ApiError>;
 /// the account is here and not hidden. Hidden, unknown, pending and a key
 /// that doesn't fit all look the same: 403 and the same body. A wrong key
 /// is refused by `check_login` before the database is asked, so neither the
-/// answer nor its timing says whether an address has an account.
-async fn authorize(app: &App, login: &Login) -> Result<Account> {
-    let checked = crypto::check_login(app.scanner.config.network, &login.address, &login.view_key.0)?;
-    let Some(account) = app.db.account(&checked.address)? else {
+/// answer nor its timing says whether an address has an account. The login
+/// is taken whole: its view key ends in the `Checked`, and is wiped there.
+async fn authorize(app: &App, login: Login) -> Result<Account> {
+    let checked = crypto::check_login(app.scanner.config.network, &login.address, login.view_key)?;
+    let address = checked.address().clone();
+    let Some(account) = app.db.call(move |db| db.account(&address)).await? else {
         return Err(Error::Forbidden);
     };
-    if account.status == Status::Hidden || account.view_key.ct_eq(&checked.view_key).unwrap_u8() == 0 {
+    if account.status == Status::Hidden || account.view_key.ct_eq(checked.view_key()).unwrap_u8() == 0 {
         return Err(Error::Forbidden);
     }
-    app.db.touch(account.id)?;
+    let id = account.id;
+    app.db.call(move |db| db.touch(id)).await?;
     Ok(account)
 }
 
 /// As [`authorize`], for a call that changes the account (an import, new
 /// subaddresses): an inactive account is served what was scanned but not
 /// changed.
-async fn authorize_active(app: &App, login: &Login) -> Result<Account> {
+async fn authorize_active(app: &App, login: Login) -> Result<Account> {
     let account = authorize(app, login).await?;
     if account.status != Status::Active {
         return Err(Error::Forbidden);
@@ -51,28 +56,42 @@ async fn authorize_active(app: &App, login: &Login) -> Result<Account> {
 }
 
 /// The strict per-client limit, for a call that would make an account or a
-/// request, and the global one on new accounts and requests.
-fn creation_allowed(app: &App, client: Option<&Extension<ClientIp>>) -> Result<()> {
+/// request.
+fn strict_allowed(app: &App, client: Option<&Extension<ClientIp>>) -> Result<()> {
     if let Some(Extension(ClientIp(ip))) = client {
         app.limits.strict.check(*ip).map_err(Error::RateLimited)?;
     }
+    Ok(())
+}
+
+/// The global limit on new accounts and requests, taken last, once nothing
+/// else will refuse the call.
+fn global_allowed(app: &App) -> Result<()> {
     app.limits.creation.check().map_err(|wait| {
         tracing::warn!("the limit on new accounts and requests an hour was reached");
         Error::RateLimited(wait)
     })
 }
 
-/// Refuses a new create or import request when the queue is full
-/// (monero-lws's `--create-queue-max`).
-fn queue_has_room(app: &App) -> Result<()> {
-    let pending = app
-        .db
-        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM requests", [], |r| r.get::<_, i64>(0))? as u64))?;
-    if pending >= app.limits.max_pending_requests {
-        tracing::warn!("the queue of pending requests is full ({pending}): accept or reject some");
-        return Err(Error::Busy("too many pending requests; try again later"));
+/// Both creation limits.
+fn creation_allowed(app: &App, client: Option<&Extension<ClientIp>>) -> Result<()> {
+    strict_allowed(app, client)?;
+    global_allowed(app)
+}
+
+/// Queues a create or import request: `Ok(false)` if one is already
+/// pending, `Busy` when the queue is full (monero-lws's
+/// `--create-queue-max`).
+async fn queue(app: &App, kind: RequestKind, new: NewAccount) -> Result<bool> {
+    let max = app.limits.max_pending_requests;
+    match app.db.call(move |db| db.add_request(kind, &new, max)).await? {
+        Queued::Added => Ok(true),
+        Queued::Duplicate => Ok(false),
+        Queued::Full(pending) => {
+            tracing::warn!("the queue of pending requests is full ({pending}): accept or reject some");
+            Err(Error::Busy("too many pending requests; try again later"))
+        }
     }
-    Ok(())
 }
 
 fn lookahead(app: &App) -> Option<AddressMeta> {
@@ -82,49 +101,52 @@ fn lookahead(app: &App) -> Option<AddressMeta> {
     })
 }
 
-fn meta(maj: u32, min: u32) -> AddressMeta {
-    AddressMeta { maj_i: maj, min_i: min }
+fn meta(sub: SubaddressIndex) -> AddressMeta {
+    AddressMeta {
+        maj_i: sub.major,
+        min_i: sub.minor,
+    }
 }
 
-fn chain_height(app: &App) -> u64 {
+fn chain_height(app: &App) -> Height {
     app.scanner.status().chain_height
 }
 
 /// The chain height a new account starts below: the scanner's last word, or
 /// the node's if the scanner has not heard from it yet. Never 0 for want of
 /// an answer, which would mean a scan of the whole chain.
-async fn creation_height(app: &App) -> Result<u64> {
+async fn creation_height(app: &App) -> Result<Height> {
     match chain_height(app) {
-        0 => Ok(app.info().await?.height),
+        Height::ZERO => Ok(app.info().await?.height),
         h => Ok(h),
     }
 }
 
 /// The fee served for a transaction, as monero-lws serves it: a
 /// `uint64-string`, `"0"` for a coinbase transaction (stored as 0).
-fn fee_of(fee: u64) -> Option<Amount> {
-    Some(Amount(fee))
+fn fee_of(fee: Amount) -> Option<Amount> {
+    Some(fee)
 }
 
-fn spend_of(o: &OutputRow, key_image: [u8; 32], mixin: u32) -> Spend {
+fn spend_of(o: &OutputRow, key_image: KeyImage, mixin: u32) -> Spend {
     Spend {
-        amount: Amount(o.amount),
-        key_image: Hex(key_image),
-        tx_pub_key: Hex(o.tx_pub_key),
-        out_index: o.out_index,
+        amount: o.amount,
+        key_image: key_image.into(),
+        tx_pub_key: o.tx_pub_key.into(),
+        out_index: o.out_index.get(),
         mixin,
-        sender: Some(meta(o.maj, o.min)),
+        sender: Some(meta(o.subaddress)),
     }
 }
 
 /// Candidate spends of an account's outputs, by the spending transaction.
-fn spends_by_tx(app: &App, account: &Account, outputs: &HashMap<i64, OutputRow>) -> Result<HashMap<i64, Vec<Spend>>> {
-    let mut by_tx: HashMap<i64, Vec<Spend>> = HashMap::new();
-    for s in app.db.spends(account.id)? {
+fn spends_by_tx(spends: &[SpendRow], outputs: &HashMap<OutputId, OutputRow>) -> HashMap<TxId, Vec<Spend>> {
+    let mut by_tx: HashMap<TxId, Vec<Spend>> = HashMap::new();
+    for s in spends {
         let Some(o) = outputs.get(&s.output) else { continue };
         by_tx.entry(s.tx).or_default().push(spend_of(o, s.key_image, s.mixin));
     }
-    Ok(by_tx)
+    by_tx
 }
 
 /// `/login`. The view key must fit the address (`check_login`) before
@@ -136,94 +158,95 @@ pub async fn login(
     client: Option<Extension<ClientIp>>,
     ApiJson(req): ApiJson<LoginRequest>,
 ) -> Reply<LoginResponse> {
-    let checked = crypto::check_login(app.scanner.config.network, &req.login.address, &req.login.view_key.0)?;
-    if let Some(account) = app.db.account(&checked.address)? {
-        if account.status == Status::Hidden || account.view_key.ct_eq(&checked.view_key).unwrap_u8() == 0 {
+    let checked = crypto::check_login(app.scanner.config.network, &req.login.address, req.login.view_key)?;
+    let address = checked.address().clone();
+    if let Some(account) = app.db.call(move |db| db.account(&address)).await? {
+        if account.status == Status::Hidden || account.view_key.ct_eq(checked.view_key()).unwrap_u8() == 0 {
             return Err(Error::Forbidden.into());
         }
-        app.db.touch(account.id)?;
+        let id = account.id;
+        app.db.call(move |db| db.touch(id)).await?;
         return Ok(Json(LoginResponse {
             new_address: false,
             generated_locally: Some(account.generated_locally),
-            start_height: Some(account.start_height),
+            start_height: Some(account.start_height.get()),
             lookahead: lookahead(&app),
         }));
     }
     if !req.create_account {
         return Err(Error::Forbidden.into());
     }
-    if app.config.create == Policy::Off {
-        return Err(Error::NoCreate.into());
-    }
-    creation_allowed(&app, client.as_ref())?;
-    let height = creation_height(&app).await?;
-    let new = NewAccount {
-        address: checked.address.clone(),
-        view_key: checked.view_key,
-        spend_pub: checked.spend_pub,
-        view_pub: checked.view_pub,
-        start_height: height.saturating_sub(1),
-        generated_locally: req.generated_locally,
+    let approve = match app.config.create {
+        Policy::Off => return Err(Error::NoCreate.into()),
+        Policy::Auto => false,
+        Policy::Approve => true,
     };
-    match app.config.create {
-        Policy::Off => Err(Error::NoCreate.into()),
-        Policy::Auto => {
-            let account = app.db.add_account(&new, Status::Active)?;
-            app.scanner.wake.notify_one();
-            tracing::info!("new account #{} from height {}", account.id, new.start_height);
-            Ok(Json(LoginResponse {
-                new_address: true,
-                generated_locally: Some(req.generated_locally),
-                start_height: Some(new.start_height),
-                lookahead: lookahead(&app),
-            }))
-        }
-        Policy::Approve => {
-            queue_has_room(&app)?;
-            if !app.db.add_request("create", &new)? {
-                // Asked before and not yet accepted.
-                return Err(Error::Forbidden.into());
-            }
-            tracing::info!("a new account request is waiting for approval");
-            Ok(Json(LoginResponse {
-                new_address: true,
-                generated_locally: Some(req.generated_locally),
-                start_height: Some(new.start_height),
-                lookahead: lookahead(&app),
-            }))
-        }
+    strict_allowed(&app, client.as_ref())?;
+    // Asked before and not yet accepted: refused before it can spend the
+    // global token.
+    let address = checked.address().clone();
+    if approve
+        && app
+            .db
+            .call(move |db| db.has_request(RequestKind::Create, &address))
+            .await?
+    {
+        return Err(Error::Forbidden.into());
     }
+    global_allowed(&app)?;
+    let height = creation_height(&app).await?;
+    let new = checked.into_new_account(height.saturating_sub(1), req.generated_locally);
+    let start_height = new.start_height;
+    if approve {
+        if !queue(&app, RequestKind::Create, new).await? {
+            return Err(Error::Forbidden.into());
+        }
+        tracing::info!("a new account request is waiting for approval");
+    } else {
+        let account = app.db.call(move |db| db.add_account(&new, Status::Active)).await?;
+        app.scanner.wake.notify_one();
+        tracing::info!("new account #{} from height {start_height}", account.id);
+    }
+    Ok(Json(LoginResponse {
+        new_address: true,
+        generated_locally: Some(req.generated_locally),
+        start_height: Some(start_height.get()),
+        lookahead: lookahead(&app),
+    }))
 }
 
 pub async fn get_address_info(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<AddressInfo> {
-    let account = authorize(&app, &login).await?;
+    let account = authorize(&app, login).await?;
     let chain = chain_height(&app);
     let now = crate::db::now();
-    let txs: HashMap<i64, TxRow> = app.db.txs(account.id)?.into_iter().map(|t| (t.id, t)).collect();
-    let outputs: HashMap<i64, OutputRow> = app.db.outputs(account.id)?.into_iter().map(|o| (o.id, o)).collect();
+    let id = account.id;
+    let Holdings { txs, outputs, spends } = app.db.call(move |db| db.holdings(id)).await?;
+    let txs: HashMap<TxId, TxRow> = txs.into_iter().map(|t| (t.id, t)).collect();
+    let outputs: HashMap<OutputId, OutputRow> = outputs.into_iter().map(|o| (o.id, o)).collect();
     let mut total_received = 0u64;
     let mut locked = 0u64;
     for o in outputs.values() {
-        total_received = total_received.saturating_add(o.amount);
-        let tx = &txs[&o.tx];
-        if !unlocked(o.height, tx.coinbase, tx.unlock_time, chain, now) {
-            locked = locked.saturating_add(o.amount);
+        total_received = total_received.saturating_add(o.amount.0);
+        // The schema ties every output to its transaction; one missing is
+        // counted as locked rather than taking the request down.
+        let unlocked = txs
+            .get(&o.tx)
+            .is_some_and(|tx| unlocked(o.height, tx.coinbase, tx.unlock_time, chain, now));
+        if !unlocked {
+            locked = locked.saturating_add(o.amount.0);
         }
     }
-    let spent_outputs: Vec<Spend> = spends_by_tx(&app, &account, &outputs)?
-        .into_values()
-        .flatten()
-        .collect();
+    let spent_outputs: Vec<Spend> = spends_by_tx(&spends, &outputs).into_values().flatten().collect();
     let total_sent = spent_outputs.iter().map(|s| s.amount.0).fold(0u64, u64::saturating_add);
     Ok(Json(AddressInfo {
         locked_funds: Amount(locked),
         total_received: Amount(total_received),
         total_sent: Amount(total_sent),
-        scanned_height: account.scan_height,
-        scanned_block_height: account.scan_height,
-        start_height: account.start_height,
-        transaction_height: account.scan_height,
-        blockchain_height: chain,
+        scanned_height: account.scan_height.get(),
+        scanned_block_height: account.scan_height.get(),
+        start_height: account.start_height.get(),
+        transaction_height: account.scan_height.get(),
+        blockchain_height: chain.get(),
         spent_outputs,
         lookahead: lookahead(&app),
         rates: None,
@@ -250,27 +273,34 @@ fn proof_of(row: crate::db::ProofRow) -> Proof {
 }
 
 pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<AddressTxs> {
-    let account = authorize(&app, &login).await?;
+    let account = authorize(&app, login).await?;
     let chain = chain_height(&app);
-    let rows = app.db.txs(account.id)?;
-    let outputs: HashMap<i64, OutputRow> = app.db.outputs(account.id)?.into_iter().map(|o| (o.id, o)).collect();
-    let mut receives_by_tx: HashMap<i64, Vec<ReceivedOutput>> = HashMap::new();
+    let id = account.id;
+    let (
+        Holdings {
+            txs: rows,
+            outputs,
+            spends,
+        },
+        mut proofs,
+    ) = app.db.call(move |db| db.holdings_and_proofs(id)).await?;
+    let outputs: HashMap<OutputId, OutputRow> = outputs.into_iter().map(|o| (o.id, o)).collect();
+    let mut receives_by_tx: HashMap<TxId, Vec<ReceivedOutput>> = HashMap::new();
     for o in outputs.values() {
         receives_by_tx.entry(o.tx).or_default().push(ReceivedOutput {
             commitment: o.commitment.map(Hex),
-            amount: Amount(o.amount),
-            public_key: Hex(o.public_key),
-            index: o.out_index,
-            global_index: o.global_index,
-            tx_pub_key: Hex(o.tx_pub_key),
+            amount: o.amount,
+            public_key: o.public_key.into(),
+            index: o.out_index.get(),
+            global_index: Amount(o.global_index.get()),
+            tx_pub_key: o.tx_pub_key.into(),
             rct: o.mask.map(Hex),
-            recipient: meta(o.maj, o.min),
+            recipient: meta(o.subaddress),
         });
     }
-    let mut spends = spends_by_tx(&app, &account, &outputs)?;
-    let mut proofs = app.db.proofs(account.id)?;
-    let mut total_received = outputs.values().map(|o| o.amount).fold(0u64, u64::saturating_add);
-    let mined: std::collections::HashSet<[u8; 32]> = rows.iter().map(|t| t.hash).collect();
+    let mut spends = spends_by_tx(&spends, &outputs);
+    let mut total_received = outputs.values().map(|o| o.amount.0).fold(0u64, u64::saturating_add);
+    let mined: std::collections::HashSet<TxHash> = rows.iter().map(|t| t.hash).collect();
     let mut transactions: Vec<Transaction> = rows
         .into_iter()
         .map(|t| {
@@ -279,16 +309,16 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
             Transaction {
                 proof: proofs.remove(&t.id).map(proof_of),
                 fee: fee_of(t.fee),
-                id: t.id as u64,
-                hash: Hex(t.hash),
+                id: t.id.get(),
+                hash: t.hash.into(),
                 timestamp: Some(Timestamp::from_unix(t.timestamp)),
-                total_received: Amount(t.total_received),
-                total_sent: Amount(t.total_sent),
+                total_received: t.total_received,
+                total_sent: t.total_sent,
                 unlock_time: t.unlock_time,
-                height: Some(t.height),
+                height: Some(t.height.get()),
                 spent_outputs: spends.remove(&t.id).unwrap_or_default(),
                 receives,
-                payment_id: t.payment_id.map(HexBytes),
+                payment_id: t.payment_id.map(HexBytes::from),
                 coinbase: t.coinbase,
                 mempool: false,
                 mixin: t.mixin,
@@ -301,8 +331,8 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
         let pool = app.scanner.mempool.lock().unwrap_or_else(|e| e.into_inner());
         (pool.for_account(account.id), pool.spends_for(account.id))
     };
-    let mut pooled: Vec<([u8; 32], Vec<PoolReceipt>, Vec<PoolSpend>)> = vec![];
-    let entry = |pooled: &mut Vec<([u8; 32], Vec<PoolReceipt>, Vec<PoolSpend>)>, hash: [u8; 32]| -> usize {
+    let mut pooled: Vec<(TxHash, Vec<PoolReceipt>, Vec<PoolSpend>)> = vec![];
+    let entry = |pooled: &mut Vec<(TxHash, Vec<PoolReceipt>, Vec<PoolSpend>)>, hash: TxHash| -> usize {
         match pooled.iter().position(|(h, _, _)| *h == hash) {
             Some(i) => i,
             None => {
@@ -325,23 +355,23 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
     let next_id = transactions.iter().map(|t| t.id + 1).max().unwrap_or(1);
     for (n, (hash, mut receipts, spent)) in pooled.into_iter().enumerate() {
         receipts.sort_by_key(|r| r.out_index);
-        let received = receipts.iter().map(|r| r.amount).fold(0, u64::saturating_add);
+        let received = receipts.iter().map(|r| r.amount.0).fold(0, u64::saturating_add);
         // As monero-lws: a pool transaction's outputs count in the total.
         total_received = total_received.saturating_add(received);
         let spent_outputs: Vec<Spend> = spent
             .iter()
-            .map(|s| spend_of(&outputs[&s.output], s.key_image, s.mixin))
+            .filter_map(|s| Some(spend_of(outputs.get(&s.output)?, s.key_image, s.mixin)))
             .collect();
         let (unlock_time, mixin, fee, payment_id) = match (receipts.first(), spent.first()) {
-            (Some(r), _) => (r.unlock_time, r.mixin, r.fee, r.payment_id.clone()),
+            (Some(r), _) => (r.unlock_time, r.mixin, r.fee, r.payment_id),
             (None, Some(s)) => (s.unlock_time, s.mixin, s.fee, None),
             (None, None) => continue,
         };
         transactions.push(Transaction {
             proof: None,
-            fee: Some(Amount(fee)),
+            fee: Some(fee),
             id: next_id + n as u64,
-            hash: Hex(hash),
+            hash: hash.into(),
             timestamp: None,
             total_received: Amount(received),
             total_sent: Amount(spent_outputs.iter().map(|s| s.amount.0).fold(0, u64::saturating_add)),
@@ -352,16 +382,16 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
                 .iter()
                 .map(|r| ReceivedOutput {
                     commitment: r.commitment.map(Hex),
-                    amount: Amount(r.amount),
-                    public_key: Hex(r.public_key),
-                    index: r.out_index,
-                    global_index: 0,
-                    tx_pub_key: Hex(r.tx_pub_key),
+                    amount: r.amount,
+                    public_key: r.public_key.into(),
+                    index: r.out_index.get(),
+                    global_index: Amount(0),
+                    tx_pub_key: r.tx_pub_key.into(),
                     rct: r.mask.map(Hex),
-                    recipient: meta(r.maj, r.min),
+                    recipient: meta(r.subaddress),
                 })
                 .collect(),
-            payment_id: payment_id.map(HexBytes),
+            payment_id: payment_id.map(HexBytes::from),
             coinbase: false,
             mempool: true,
             mixin,
@@ -369,11 +399,11 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
     }
     Ok(Json(AddressTxs {
         total_received: Amount(total_received),
-        scanned_height: account.scan_height,
-        scanned_block_height: account.scan_height,
-        start_height: account.start_height,
-        transaction_height: account.scan_height,
-        blockchain_height: chain,
+        scanned_height: account.scan_height.get(),
+        scanned_block_height: account.scan_height.get(),
+        start_height: account.start_height.get(),
+        transaction_height: account.scan_height.get(),
+        blockchain_height: chain.get(),
         transactions,
         lookahead: lookahead(&app),
     }))
@@ -383,13 +413,14 @@ pub async fn get_unspent_outs(
     State(app): State<Arc<App>>,
     ApiJson(req): ApiJson<UnspentOutsRequest>,
 ) -> Reply<UnspentOuts> {
-    let account = authorize(&app, &req.login).await?;
+    let account = authorize(&app, req.login).await?;
     let fee = app.fee().await?;
-    let txs: HashMap<i64, TxRow> = app.db.txs(account.id)?.into_iter().map(|t| (t.id, t)).collect();
-    let outputs = app.db.outputs(account.id)?;
-    let mut images: HashMap<i64, Vec<Hex32>> = HashMap::new();
-    for s in app.db.spends(account.id)? {
-        images.entry(s.output).or_default().push(Hex(s.key_image));
+    let id = account.id;
+    let Holdings { txs, outputs, spends } = app.db.call(move |db| db.holdings(id)).await?;
+    let txs: HashMap<TxId, TxRow> = txs.into_iter().map(|t| (t.id, t)).collect();
+    let mut images: HashMap<OutputId, Vec<Hex32>> = HashMap::new();
+    for s in spends {
+        images.entry(s.output).or_default().push(s.key_image.into());
     }
     let dust = if req.use_dust {
         0
@@ -399,48 +430,53 @@ pub async fn get_unspent_outs(
     let mut total = 0u64;
     let mut listed = vec![];
     for o in outputs {
-        let tx = &txs[&o.tx];
+        // The schema ties every output to its transaction; skip one that
+        // isn't rather than panic.
+        let Some(tx) = txs.get(&o.tx) else {
+            tracing::warn!("output #{} without its transaction row", o.id);
+            continue;
+        };
         // As monero-lws: an output is left out when its transaction's mixin
         // is below the one asked for (a coinbase transaction's is 0, so any
         // mixin leaves coinbase outputs out) or its amount is below the
         // dust threshold. Locked outputs are listed; the client decides.
-        if tx.mixin < req.mixin || o.amount < dust {
+        if tx.mixin < req.mixin || o.amount.0 < dust {
             continue;
         }
-        total = total.saturating_add(o.amount);
+        total = total.saturating_add(o.amount.0);
         let rct = o.mask.and_then(|mask| {
             if tx.coinbase {
                 Some(crypto::coinbase_rct())
             } else {
                 // The commitment the chain holds for the output (the same as
                 // monero-lws's `commit(amount, mask)` for a sound output).
-                let commitment = o.commitment.unwrap_or_else(|| crypto::commit(&mask, o.amount));
+                let commitment = o.commitment.unwrap_or_else(|| crypto::commit(&mask, o.amount.0));
                 crypto::legacy_rct(
                     &account.view_key,
-                    &o.tx_pub_key,
-                    o.out_index as u64,
+                    o.tx_pub_key.as_bytes(),
+                    u64::from(o.out_index.get()),
                     &commitment,
                     &mask,
-                    o.amount,
+                    o.amount.0,
                 )
             }
             .map(|b| HexBytes(b.to_vec()))
         });
         listed.push(Output {
-            amount: Amount(o.amount),
-            public_key: Hex(o.public_key),
-            index: o.out_index,
-            global_index: Amount(o.global_index),
+            amount: o.amount,
+            public_key: o.public_key.into(),
+            index: o.out_index.get(),
+            global_index: Amount(o.global_index.get()),
             // monero-lws writes the global index here too.
-            tx_id: o.global_index,
-            tx_hash: Hex(tx.hash),
+            tx_id: o.global_index.get(),
+            tx_hash: tx.hash.into(),
             tx_prefix_hash: Hex(tx.prefix_hash),
-            tx_pub_key: Hex(o.tx_pub_key),
+            tx_pub_key: o.tx_pub_key.into(),
             timestamp: Timestamp::from_unix(tx.timestamp),
-            height: o.height,
+            height: o.height.get(),
             spend_key_images: images.remove(&o.id).unwrap_or_default(),
             rct,
-            recipient: Some(meta(o.maj, o.min)),
+            recipient: Some(meta(o.subaddress)),
         });
     }
     if total < req.amount.0 {
@@ -460,10 +496,6 @@ pub async fn get_unspent_outs(
     }))
 }
 
-/// Ring members a ring and rings a request, at most: monero-lws's limits.
-pub const MAX_RING_SIZE: u32 = 20;
-pub const MAX_RINGS: usize = 150;
-
 /// `/get_random_outs`, as monero-lws answers it: `count` members for every
 /// ring, picked as wallet2 picks them (`decoys`), each unlocked by the
 /// node's word, none twice in a ring, sorted by global index, with `rct`
@@ -473,18 +505,14 @@ pub async fn get_random_outs(
     State(app): State<Arc<App>>,
     ApiJson(req): ApiJson<RandomOutsRequest>,
 ) -> Reply<RandomOuts> {
-    if req.count > MAX_RING_SIZE {
-        return Err(bad(format!("count must be at most {MAX_RING_SIZE}")).into());
-    }
-    if req.amounts.len() > MAX_RINGS {
-        return Err(bad(format!("at most {MAX_RINGS} amounts")).into());
-    }
+    // `count` and the number of `amounts` are within monero-lws's limits
+    // (`lws_api::MAX_RING_MEMBERS`, `lws_api::MAX_RINGS`) by their types.
     if req.amounts.iter().any(|a| a.0 != 0) {
         return Err(bad("only RingCT (amount 0) outputs are served").into());
     }
     // As monero-lws: nothing to pick, an empty ring for each amount, and the
     // node isn't asked.
-    if req.count == 0 || req.amounts.is_empty() {
+    if req.count.get() == 0 || req.amounts.is_empty() {
         return Ok(Json(RandomOuts {
             amount_outs: req
                 .amounts
@@ -498,7 +526,12 @@ pub async fn get_random_outs(
     }
     let rings = app
         .picker
-        .rings(&app.daemon, req.count as usize, req.amounts.len(), chain_height(&app))
+        .rings(
+            &app.daemon,
+            req.count.get() as usize,
+            req.amounts.len(),
+            chain_height(&app),
+        )
         .await?;
     Ok(Json(RandomOuts {
         amount_outs: rings
@@ -512,7 +545,7 @@ pub async fn get_random_outs(
                         rct.resize(96, 0);
                         RandomOutput {
                             global_index: Amount(m.global_index),
-                            public_key: Hex(m.public_key),
+                            public_key: m.public_key.into(),
                             rct: HexBytes(rct),
                         }
                     })
@@ -591,7 +624,7 @@ pub async fn submit_raw_tx(
     if result.status == "OK" {
         if result.not_relayed {
             return Ok(Json(SubmitResponse {
-                status: "OK".into(),
+                status: SubmitStatus::Ok,
                 reason: Some("Not relayed".into()),
                 not_relayed: Some(true),
             })
@@ -603,7 +636,7 @@ pub async fn submit_raw_tx(
         }
         app.scanner.wake.notify_one();
         return Ok(Json(SubmitResponse {
-            status: "OK".into(),
+            status: SubmitStatus::Ok,
             reason: None,
             not_relayed: None,
         })
@@ -612,7 +645,7 @@ pub async fn submit_raw_tx(
     Ok((
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(SubmitResponse {
-            status: "Failed".into(),
+            status: SubmitStatus::Failed,
             reason: Some(refusal_reason(&result)),
             not_relayed: None,
         }),
@@ -625,7 +658,7 @@ pub async fn import_wallet_request(
     client: Option<Extension<ClientIp>>,
     ApiJson(login): ApiJson<Login>,
 ) -> Reply<ImportResponse> {
-    let account = authorize_active(&app, &login).await?;
+    let account = authorize_active(&app, login).await?;
     let reply = |new_request, request_fulfilled, status: &str| {
         Json(ImportResponse {
             payment_address: None,
@@ -641,35 +674,33 @@ pub async fn import_wallet_request(
         Policy::Auto => {
             // Nothing to do for an account that starts at 0, or whose
             // import hasn't got past block 0 yet.
-            if account.start_height == 0 || account.scan_height == 0 {
+            if account.start_height == Height::ZERO || account.scan_height == Height::ZERO {
                 return Ok(reply(false, true, "Approved"));
             }
             creation_allowed(&app, client.as_ref())?;
-            app.db.import(std::slice::from_ref(&account.address))?;
+            let address = account.address.clone();
+            app.db.call(move |db| db.import(std::slice::from_ref(&address))).await?;
             app.scanner.wake.notify_one();
             tracing::info!("import for account #{}: scanning from 0", account.id);
             Ok(reply(true, true, "Approved"))
         }
         Policy::Approve => {
             let new = NewAccount {
-                address: account.address.clone(),
+                address: account.address,
                 view_key: account.view_key,
-                spend_pub: account.spend_pub,
-                view_pub: account.view_pub,
-                start_height: 0,
+                start_height: Height::ZERO,
                 generated_locally: account.generated_locally,
             };
+            let address = new.address.clone();
             if app
                 .db
-                .requests()?
-                .iter()
-                .any(|(k, r)| k == "import" && r.address == new.address)
+                .call(move |db| db.has_request(RequestKind::Import, &address))
+                .await?
             {
                 return Ok(reply(false, false, "Already requested"));
             }
-            queue_has_room(&app)?;
             creation_allowed(&app, client.as_ref())?;
-            let added = app.db.add_request("import", &new)?;
+            let added = queue(&app, RequestKind::Import, new).await?;
             Ok(reply(added, false, if added { "Pending" } else { "Already requested" }))
         }
     }
@@ -694,26 +725,38 @@ fn check_ranges(ranges: &[SubaddrRanges], max: u64) -> Result<()> {
     if count > MAX_RANGES {
         return Err(bad(format!("at most {MAX_RANGES} ranges a request")));
     }
-    let mut minors = 0u64;
-    for r in ranges {
-        for &[lo, hi] in &r.value {
-            if lo > hi {
-                return Err(bad("a subaddress range runs backwards"));
-            }
-            minors += u64::from(hi - lo) + 1;
-        }
-    }
+    // Each range runs forwards (`MinorRange`): at least one minor.
+    let minors: u64 = ranges.iter().flat_map(|r| &r.value).map(|r| r.minors()).sum();
     if minors > max {
         return Err(Error::Conflict(format!("asking for more than the limit of {max}")));
     }
     Ok(())
 }
 
+/// Adds the ranges to the account's and, with `get_all`, reads them all
+/// back: what is new, and everything.
+async fn upsert(
+    app: &App,
+    account: AccountId,
+    wanted: Vec<SubaddrRanges>,
+    max: u64,
+    get_all: bool,
+) -> Result<(Vec<SubaddrRanges>, Option<Vec<SubaddrRanges>>)> {
+    app.db
+        .call(move |db| {
+            let new = db.upsert_subaddrs(account, &wanted, max)?;
+            let all = get_all.then(|| db.subaddrs(account)).transpose()?;
+            Ok((new, all))
+        })
+        .await
+}
+
 pub async fn get_subaddrs(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<Subaddrs> {
     let max = subaddresses_on(&app)?;
-    let account = authorize(&app, &login).await?;
+    let account = authorize(&app, login).await?;
+    let id = account.id;
     Ok(Json(Subaddrs {
-        all_subaddrs: app.db.subaddrs(account.id)?,
+        all_subaddrs: app.db.call(move |db| db.subaddrs(id)).await?,
         max_subaddrs: Some(max),
     }))
 }
@@ -724,9 +767,8 @@ pub async fn upsert_subaddrs(
 ) -> Reply<NewSubaddrs> {
     let max = subaddresses_on(&app)?;
     check_ranges(&req.subaddrs, max)?;
-    let account = authorize_active(&app, &req.login).await?;
-    let new_subaddrs = app.db.upsert_subaddrs(account.id, &req.subaddrs, max)?;
-    let all_subaddrs = req.get_all.then(|| app.db.subaddrs(account.id)).transpose()?;
+    let account = authorize_active(&app, req.login).await?;
+    let (new_subaddrs, all_subaddrs) = upsert(&app, account.id, req.subaddrs, max, req.get_all).await?;
     Ok(Json(NewSubaddrs {
         new_subaddrs,
         all_subaddrs,
@@ -738,29 +780,35 @@ pub async fn provision_subaddrs(
     ApiJson(req): ApiJson<ProvisionSubaddrsRequest>,
 ) -> Reply<NewSubaddrs> {
     let max = subaddresses_on(&app)?;
-    let account = authorize_active(&app, &req.login).await?;
+    let account = authorize_active(&app, req.login).await?;
     let maj_i = req.maj_i.unwrap_or(0);
     let n_maj = req.n_maj.unwrap_or(1).max(1);
     let n_min = req.n_min.unwrap_or(1).max(1);
     if u64::from(n_maj) * u64::from(n_min) > max {
         return Err(Error::Conflict(format!("asking for more than the limit of {max}")).into());
     }
-    let have = app.db.subaddrs(account.id)?;
+    let id = account.id;
+    let have = app.db.call(move |db| db.subaddrs(id)).await?;
     let mut wanted = vec![];
+    let full = || Error::Conflict("no room left in that major index".into());
     for maj in maj_i..maj_i.saturating_add(n_maj) {
-        let next = have
+        // The minor after the highest one held; none if that is u32::MAX.
+        let next = match have
             .iter()
             .find(|r| r.key == maj)
-            .and_then(|r| r.value.iter().map(|[_, hi]| hi + 1).max())
-            .unwrap_or(0);
+            .and_then(|r| r.value.iter().map(|r| r.hi()).max())
+        {
+            Some(hi) => hi.checked_add(1).ok_or_else(full)?,
+            None => 0,
+        };
         let lo = req.min_i.unwrap_or(next).max(next);
+        let hi = lo.checked_add(n_min - 1).ok_or_else(full)?;
         wanted.push(SubaddrRanges {
             key: maj,
-            value: vec![[lo, lo.saturating_add(n_min - 1)]],
+            value: vec![MinorRange::new(lo, hi).ok_or_else(full)?],
         });
     }
-    let new_subaddrs = app.db.upsert_subaddrs(account.id, &wanted, max)?;
-    let all_subaddrs = req.get_all.then(|| app.db.subaddrs(account.id)).transpose()?;
+    let (new_subaddrs, all_subaddrs) = upsert(&app, account.id, wanted, max, req.get_all).await?;
     Ok(Json(NewSubaddrs {
         new_subaddrs,
         all_subaddrs,
@@ -776,10 +824,10 @@ pub async fn get_version(State(app): State<Arc<App>>) -> Reply<Version> {
         last_git_commit_hash: option_env!("MONOKULO_LWS_COMMIT").map(String::from),
         last_commit_date: None,
         monero_version_full: info.as_ref().map(|i| i.version.clone()).unwrap_or_default(),
-        blockchain_height: info.map(|i| i.height).unwrap_or(status.chain_height),
+        blockchain_height: info.map(|i| i.height).unwrap_or(status.chain_height).get(),
         api: 2,
         max_subaddresses: app.config.max_subaddresses,
-        network: crypto::network_name(network).into(),
+        network: crypto::network_name(network),
         testnet: network != monero_wallet::address::Network::Mainnet,
     }))
 }
@@ -791,7 +839,7 @@ pub async fn daemon_status(State(app): State<Arc<App>>) -> Reply<serde_json::Val
     let info = app.info().await;
     Ok(Json(json!({
         "server": env!("CARGO_PKG_VERSION"),
-        "network": crypto::network_name(app.scanner.config.network),
+        "network": crypto::network_name(app.scanner.config.network).as_str(),
         "daemon_reachable": info.is_ok(),
         "daemon_height": info.as_ref().map(|i| i.height).unwrap_or(status.chain_height),
         "daemon_synced": info.as_ref().map(|i| i.synchronized).unwrap_or(false),

@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod address;
 mod admin_keys;
 mod at_rest;
 #[cfg(test)]
@@ -26,6 +27,7 @@ mod sending;
 mod server;
 #[cfg(test)]
 mod testkit;
+mod types;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -38,8 +40,8 @@ use monero_wallet::address::Network;
 use tokio::sync::Mutex;
 
 use crate::daemon::Daemon;
-use crate::db::{Db, NewAccount, Status};
-use crate::limits::{Cidr, ClientIpConfig, Limits};
+use crate::db::{Db, Status};
+use crate::limits::{Cidr, ClientIpConfig, Limits, PER_48_FACTOR};
 use crate::rest::{App, Config, Policy};
 use crate::scanner::{LaneConfig, ScanConfig, Scanner};
 use crate::server::ListenerConfig;
@@ -127,6 +129,14 @@ struct ServeArgs {
     /// /submit_raw_tx and /get_random_outs; 0 is no limit.
     #[arg(long, default_value_t = 12)]
     strict_rate_limit: u32,
+    /// Requests a minute from one IPv6 /48, on top of --rate-limit per /64;
+    /// 0 is no limit. Default: 4 × --rate-limit.
+    #[arg(long)]
+    rate_limit_per_48: Option<u32>,
+    /// As --strict-rate-limit, per IPv6 /48; 0 is no limit. Default:
+    /// 4 × --strict-rate-limit.
+    #[arg(long)]
+    strict_rate_limit_per_48: Option<u32>,
     /// New accounts and import requests an hour across all clients; 0 is no
     /// limit.
     #[arg(long, default_value_t = 1000)]
@@ -138,8 +148,8 @@ struct ServeArgs {
     /// Open connections at most, per listener.
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,
-    /// Open connections from one address at most (a trusted proxy is
-    /// exempt); 0 is no limit.
+    /// Open connections from one client (an IPv4 address or IPv6 /64) at
+    /// most (a trusted proxy is exempt); 0 is no limit.
     #[arg(long, default_value_t = 64)]
     max_connections_per_ip: usize,
     /// Seconds a request may take, reading its body and answering included.
@@ -381,8 +391,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             lanes,
         },
     );
+    tracing::info!("database {} with {} read connections", args.db.display(), db.readers());
     let app = Arc::new(App {
-        db,
+        db: crate::db::AsyncDb::new(db),
         daemon,
         scanner: scanner.clone(),
         config: Config {
@@ -395,13 +406,21 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             request_timeout: Duration::from_secs(args.request_timeout.max(1)),
             tls: tls.is_some(),
         },
-        limits: Limits::new(
+        limits: Limits::with_per_48(
             ClientIpConfig {
                 trusted_proxies: args.trusted_proxies.clone(),
                 header: args.client_ip_header.to_ascii_lowercase(),
             },
-            args.rate_limit,
-            args.strict_rate_limit,
+            [
+                args.rate_limit,
+                args.rate_limit_per_48
+                    .unwrap_or(args.rate_limit.saturating_mul(PER_48_FACTOR)),
+            ],
+            [
+                args.strict_rate_limit,
+                args.strict_rate_limit_per_48
+                    .unwrap_or(args.strict_rate_limit.saturating_mul(PER_48_FACTOR)),
+            ],
             args.max_new_accounts_per_hour,
             args.max_pending_requests,
         ),
@@ -434,7 +453,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("listening on {addr}"))?;
-            if app.config.admin_auth && admin_keys::count(&app.db)? == 0 {
+            if app.config.admin_auth && app.db.call(admin_keys::count).await? == 0 {
                 tracing::warn!("admin API on but no admin key yet: run `monokulo-lws admin create-key`");
             }
             if !app.config.admin_auth {
@@ -487,36 +506,38 @@ fn admin(command: AdminCommand) -> anyhow::Result<()> {
                     zeroize::Zeroizing::new(line.trim().to_string())
                 }
             };
-            let key =
-                zeroize::Zeroizing::new(daemon::hex32(&view_key).context("the view key must be 64 hex characters")?);
-            let checked = crypto::check_login(network, &address, &key)?;
+            let key = lws_api::PrivateViewKey::from_hex(&view_key).context("the view key must be 64 hex characters")?;
+            let checked = crypto::check_login(network, &address, key)?;
             let account = db.add_account(
-                &NewAccount {
-                    address: checked.address.clone(),
-                    view_key: checked.view_key,
-                    spend_pub: checked.spend_pub,
-                    view_pub: checked.view_pub,
-                    start_height,
-                    generated_locally: false,
-                },
+                &checked.into_new_account(types::Height::new(start_height), false),
                 Status::Active,
             )?;
-            println!("added {} from height {}", account.address, account.start_height);
+            println!(
+                "added {} from height {}",
+                account.address.as_str(),
+                account.start_height
+            );
         }
         AdminCommand::RemoveAccount { db, address } => {
             let db = open_db(&db)?;
+            let address = address::Address::parse_any_network(&address)?;
             if db.remove_accounts(std::slice::from_ref(&address))?.is_empty() {
                 bail!("no account with that address");
             }
-            println!("removed {address}");
+            println!("removed {}", address.as_str());
         }
         AdminCommand::List { db } => {
             let db = open_db(&db)?;
             for a in db.accounts(None)? {
-                println!("{:<8} {:>9} {}", a.status.as_str(), a.scan_height, a.address);
+                println!("{:<8} {:>9} {}", a.status.as_str(), a.scan_height, a.address.as_str());
             }
             for (kind, r) in db.requests()? {
-                println!("request {kind:<7} {:>9} {}", r.start_height, r.address);
+                println!(
+                    "request {:<7} {:>9} {}",
+                    kind.as_str(),
+                    r.start_height,
+                    r.address.as_str()
+                );
             }
         }
     }

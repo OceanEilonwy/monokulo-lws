@@ -1,5 +1,13 @@
 //! The server's store: one SQLite file, WAL mode, one writer.
 //!
+//! Writes go through the one writer connection, one transaction at a time.
+//! Reads go through a small pool of read-only connections (`query_only`),
+//! each read one SQLite read transaction: under WAL a reader sees the last
+//! commit and is never held up by a write transaction in progress, so the
+//! scanner writing a batch doesn't stall the API. Every call blocks, so
+//! async code reaches the store through [`AsyncDb`] (or [`Db::call`]), which
+//! runs it on tokio's blocking threads, never on a worker.
+//!
 //! What is kept, per account: the view key and public keys, where scanning
 //! stands, every output received, every candidate spend (an input whose ring
 //! holds one of the account's outputs), the transactions those came in, and
@@ -8,14 +16,21 @@
 //! `admin_keys`), and for proofs of inclusion (`proof`) the blocks and the
 //! pruned transactions that pay an account, as the node sent them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use lws_api::admin::RequestKind;
+use lws_api::{Amount, MinorRange, PrivateViewKey};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
+use crate::address::Address;
 use crate::error::{Error, Result, bad};
+use crate::types::{
+    AccountId, BlockHash, GlobalIndex, Height, KeyImage, OutIndex, OutputId, PaymentId, PublicKey, SqlU64,
+    SubaddressIndex, TxHash, TxId,
+};
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -100,6 +115,8 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 CREATE TABLE IF NOT EXISTS admin_keys (key BLOB PRIMARY KEY, created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS blocks_kept (height INTEGER PRIMARY KEY, hash BLOB NOT NULL, blob BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS checkpoints (height INTEGER PRIMARY KEY, hash BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS rescan_due (account INTEGER PRIMARY KEY REFERENCES accounts(id));
 CREATE TABLE IF NOT EXISTS txs_kept (
     hash BLOB PRIMARY KEY,
     height INTEGER NOT NULL,
@@ -117,96 +134,76 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
-    /// Scanned and served.
-    Active,
-    /// Served from what was scanned, no longer scanned.
-    Inactive,
-    /// Neither: the way to delete.
-    Hidden,
+/// An account's status: the admin API's, stored as its text.
+pub use lws_api::admin::AccountStatus as Status;
+
+/// A stored status. Text that isn't one is an error: an account whose
+/// status can't be read is neither served nor scanned as something it may
+/// not be.
+fn status_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Status> {
+    let text = r.get_ref(i)?.as_str()?;
+    Status::parse(text).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, "not an account status".into())
+    })
 }
 
-impl Status {
-    pub fn parse(s: &str) -> Option<Status> {
-        Some(match s {
-            "active" => Status::Active,
-            "inactive" => Status::Inactive,
-            "hidden" => Status::Hidden,
-            _ => return None,
-        })
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Status::Active => "active",
-            Status::Inactive => "inactive",
-            Status::Hidden => "hidden",
-        }
-    }
-}
-
-/// `Debug` leaves out the view key and the address (`crate::redact`).
-#[derive(Clone)]
+/// `Debug` leaves out the view key and the address (`crate::redact`). Not
+/// `Clone`: the view key isn't, so an account is passed by reference.
 pub struct Account {
-    pub id: i64,
-    pub address: String,
-    pub view_key: [u8; 32],
-    pub spend_pub: [u8; 32],
-    pub view_pub: [u8; 32],
+    pub id: AccountId,
+    /// Its public keys too (stored in their own columns as well).
+    pub address: Address,
+    pub view_key: PrivateViewKey,
     pub status: Status,
-    pub start_height: u64,
-    pub scan_height: u64,
+    pub start_height: Height,
+    pub scan_height: Height,
     pub access_time: u64,
     pub generated_locally: bool,
 }
 
 /// A new account or a pending request, before it has a row. `Debug` leaves
-/// out the view key and the address (`crate::redact`).
-#[derive(Clone)]
+/// out the view key and the address (`crate::redact`). Not `Clone`, as
+/// the view key isn't.
 pub struct NewAccount {
-    pub address: String,
-    pub view_key: [u8; 32],
-    pub spend_pub: [u8; 32],
-    pub view_pub: [u8; 32],
-    pub start_height: u64,
+    pub address: Address,
+    pub view_key: PrivateViewKey,
+    pub start_height: Height,
     pub generated_locally: bool,
 }
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct TxRow {
-    pub id: i64,
-    pub hash: [u8; 32],
+    pub id: TxId,
+    pub hash: TxHash,
     pub prefix_hash: [u8; 32],
-    pub height: u64,
+    pub height: Height,
     pub timestamp: u64,
     pub unlock_time: u64,
     pub coinbase: bool,
     pub mixin: u32,
-    pub fee: u64,
-    pub payment_id: Option<Vec<u8>>,
-    pub tx_pub_key: [u8; 32],
-    pub total_received: u64,
-    pub total_sent: u64,
+    pub fee: Amount,
+    pub payment_id: Option<PaymentId>,
+    pub tx_pub_key: PublicKey,
+    pub total_received: Amount,
+    pub total_sent: Amount,
 }
 
 #[derive(Clone, Debug)]
 pub struct OutputRow {
-    pub id: i64,
-    pub tx: i64,
-    pub out_index: u16,
-    pub global_index: u64,
-    pub amount: u64,
-    pub public_key: [u8; 32],
+    pub id: OutputId,
+    pub tx: TxId,
+    pub out_index: OutIndex,
+    pub global_index: GlobalIndex,
+    pub amount: Amount,
+    pub public_key: PublicKey,
     /// The transaction public key this output was derived from (the
     /// additional one for a subaddress, when the sender used one).
-    pub tx_pub_key: [u8; 32],
+    pub tx_pub_key: PublicKey,
     /// The unencrypted RingCT mask; `None` for a pre-RingCT output.
     pub mask: Option<[u8; 32]>,
-    pub height: u64,
-    pub maj: u32,
-    pub min: u32,
+    pub height: Height,
+    pub subaddress: SubaddressIndex,
     /// The Pedersen commitment the chain holds for the output (the RingCT
     /// base's `outPk`; `G + amount·H` for a miner output); `None` for a
     /// pre-RingCT output.
@@ -216,11 +213,11 @@ pub struct OutputRow {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct SpendRow {
-    pub tx: i64,
-    pub output: i64,
-    pub key_image: [u8; 32],
+    pub tx: TxId,
+    pub output: OutputId,
+    pub key_image: KeyImage,
     pub mixin: u32,
-    pub height: u64,
+    pub height: Height,
 }
 
 /// What a transaction is proved in: its block's blob, and for a transaction
@@ -233,61 +230,190 @@ pub struct ProofRow {
 
 /// A transaction kept for proofs whose prunable hash is pending: its hash,
 /// prefix and RingCT base.
-pub type Pending = ([u8; 32], Vec<u8>, Vec<u8>);
+pub type Pending = (TxHash, Vec<u8>, Vec<u8>);
 
 /// What a new transaction row carries. `total_received`/`total_sent` grow
 /// as outputs and spends are added to it.
-pub struct NewTx<'a> {
-    pub hash: [u8; 32],
+pub struct NewTx {
+    pub hash: TxHash,
     pub prefix_hash: [u8; 32],
-    pub height: u64,
+    pub height: Height,
     pub timestamp: u64,
     pub unlock_time: u64,
     pub coinbase: bool,
     pub mixin: u32,
-    pub fee: u64,
-    pub payment_id: Option<&'a [u8]>,
-    pub tx_pub_key: [u8; 32],
+    pub fee: Amount,
+    pub payment_id: Option<PaymentId>,
+    pub tx_pub_key: PublicKey,
 }
 
 pub struct NewOutput {
-    pub out_index: u16,
-    pub global_index: u64,
-    pub amount: u64,
-    pub public_key: [u8; 32],
-    pub tx_pub_key: [u8; 32],
+    pub out_index: OutIndex,
+    pub global_index: GlobalIndex,
+    pub amount: Amount,
+    pub public_key: PublicKey,
+    pub tx_pub_key: PublicKey,
     pub mask: Option<[u8; 32]>,
-    pub height: u64,
-    pub maj: u32,
-    pub min: u32,
+    pub height: Height,
+    pub subaddress: SubaddressIndex,
     pub commitment: Option<[u8; 32]>,
 }
 
 pub struct Db {
-    conn: Mutex<Connection>,
+    writer: Mutex<Connection>,
+    /// Whose turn it is at the writer: writes take it first come, first
+    /// served (`Turns`), so a client's write waiting behind the scanner
+    /// goes before the scanner's next chunk of blocks.
+    turns: Turns,
+    /// Read-only connections; empty for an in-memory database, whose reads
+    /// then go through the writer.
+    readers: Mutex<Vec<Connection>>,
+    reader_free: Condvar,
+    /// How many readers the pool was made with.
+    reader_count: usize,
+    /// Accounts whose access time is to be set (`touch`) and when, for the
+    /// next write: a login doesn't wait for the scanner's batch to commit.
+    touched: Mutex<HashMap<AccountId, u64>>,
+    /// A test database's file, removed with it (`Db::scratch`).
+    #[cfg(test)]
+    scratch: Option<std::path::PathBuf>,
 }
 
-fn blob32(v: Vec<u8>) -> rusqlite::Result<[u8; 32]> {
-    v.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
+#[cfg(test)]
+impl Drop for Db {
+    fn drop(&mut self) {
+        if let Some(path) = &self.scratch {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+    }
+}
+
+/// Read connections a database opens by default: a few, so a burst of API
+/// reads doesn't queue behind one, but not one per core on a big machine.
+pub fn default_readers() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4)
+}
+
+/// How long a connection waits on SQLite's own locks (another process,
+/// a checkpoint) before giving up.
+const BUSY_TIMEOUT_MS: u32 = 5_000;
+
+/// A reader taken from the pool, given back when dropped.
+struct Reader<'a> {
+    db: &'a Db,
+    conn: Option<Connection>,
+}
+
+impl Drop for Reader<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            lock(&self.db.readers).push(conn);
+            self.db.reader_free.notify_one();
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A ticket queue in front of the writer. `std::sync::Mutex` makes no
+/// promise of order: the scanner, unlocking after one chunk of a batch and
+/// locking again for the next, can take the writer back before a waiting
+/// client's write wakes, again and again. With turns, every write waits
+/// only for those that asked before it.
+#[derive(Default)]
+struct Turns {
+    /// (the next ticket to hand out, the ticket being served).
+    state: Mutex<(u64, u64)>,
+    changed: Condvar,
+}
+
+/// A turn at the writer, held while writing; the next ticket's when dropped.
+struct Turn<'a>(&'a Turns);
+
+impl Turns {
+    /// Waits for a turn, behind every write that asked before.
+    fn take(&self) -> Turn<'_> {
+        let mut state = lock(&self.state);
+        let ticket = state.0;
+        state.0 = state.0.wrapping_add(1);
+        while state.1 != ticket {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        Turn(self)
+    }
+
+    /// A turn now, if nobody holds or waits for one.
+    fn try_take(&self) -> Option<Turn<'_>> {
+        let mut state = lock(&self.state);
+        if state.0 != state.1 {
+            return None;
+        }
+        state.0 = state.0.wrapping_add(1);
+        Some(Turn(self))
+    }
+
+    /// Writes holding or waiting for a turn.
+    #[cfg(test)]
+    fn queued(&self) -> u64 {
+        let state = lock(&self.state);
+        state.0.wrapping_sub(state.1)
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.0.state);
+        state.1 = state.1.wrapping_add(1);
+        self.0.changed.notify_all();
+    }
+}
+
+/// A view key column, read straight from SQLite's buffer into the key's own
+/// (no `Vec` copy left behind). A blob of the wrong length is an error.
+/// (`PrivateViewKey` is `lws_api`'s, so it can't implement `FromSql` here;
+/// it is written as `key.as_bytes().as_slice()`.)
+/// An amount column, checked as `SqlU64` is. (`Amount` is `lws_api`'s, so
+/// it can't implement `FromSql` here; it is written as `SqlU64(amount.0)`.)
+fn amount_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Amount> {
+    Ok(Amount(r.get::<_, SqlU64>(i)?.0))
+}
+
+fn view_key_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<PrivateViewKey> {
+    let blob = r.get_ref(i)?.as_blob()?;
+    PrivateViewKey::from_slice(blob).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            i,
+            rusqlite::types::Type::Blob,
+            format!("a view key of {} bytes", blob.len()).into(),
+        )
+    })
 }
 
 fn account_row(r: &rusqlite::Row) -> rusqlite::Result<Account> {
     Ok(Account {
         id: r.get(0)?,
         address: r.get(1)?,
-        view_key: blob32(r.get(2)?)?,
-        spend_pub: blob32(r.get(3)?)?,
-        view_pub: blob32(r.get(4)?)?,
-        status: Status::parse(&r.get::<_, String>(5)?).unwrap_or(Status::Hidden),
-        start_height: r.get::<_, i64>(6)? as u64,
-        scan_height: r.get::<_, i64>(7)? as u64,
-        access_time: r.get::<_, i64>(8)? as u64,
-        generated_locally: r.get::<_, i64>(9)? != 0,
+        view_key: view_key_col(r, 2)?,
+        status: status_col(r, 3)?,
+        start_height: r.get(4)?,
+        scan_height: r.get(5)?,
+        access_time: r.get::<_, SqlU64>(6)?.0,
+        generated_locally: r.get(7)?,
     })
 }
 
-const ACCOUNT_COLS: &str =
-    "id, address, view_key, spend_pub, view_pub, status, start_height, scan_height, access_time, generated_locally";
+/// Every this many blocks a block's hash is kept for good (`checkpoints`),
+/// whichever lane scanned it: when a reorg goes deeper than the last
+/// `KEEP_HASHES`, they bracket the fork to within this many blocks. About
+/// 40 bytes each: 150 KB for all of mainnet.
+pub(crate) const CHECKPOINT_EVERY: u64 = 1_000;
+
+/// The public keys are not read back: the address holds them.
+const ACCOUNT_COLS: &str = "id, address, view_key, status, start_height, scan_height, access_time, generated_locally";
 
 /// Brings a database made by an earlier version up to `SCHEMA`.
 ///
@@ -298,6 +424,12 @@ const ACCOUNT_COLS: &str =
 /// is `G + amount·H`, which is what the chain's output set holds for it), so
 /// the commitment worked out again is the on-chain one, without a rescan.
 ///
+/// `checkpoints` came later: an older database's are seeded from the
+/// block hashes it kept, at the heights a checkpoint falls on. So did
+/// `rescan_due`: a database stopped for a deep reorg by a version that
+/// waited until no active account stood at or above the stop's height has
+/// those accounts marked.
+///
 /// `blocks_kept` and `txs_kept` (what proofs of inclusion are made of) came
 /// later still; `SCHEMA` makes them empty in an older database. They can't
 /// be filled from what is stored, so transactions scanned before them are
@@ -307,16 +439,28 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         .prepare("SELECT 1 FROM pragma_table_info('outputs') WHERE name = 'commitment'")?
         .exists([])?;
     let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT OR IGNORE INTO checkpoints (height, hash) SELECT height, hash FROM blocks WHERE height % ?1 = 0",
+        [SqlU64(CHECKPOINT_EVERY)],
+    )?;
+    // Stopped by a version that marked no account: those its rule waited
+    // for (at or above the stop's height) are the ones to rescan.
+    if meta_u64(&tx, "halted_below")?.is_some() && !tx.prepare("SELECT 1 FROM rescan_due")?.exists([])? {
+        tx.execute(
+            "INSERT INTO rescan_due (account) SELECT id FROM accounts
+             WHERE scan_height >= (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'halted_below')",
+            [],
+        )?;
+    }
     if !has_commitment {
         tx.execute("ALTER TABLE outputs ADD COLUMN commitment BLOB", [])?;
     }
-    let missing: Vec<(i64, Vec<u8>, i64)> = tx
+    let missing: Vec<(OutputId, [u8; 32], Amount)> = tx
         .prepare("SELECT id, mask, amount FROM outputs WHERE commitment IS NULL AND mask IS NOT NULL")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, amount_col(r, 2)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (id, mask, amount) in missing {
-        let mask = blob32(mask)?;
-        let commitment = crate::crypto::commit(&mask, amount as u64);
+        let commitment = crate::crypto::commit(&mask, amount.0);
         tx.execute(
             "UPDATE outputs SET commitment = ?1 WHERE id = ?2",
             params![commitment.as_slice(), id],
@@ -326,45 +470,201 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-impl Db {
-    pub fn open(path: &Path) -> Result<Db> {
-        let mut conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")?;
-        conn.execute_batch(SCHEMA)?;
-        migrate(&mut conn)?;
-        Ok(Db { conn: Mutex::new(conn) })
+/// A read-only connection to the database at `path`, which the writer has
+/// made: never creates it, refuses to write (`query_only`), waits out
+/// SQLite's locks for a while.
+fn open_reader(path: &Path) -> Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.execute_batch(&format!("PRAGMA query_only=ON; PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))?;
+    Ok(conn)
+}
+
+/// The store as async code holds it: the only way in is [`AsyncDb::call`],
+/// which runs on a blocking thread, so a handler can't block a tokio worker
+/// on SQLite by forgetting to.
+#[derive(Clone)]
+pub struct AsyncDb(Arc<Db>);
+
+impl AsyncDb {
+    pub fn new(db: Arc<Db>) -> AsyncDb {
+        AsyncDb(db)
     }
 
+    /// `f` with the store, on one of tokio's blocking threads.
+    pub async fn call<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Db) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.0.call(f).await
+    }
+}
+
+/// Tests look at the store directly.
+#[cfg(test)]
+impl std::ops::Deref for AsyncDb {
+    type Target = Db;
+
+    fn deref(&self) -> &Db {
+        &self.0
+    }
+}
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Db> {
+        Db::open_with_readers(path, default_readers())
+    }
+
+    /// Opens the database with `readers` read-only connections besides the
+    /// writer (at least one).
+    pub fn open_with_readers(path: &Path, readers: usize) -> Result<Db> {
+        let mut conn = Connection::open(path)?;
+        conn.execute_batch(&format!(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"
+        ))?;
+        conn.execute_batch(SCHEMA)?;
+        migrate(&mut conn)?;
+        let readers = (0..readers.max(1))
+            .map(|_| open_reader(path))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Db::with(conn, readers))
+    }
+
+    fn with(writer: Connection, readers: Vec<Connection>) -> Db {
+        Db {
+            writer: Mutex::new(writer),
+            turns: Turns::default(),
+            reader_count: readers.len(),
+            readers: Mutex::new(readers),
+            reader_free: Condvar::new(),
+            touched: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            scratch: None,
+        }
+    }
+
+    /// A database in a file of its own under the temporary directory, with
+    /// the read pool as a served one has it; the file goes with it.
+    #[cfg(test)]
+    pub fn scratch() -> Db {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "monokulo-lws-db-{}-{}-{}.sqlite",
+            std::process::id(),
+            now(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut db = Db::open_with_readers(&path, 2).unwrap();
+        db.scratch = Some(path);
+        db
+    }
+
+    /// A private in-memory database. It has no read pool (each in-memory
+    /// connection is a database of its own): reads go through the writer.
+    /// Tests of the pool itself open a file (`Db::open`).
     #[cfg(test)]
     pub fn in_memory() -> Db {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         migrate(&mut conn).unwrap();
-        Db { conn: Mutex::new(conn) }
+        Db::with(conn, vec![])
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    /// Writes holding or waiting for the writer.
+    #[cfg(test)]
+    pub fn writes_queued(&self) -> u64 {
+        self.turns.queued()
     }
 
-    /// Run `f` inside one write transaction.
+    /// How many read-only connections the database has (0: reads go
+    /// through the writer).
+    pub fn readers(&self) -> usize {
+        self.reader_count
+    }
+
+    /// Run `f` inside one write transaction, on the one writer, once every
+    /// write asked for before it is done (`Turns`). Access times left by
+    /// `touch` are written in it too.
     pub fn write<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
-        let mut conn = self.lock();
+        let _turn = self.turns.take();
+        let mut conn = lock(&self.writer);
         let tx = conn.transaction()?;
         let out = f(&tx)?;
+        self.flush_touched(&tx)?;
         tx.commit()?;
         Ok(out)
     }
 
+    /// Run `f` inside one read transaction, on a read-only connection from
+    /// the pool (waiting for one if all are out), or on the writer for an
+    /// in-memory database. Everything `f` reads is one snapshot: a write
+    /// committed while it runs is not half seen.
     pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self.lock();
-        f(&conn)
+        if self.reader_count == 0 {
+            let mut conn = lock(&self.writer);
+            let tx = conn.transaction()?;
+            return f(&tx);
+        }
+        let mut reader = self.take_reader();
+        let conn = reader.conn.as_mut().expect("held until dropped");
+        let tx = conn.transaction()?;
+        let out = f(&tx);
+        // A read transaction has nothing to commit; dropping it ends it.
+        drop(tx);
+        out
+    }
+
+    /// `f` on the writer outside any transaction, for a test that must
+    /// do what a transaction can't (turn foreign keys off).
+    #[cfg(test)]
+    pub fn raw_writer<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        f(&lock(&self.writer))
+    }
+
+    fn take_reader(&self) -> Reader<'_> {
+        let mut idle = lock(&self.readers);
+        loop {
+            if let Some(conn) = idle.pop() {
+                return Reader {
+                    db: self,
+                    conn: Some(conn),
+                };
+            }
+            idle = self.reader_free.wait(idle).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Runs `f` on one of tokio's blocking threads, so a caller on a
+    /// worker never waits there for SQLite (a write the scanner holds, a
+    /// busy pool, the disk). What async code uses; see [`AsyncDb`].
+    pub async fn call<T, F>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        F: FnOnce(&Db) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || f(&db))
+            .await
+            .map_err(|e| Error::Internal(format!("a database call failed: {e}")))?
+    }
+
+    fn flush_touched(&self, tx: &Transaction) -> Result<()> {
+        let touched = std::mem::take(&mut *lock(&self.touched));
+        for (id, at) in touched {
+            tx.execute(
+                "UPDATE accounts SET access_time = MAX(access_time, ?1) WHERE id = ?2",
+                params![SqlU64(at), id],
+            )?;
+        }
+        Ok(())
     }
 
     // ---- accounts ----
 
-    pub fn account(&self, address: &str) -> Result<Option<Account>> {
+    pub fn account(&self, address: &Address) -> Result<Option<Account>> {
         self.read(|c| {
             Ok(c.query_row(
                 &format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE address = ?1"),
@@ -392,30 +692,10 @@ impl Db {
 
     /// Adds an account; `Err(Conflict)` if the address is already here.
     pub fn add_account(&self, new: &NewAccount, status: Status) -> Result<Account> {
-        self.write(|tx| {
-            let n = now();
-            let changed = tx.execute(
-                "INSERT OR IGNORE INTO accounts (address, view_key, spend_pub, view_pub, status, start_height, scan_height, created, access_time, generated_locally) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?7, ?8)",
-                params![
-                    new.address,
-                    new.view_key.as_slice(),
-                    new.spend_pub.as_slice(),
-                    new.view_pub.as_slice(),
-                    status.as_str(),
-                    new.start_height as i64,
-                    n as i64,
-                    new.generated_locally as i64
-                ],
-            )?;
-            if changed == 0 {
-                return Err(Error::Conflict("account exists".into()));
-            }
-            tx.query_row(&format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE address = ?1"), [&new.address], account_row)
-                .map_err(Error::from)
-        })
+        self.write(|tx| insert_account(tx, new, status))
     }
 
-    pub fn set_status(&self, addresses: &[String], status: Status) -> Result<Vec<String>> {
+    pub fn set_status(&self, addresses: &[Address], status: Status) -> Result<Vec<Address>> {
         self.write(|tx| {
             let mut done = vec![];
             for a in addresses {
@@ -431,195 +711,208 @@ impl Db {
         })
     }
 
-    pub fn touch(&self, id: i64) -> Result<()> {
-        self.write(|tx| {
-            tx.execute(
-                "UPDATE accounts SET access_time = ?1 WHERE id = ?2",
-                params![now() as i64, id],
-            )?;
-            Ok(())
-        })
+    /// Sets the account's access time to now: at once if the writer is
+    /// free, else with the next write (the scanner's batch commit, most
+    /// likely), so a login never waits for a batch to commit.
+    pub fn touch(&self, id: AccountId) -> Result<()> {
+        {
+            let mut touched = lock(&self.touched);
+            let at = touched.entry(id).or_insert(0);
+            *at = (*at).max(now());
+        }
+        // Held or waited for: whoever holds it writes the access time
+        // before committing, or the next writer does.
+        let Some(_turn) = self.turns.try_take() else {
+            return Ok(());
+        };
+        let mut conn = lock(&self.writer);
+        let tx = conn.transaction()?;
+        self.flush_touched(&tx)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Scan these accounts again from `height`: their rows from there on go.
-    pub fn rescan(&self, addresses: &[String], height: u64) -> Result<Vec<String>> {
-        self.write(|tx| {
-            let mut done = vec![];
-            for a in addresses {
-                let id: Option<i64> = tx
-                    .query_row("SELECT id FROM accounts WHERE address = ?1", [a], |r| r.get(0))
-                    .optional()?;
-                let Some(id) = id else { continue };
-                delete_account_from(tx, id, height)?;
-                tx.execute(
-                    "UPDATE accounts SET scan_height = MIN(scan_height, ?1) WHERE id = ?2",
-                    params![height as i64, id],
-                )?;
-                done.push(a.clone());
-            }
-            drop_unused_kept(tx, height)?;
-            Ok(done)
-        })
+    pub fn rescan(&self, addresses: &[Address], height: Height) -> Result<Vec<Address>> {
+        self.write(|tx| rescan_in(tx, addresses, height))
     }
 
     /// Forgets these accounts whole: the account, its view key, its
     /// transactions, outputs, spends and subaddresses, any request pending
     /// under its address, and the proofs kept for it alone. Not monero-lws's
     /// (it only hides); an operator's choice, for a wallet that has moved on.
-    pub fn remove_accounts(&self, addresses: &[String]) -> Result<Vec<String>> {
+    pub fn remove_accounts(&self, addresses: &[Address]) -> Result<Vec<Address>> {
         self.write(|tx| {
             let mut done = vec![];
             for a in addresses {
-                let id: Option<i64> = tx
+                let id: Option<AccountId> = tx
                     .query_row("SELECT id FROM accounts WHERE address = ?1", [a], |r| r.get(0))
                     .optional()?;
                 tx.execute("DELETE FROM requests WHERE address = ?1", [a])?;
                 let Some(id) = id else { continue };
-                delete_account_from(tx, id, 0)?;
+                delete_account_from(tx, id, Height::ZERO)?;
+                tx.execute("DELETE FROM rescan_due WHERE account = ?1", [id])?;
                 tx.execute("DELETE FROM subaddrs WHERE account = ?1", [id])?;
                 tx.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
                 done.push(a.clone());
             }
             if !done.is_empty() {
-                drop_unused_kept(tx, 0)?;
+                drop_unused_kept(tx, Height::ZERO)?;
             }
             Ok(done)
         })
     }
 
     /// An accepted import: the accounts start at block 0 and scan again
-    /// from it, as monero-lws's import does.
-    pub fn import(&self, addresses: &[String]) -> Result<Vec<String>> {
-        let done = self.rescan(addresses, 0)?;
-        self.write(|tx| {
-            for a in &done {
-                tx.execute("UPDATE accounts SET start_height = 0 WHERE address = ?1", [a])?;
-            }
-            Ok(())
-        })?;
-        Ok(done)
+    /// from it, as monero-lws's import does. One transaction.
+    pub fn import(&self, addresses: &[Address]) -> Result<Vec<Address>> {
+        self.write(|tx| import_in(tx, addresses))
     }
 
     // ---- requests ----
 
-    pub fn add_request(&self, kind: &str, new: &NewAccount) -> Result<bool> {
+    /// Queues a request, unless one of the kind is already pending for the
+    /// address or `max_pending` requests are. The count and the insert are
+    /// one transaction, so concurrent callers can't pass the cap together.
+    pub fn add_request(&self, kind: RequestKind, new: &NewAccount, max_pending: u64) -> Result<Queued> {
+        let start_height = sql_height(new.start_height)?;
         self.write(|tx| {
+            if request_exists(tx, kind, &new.address)? {
+                return Ok(Queued::Duplicate);
+            }
+            let pending = tx.query_row("SELECT COUNT(*) FROM requests", [], |r| r.get::<_, SqlU64>(0))?.0;
+            if pending >= max_pending {
+                return Ok(Queued::Full(pending));
+            }
             let changed = tx.execute(
                 "INSERT OR IGNORE INTO requests (kind, address, view_key, spend_pub, view_pub, start_height, generated_locally, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
-                    kind,
+                    kind.as_str(),
                     new.address,
-                    new.view_key.as_slice(),
-                    new.spend_pub.as_slice(),
-                    new.view_pub.as_slice(),
-                    new.start_height as i64,
-                    new.generated_locally as i64,
-                    now() as i64
+                    new.view_key.as_bytes().as_slice(),
+                    new.address.spend_pub().as_slice(),
+                    new.address.view_pub().as_slice(),
+                    start_height,
+                    new.generated_locally,
+                    SqlU64(now())
                 ],
             )?;
-            Ok(changed > 0)
+            Ok(if changed > 0 { Queued::Added } else { Queued::Duplicate })
         })
     }
 
-    pub fn requests(&self) -> Result<Vec<(String, NewAccount)>> {
+    /// Whether a request of the kind is pending for the address.
+    pub fn has_request(&self, kind: RequestKind, address: &Address) -> Result<bool> {
+        self.read(|c| request_exists(c, kind, address))
+    }
+
+    pub fn requests(&self) -> Result<Vec<(RequestKind, NewAccount)>> {
         self.read(|c| {
-            let mut st = c.prepare(
-                "SELECT kind, address, view_key, spend_pub, view_pub, start_height, generated_locally FROM requests ORDER BY created",
-            )?;
-            let rows = st
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        NewAccount {
-                            address: r.get(1)?,
-                            view_key: blob32(r.get(2)?)?,
-                            spend_pub: blob32(r.get(3)?)?,
-                            view_pub: blob32(r.get(4)?)?,
-                            start_height: r.get::<_, i64>(5)? as u64,
-                            generated_locally: r.get::<_, i64>(6)? != 0,
-                        },
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut st = c.prepare(&format!("SELECT {REQUEST_COLS} FROM requests ORDER BY created"))?;
+            let rows = st.query_map([], request_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
     }
 
-    /// Removes the named requests of a kind, returning what they were.
-    pub fn take_requests(&self, kind: &str, addresses: &[String]) -> Result<Vec<NewAccount>> {
-        let all = self.requests()?;
-        let mut taken = vec![];
+    /// Removes the named requests of a kind, returning what they were. One
+    /// transaction, so two callers can't both take the same request.
+    pub fn take_requests(&self, kind: RequestKind, addresses: &[Address]) -> Result<Vec<NewAccount>> {
         self.write(|tx| {
-            for (k, new) in all {
-                if k == kind && addresses.contains(&new.address) {
-                    tx.execute(
-                        "DELETE FROM requests WHERE kind = ?1 AND address = ?2",
-                        params![kind, new.address],
-                    )?;
-                    taken.push(new);
+            let taken = named_requests(tx, kind, addresses)?;
+            for new in &taken {
+                delete_request(tx, kind, &new.address)?;
+            }
+            Ok(taken)
+        })
+    }
+
+    /// Accepts the named requests of a kind, all or none, in one
+    /// transaction: a create request becomes an active account, an import
+    /// request scans its account again from block 0. If any named create
+    /// request's address already has an account, nothing is changed and
+    /// those addresses are returned. An import request whose account has
+    /// gone since is dropped and not counted as done.
+    pub fn accept_requests(&self, kind: RequestKind, addresses: &[Address]) -> Result<Accepted> {
+        self.write(|tx| {
+            let taken = named_requests(tx, kind, addresses)?;
+            if kind == RequestKind::Create {
+                let mut exists = vec![];
+                for new in &taken {
+                    if account_id(tx, &new.address)?.is_some() {
+                        exists.push(new.address.clone());
+                    }
+                }
+                if !exists.is_empty() {
+                    return Ok(Accepted::Exists(exists));
                 }
             }
-            Ok(())
-        })?;
-        Ok(taken)
+            let mut done = vec![];
+            for new in &taken {
+                delete_request(tx, kind, &new.address)?;
+                match kind {
+                    RequestKind::Create => {
+                        insert_account(tx, new, Status::Active)?;
+                        done.push(new.address.clone());
+                    }
+                    RequestKind::Import => done.extend(import_in(tx, std::slice::from_ref(&new.address))?),
+                }
+            }
+            Ok(Accepted::Done(done))
+        })
     }
 
     // ---- subaddresses ----
 
-    pub fn subaddrs(&self, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
+    pub fn subaddrs(&self, account: AccountId) -> Result<Vec<lws_api::SubaddrRanges>> {
         self.read(|c| subaddrs_in(c, account))
     }
 
     /// Adds ranges, merging with what is there; returns only what was new,
     /// as ranges, and refuses to pass `max` minors in all.
+    ///
+    /// Each major is sorted and merged once: what is wanted, what is held,
+    /// and the two together, with the new minors found by one sweep of the
+    /// sorted lists, so the work is O((S + R) log(S + R)) for S stored and
+    /// R requested ranges. Only the majors asked about are written again.
     pub fn upsert_subaddrs(
         &self,
-        account: i64,
+        account: AccountId,
         wanted: &[lws_api::SubaddrRanges],
         max: u64,
     ) -> Result<Vec<lws_api::SubaddrRanges>> {
+        let mut wanted_by_major: std::collections::BTreeMap<u32, Vec<[u32; 2]>> = Default::default();
+        for want in wanted {
+            // A `MinorRange` runs forwards by construction.
+            wanted_by_major
+                .entry(want.key)
+                .or_default()
+                .extend(want.value.iter().map(|r| [r.lo(), r.hi()]));
+        }
         self.write(|tx| {
-            let existing = subaddrs_in(tx, account)?;
-            let mut by_major: HashMap<u32, Vec<[u32; 2]>> = existing.into_iter().map(|r| (r.key, r.value)).collect();
+            let mut by_major: HashMap<u32, Vec<[u32; 2]>> = subaddrs_in(tx, account)?
+                .into_iter()
+                .map(|r| (r.key, r.value.iter().map(|r| [r.lo(), r.hi()]).collect()))
+                .collect();
             let mut added = vec![];
-            for want in wanted {
-                let have = by_major.entry(want.key).or_default();
-                let mut new_here = vec![];
-                for &[lo, hi] in &want.value {
-                    if lo > hi {
-                        return Err(bad("a subaddress range runs backwards"));
-                    }
-                    // Only the minors not already covered are new.
-                    let mut cursor = lo;
-                    let mut covered: Vec<[u32; 2]> = have.clone();
-                    covered.sort();
-                    for [clo, chi] in covered {
-                        if chi < cursor {
-                            continue;
-                        }
-                        if clo > hi {
-                            break;
-                        }
-                        if clo > cursor {
-                            new_here.push([cursor, clo - 1]);
-                        }
-                        cursor = cursor.max(chi.saturating_add(1));
-                        if cursor > hi {
-                            break;
-                        }
-                    }
-                    if cursor <= hi {
-                        new_here.push([cursor, hi]);
-                    }
-                    have.push([lo, hi]);
-                }
+            let mut touched = vec![];
+            for (maj, want) in wanted_by_major {
+                let want = merge(want);
+                let have = by_major.entry(maj).or_default();
                 *have = merge(std::mem::take(have));
-                if !new_here.is_empty() {
-                    added.push(lws_api::SubaddrRanges {
-                        key: want.key,
-                        value: merge(new_here),
-                    });
+                let new_here = uncovered(&want, have);
+                if new_here.is_empty() {
+                    continue;
                 }
+                have.extend_from_slice(&new_here);
+                *have = merge(std::mem::take(have));
+                added.push(lws_api::SubaddrRanges {
+                    key: maj,
+                    value: new_here
+                        .iter()
+                        .map(|&[lo, hi]| MinorRange::new(lo, hi).expect("uncovered runs forwards"))
+                        .collect(),
+                });
+                touched.push(maj);
             }
             let total: u64 = by_major.values().flatten().map(|[lo, hi]| u64::from(hi - lo) + 1).sum();
             if total > max {
@@ -627,42 +920,48 @@ impl Db {
                     "subaddress limit of {max} would be passed ({total})"
                 )));
             }
-            tx.execute("DELETE FROM subaddrs WHERE account = ?1", [account])?;
-            let mut majors: Vec<_> = by_major.into_iter().collect();
-            majors.sort_by_key(|(m, _)| *m);
-            for (maj, ranges) in majors {
-                for [lo, hi] in ranges {
-                    tx.execute(
-                        "INSERT INTO subaddrs (account, maj, min_lo, min_hi) VALUES (?1, ?2, ?3, ?4)",
-                        params![account, maj, lo, hi],
-                    )?;
+            let mut insert =
+                tx.prepare("INSERT INTO subaddrs (account, maj, min_lo, min_hi) VALUES (?1, ?2, ?3, ?4)")?;
+            for maj in touched {
+                tx.execute(
+                    "DELETE FROM subaddrs WHERE account = ?1 AND maj = ?2",
+                    params![account, maj],
+                )?;
+                for [lo, hi] in &by_major[&maj] {
+                    insert.execute(params![account, maj, lo, hi])?;
                 }
             }
-            added.sort_by_key(|r| r.key);
             Ok(added)
         })
     }
 
     // ---- blocks ----
 
-    pub fn block_hash(&self, height: u64) -> Result<Option<[u8; 32]>> {
+    pub fn block_hash(&self, height: Height) -> Result<Option<BlockHash>> {
         self.read(|c| {
             Ok(
-                c.query_row("SELECT hash FROM blocks WHERE height = ?1", [height as i64], |r| {
-                    r.get::<_, Vec<u8>>(0)
-                })
-                .optional()?
-                .map(blob32)
-                .transpose()?,
+                c.query_row("SELECT hash FROM blocks WHERE height = ?1", [height], |r| r.get(0))
+                    .optional()?,
             )
         })
     }
 
-    pub fn recent_blocks(&self) -> Result<Vec<(u64, [u8; 32])>> {
+    pub fn recent_blocks(&self) -> Result<Vec<(Height, BlockHash)>> {
         self.read(|c| {
             let mut st = c.prepare("SELECT height, hash FROM blocks ORDER BY height DESC")?;
             let rows = st
-                .query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, blob32(r.get(1)?)?)))?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// The checkpoints kept (`CHECKPOINT_EVERY`), lowest first.
+    pub fn checkpoints(&self) -> Result<Vec<(Height, BlockHash)>> {
+        self.read(|c| {
+            let mut st = c.prepare("SELECT height, hash FROM checkpoints ORDER BY height")?;
+            let rows = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -670,108 +969,122 @@ impl Db {
 
     /// The scanner's own height: the block after the last one it finished.
     #[cfg(test)]
-    pub fn scanner_height(&self) -> Result<Option<u64>> {
+    pub fn scanner_height(&self) -> Result<Option<Height>> {
         self.read(|c| {
             Ok(
                 c.query_row("SELECT value FROM meta WHERE key = 'scanner_height'", [], |r| {
                     r.get::<_, String>(0)
                 })
                 .optional()?
-                .and_then(|s| s.parse().ok()),
+                .and_then(|s| s.parse().ok())
+                .map(Height::new),
             )
         })
     }
 
     /// Forget everything from `height` on: a reorg went deeper than it.
-    pub fn rewind(&self, height: u64) -> Result<()> {
+    pub fn rewind(&self, height: Height) -> Result<()> {
+        self.write(|tx| rewind_in(tx, height))
+    }
+
+    /// How many reorgs (rewinds, and stops for one too deep) there have
+    /// been. A batch fetched before it changed may hold blocks of an
+    /// orphaned chain, and is not written (`ScanWriter::reorg_generation`).
+    pub fn reorg_generation(&self) -> Result<u64> {
+        self.read(|c| meta_u64(c, "reorg_generation").map(|g| g.unwrap_or(0)))
+    }
+
+    /// The lowest known height, if scanning is stopped for a reorg deeper
+    /// than every hash kept, checkpoints too (`halt`).
+    pub fn halted(&self) -> Result<Option<Height>> {
+        self.read(|c| Ok(meta_u64(c, "halted_below")?.map(Height::new)))
+    }
+
+    /// Stops scanning for a reorg deeper than every hash kept, the lowest of
+    /// which (a checkpoint, or the lowest of the last hashes) is at
+    /// `lowest`; kept across restarts until `resume`. Nothing is rewound:
+    /// the fork is somewhere below `lowest`, and the server can't tell which
+    /// rows are from the orphaned chain. Every account there is now is
+    /// marked as to be rescanned (`rescans_due`): any may have scanned past
+    /// the fork, a catch-up account below `lowest` as well as one above it.
+    pub fn halt(&self, lowest: Height) -> Result<()> {
         self.write(|tx| {
-            let h = height as i64;
-            tx.execute("DELETE FROM spends WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM outputs WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM txs WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM blocks WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM blocks_kept WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM txs_kept WHERE height >= ?1", [h])?;
-            tx.execute("UPDATE accounts SET scan_height = MIN(scan_height, ?1)", [h])?;
-            tx.execute("UPDATE txs SET total_received = (SELECT COALESCE(SUM(amount), 0) FROM outputs WHERE outputs.tx = txs.id)", [])?;
-            tx.execute(
-                "UPDATE txs SET total_sent = (SELECT COALESCE(SUM(o.amount), 0) FROM spends s JOIN outputs o ON o.id = s.output WHERE s.tx = txs.id)",
-                [],
+            bump_generation(tx)?;
+            set_meta(tx, "halted_below", lowest.get())?;
+            tx.execute("INSERT OR IGNORE INTO rescan_due (account) SELECT id FROM accounts", [])?;
+            Ok(())
+        })
+    }
+
+    /// The active accounts still to be rescanned from below the stop's
+    /// height before scanning resumes (`halt`, `rescan`).
+    pub fn rescans_due(&self) -> Result<Vec<Address>> {
+        self.read(|c| {
+            let mut st = c.prepare(
+                "SELECT a.address FROM rescan_due r JOIN accounts a ON a.id = r.account
+                 WHERE a.status = 'active' ORDER BY a.id",
             )?;
-            tx.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('scanner_height', ?1)", [height.to_string()])?;
+            let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Scanning goes on after `halt(lowest)`, every active account marked
+    /// having been rescanned from below it: everything from `lowest` on,
+    /// all of it from the orphaned chain (the hashes kept there among it),
+    /// goes. An account still marked (hidden or inactive, so not asked
+    /// for) loses all it holds and starts again from the lowest height it
+    /// held anything at, or its start height: it may have scanned past the
+    /// fork, and is not scanned until made active again.
+    pub fn resume(&self, lowest: Height) -> Result<()> {
+        self.write(|tx| {
+            rewind_in(tx, lowest)?;
+            let left: Vec<(AccountId, Height)> = tx
+                .prepare(
+                    "SELECT a.id, MIN(a.start_height, a.scan_height,
+                         COALESCE((SELECT MIN(height) FROM txs WHERE account = a.id), a.start_height))
+                     FROM rescan_due r JOIN accounts a ON a.id = r.account",
+                )?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (id, from) in &left {
+                delete_account_from(tx, *id, *from)?;
+                tx.execute("UPDATE accounts SET scan_height = ?1 WHERE id = ?2", params![from, id])?;
+            }
+            if !left.is_empty() {
+                drop_unused_kept(tx, Height::ZERO)?;
+            }
+            tx.execute("DELETE FROM rescan_due", [])?;
+            tx.execute("DELETE FROM meta WHERE key = 'halted_below'", [])?;
             Ok(())
         })
     }
 
     // ---- what an account holds ----
 
-    pub fn txs(&self, account: i64) -> Result<Vec<TxRow>> {
-        self.read(|c| {
-            let mut st = c.prepare(
-                "SELECT id, hash, prefix_hash, height, timestamp, unlock_time, coinbase, mixin, fee, payment_id, tx_pub_key, total_received, total_sent FROM txs WHERE account = ?1 ORDER BY height, id",
-            )?;
-            let rows = st
-                .query_map([account], |r| {
-                    Ok(TxRow {
-                        id: r.get(0)?,
-                        hash: blob32(r.get(1)?)?,
-                        prefix_hash: blob32(r.get(2)?)?,
-                        height: r.get::<_, i64>(3)? as u64,
-                        timestamp: r.get::<_, i64>(4)? as u64,
-                        unlock_time: r.get::<_, i64>(5)? as u64,
-                        coinbase: r.get::<_, i64>(6)? != 0,
-                        mixin: r.get::<_, i64>(7)? as u32,
-                        fee: r.get::<_, i64>(8)? as u64,
-                        payment_id: r.get(9)?,
-                        tx_pub_key: blob32(r.get(10)?)?,
-                        total_received: r.get::<_, i64>(11)? as u64,
-                        total_sent: r.get::<_, i64>(12)? as u64,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+    #[cfg(test)]
+    pub fn txs(&self, account: AccountId) -> Result<Vec<TxRow>> {
+        self.read(|c| txs_in(c, account))
     }
 
-    pub fn outputs(&self, account: i64) -> Result<Vec<OutputRow>> {
+    /// The account's transactions, outputs and candidate spends, read in
+    /// one read transaction, so a scanner commit can't fall between them
+    /// (an output whose transaction isn't in the list).
+    pub fn holdings(&self, account: AccountId) -> Result<Holdings> {
+        self.read(|c| holdings_in(c, account))
+    }
+
+    /// [`Db::holdings`] and what each transaction can be proved in (by row
+    /// id) from one snapshot: a rescan
+    /// between two reads could give a row id to another transaction (SQLite
+    /// reuses the highest ids once they are deleted), and its proof to it.
+    pub fn holdings_and_proofs(&self, account: AccountId) -> Result<(Holdings, HashMap<TxId, ProofRow>)> {
+        self.read(|c| Ok((holdings_in(c, account)?, proofs_in(c, account)?)))
+    }
+
+    #[cfg(test)]
+    pub fn outputs(&self, account: AccountId) -> Result<Vec<OutputRow>> {
         self.read(|c| outputs_in(c, account))
-    }
-
-    /// What each of the account's transactions can be proved in, by row id:
-    /// a miner transaction whose block is kept, or another whose block and
-    /// pruned parts are, its prunable hash included. Transactions scanned
-    /// before these were kept, those whose prunable hash is still pending,
-    /// and those the account only (maybe) spent in, have none.
-    pub fn proofs(&self, account: i64) -> Result<HashMap<i64, ProofRow>> {
-        self.read(|c| {
-            let mut st = c.prepare(
-                "SELECT t.id, b.blob, k.prefix, k.rct_base, k.prunable_hash FROM txs t
-                 JOIN blocks_kept b ON b.height = t.height
-                 LEFT JOIN txs_kept k ON k.hash = t.hash AND k.height = t.height
-                 WHERE t.account = ?1 AND (t.coinbase != 0 OR k.prunable_hash IS NOT NULL)",
-            )?;
-            let rows = st
-                .query_map([account], |r| {
-                    let prefix: Option<Vec<u8>> = r.get(2)?;
-                    let parts = match prefix {
-                        Some(prefix) => Some(crate::proof::TxParts {
-                            prefix,
-                            rct_base: r.get(3)?,
-                            prunable_hash: Some(blob32(r.get(4)?)?),
-                        }),
-                        None => None,
-                    };
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        ProofRow {
-                            block: r.get(1)?,
-                            parts,
-                        },
-                    ))
-                })?
-                .collect::<rusqlite::Result<HashMap<_, _>>>()?;
-            Ok(rows)
-        })
     }
 
     /// Kept transactions whose prunable hash isn't known yet (the node sent
@@ -781,7 +1094,9 @@ impl Db {
             let mut st =
                 c.prepare("SELECT hash, prefix, rct_base FROM txs_kept WHERE prunable_hash IS NULL LIMIT ?1")?;
             let rows = st
-                .query_map([limit as i64], |r| Ok((blob32(r.get(0)?)?, r.get(1)?, r.get(2)?)))?
+                .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -790,19 +1105,19 @@ impl Db {
     /// Settles pending proofs: each transaction's prunable hash where one was
     /// found that its parts hash to it with, and the rest dropped (with
     /// their blocks, if nothing else needs them).
-    pub fn settle_proofs(&self, found: &[([u8; 32], [u8; 32])], dropped: &[[u8; 32]]) -> Result<()> {
+    pub fn settle_proofs(&self, found: &[(TxHash, [u8; 32])], dropped: &[TxHash]) -> Result<()> {
         self.write(|tx| {
             for (hash, prunable) in found {
                 tx.execute(
                     "UPDATE txs_kept SET prunable_hash = ?1 WHERE hash = ?2",
-                    params![prunable.as_slice(), hash.as_slice()],
+                    params![prunable.as_slice(), hash],
                 )?;
             }
             for hash in dropped {
-                tx.execute("DELETE FROM txs_kept WHERE hash = ?1", [hash.as_slice()])?;
+                tx.execute("DELETE FROM txs_kept WHERE hash = ?1", [hash])?;
             }
             if !dropped.is_empty() {
-                drop_unused_kept(tx, 0)?;
+                drop_unused_kept(tx, Height::ZERO)?;
             }
             Ok(())
         })
@@ -810,14 +1125,14 @@ impl Db {
 
     /// The block kept for proofs at `height`: its hash and blob.
     #[cfg(test)]
-    pub fn kept_block(&self, height: u64) -> Result<Option<([u8; 32], Vec<u8>)>> {
+    pub fn kept_block(&self, height: Height) -> Result<Option<(BlockHash, Vec<u8>)>> {
         self.read(|c| {
-            Ok(c.query_row(
-                "SELECT hash, blob FROM blocks_kept WHERE height = ?1",
-                [height as i64],
-                |r| Ok((blob32(r.get(0)?)?, r.get(1)?)),
+            Ok(
+                c.query_row("SELECT hash, blob FROM blocks_kept WHERE height = ?1", [height], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?,
             )
-            .optional()?)
         })
     }
 
@@ -826,31 +1141,255 @@ impl Db {
     pub fn kept_counts(&self) -> Result<(u64, u64)> {
         self.read(|c| {
             Ok((
-                c.query_row("SELECT COUNT(*) FROM blocks_kept", [], |r| r.get::<_, i64>(0))? as u64,
-                c.query_row("SELECT COUNT(*) FROM txs_kept", [], |r| r.get::<_, i64>(0))? as u64,
+                c.query_row("SELECT COUNT(*) FROM blocks_kept", [], |r| r.get::<_, SqlU64>(0))?
+                    .0,
+                c.query_row("SELECT COUNT(*) FROM txs_kept", [], |r| r.get::<_, SqlU64>(0))?
+                    .0,
             ))
         })
     }
 
-    pub fn spends(&self, account: i64) -> Result<Vec<SpendRow>> {
-        self.read(|c| {
-            let mut st = c.prepare(
-                "SELECT tx, output, key_image, mixin, height FROM spends WHERE account = ?1 ORDER BY height, id",
-            )?;
-            let rows = st
-                .query_map([account], |r| {
-                    Ok(SpendRow {
-                        tx: r.get(0)?,
-                        output: r.get(1)?,
-                        key_image: blob32(r.get(2)?)?,
-                        mixin: r.get::<_, i64>(3)? as u32,
-                        height: r.get::<_, i64>(4)? as u64,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+    #[cfg(test)]
+    pub fn spends(&self, account: AccountId) -> Result<Vec<SpendRow>> {
+        self.read(|c| spends_in(c, account))
     }
+}
+
+/// What [`Db::holdings`] reads: one snapshot of an account.
+pub struct Holdings {
+    pub txs: Vec<TxRow>,
+    pub outputs: Vec<OutputRow>,
+    pub spends: Vec<SpendRow>,
+}
+
+fn holdings_in(c: &Connection, account: AccountId) -> Result<Holdings> {
+    Ok(Holdings {
+        txs: txs_in(c, account)?,
+        outputs: outputs_in(c, account)?,
+        spends: spends_in(c, account)?,
+    })
+}
+
+/// What each of the account's transactions can be proved in, by row id:
+/// a miner transaction whose block is kept, or another whose block and
+/// pruned parts are, its prunable hash included. Transactions scanned
+/// before these were kept, those whose prunable hash is still pending,
+/// and those the account only (maybe) spent in, have none.
+fn proofs_in(c: &Connection, account: AccountId) -> Result<HashMap<TxId, ProofRow>> {
+    let mut st = c.prepare(
+        "SELECT t.id, b.blob, k.prefix, k.rct_base, k.prunable_hash FROM txs t
+         JOIN blocks_kept b ON b.height = t.height
+         LEFT JOIN txs_kept k ON k.hash = t.hash AND k.height = t.height
+         WHERE t.account = ?1 AND (t.coinbase != 0 OR k.prunable_hash IS NOT NULL)",
+    )?;
+    let rows = st
+        .query_map([account], |r| {
+            let prefix: Option<Vec<u8>> = r.get(2)?;
+            let parts = match prefix {
+                Some(prefix) => Some(crate::proof::TxParts {
+                    prefix,
+                    rct_base: r.get(3)?,
+                    prunable_hash: Some(r.get(4)?),
+                }),
+                None => None,
+            };
+            Ok((
+                r.get::<_, TxId>(0)?,
+                ProofRow {
+                    block: r.get(1)?,
+                    parts,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+    Ok(rows)
+}
+
+fn txs_in(c: &Connection, account: AccountId) -> Result<Vec<TxRow>> {
+    let mut st = c.prepare(
+        "SELECT id, hash, prefix_hash, height, timestamp, unlock_time, coinbase, mixin, fee, payment_id, tx_pub_key, total_received, total_sent FROM txs WHERE account = ?1 ORDER BY height, id",
+    )?;
+    let rows = st
+        .query_map([account], |r| {
+            Ok(TxRow {
+                id: r.get(0)?,
+                hash: r.get(1)?,
+                prefix_hash: r.get(2)?,
+                height: r.get(3)?,
+                timestamp: r.get::<_, SqlU64>(4)?.0,
+                unlock_time: r.get::<_, SqlU64>(5)?.0,
+                coinbase: r.get(6)?,
+                mixin: r.get(7)?,
+                fee: amount_col(r, 8)?,
+                payment_id: r.get(9)?,
+                tx_pub_key: r.get(10)?,
+                total_received: amount_col(r, 11)?,
+                total_sent: amount_col(r, 12)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn spends_in(c: &Connection, account: AccountId) -> Result<Vec<SpendRow>> {
+    let mut st =
+        c.prepare("SELECT tx, output, key_image, mixin, height FROM spends WHERE account = ?1 ORDER BY height, id")?;
+    let rows = st
+        .query_map([account], |r| {
+            Ok(SpendRow {
+                tx: r.get(0)?,
+                output: r.get(1)?,
+                key_image: r.get(2)?,
+                mixin: r.get(3)?,
+                height: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// What [`Db::add_request`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Queued {
+    Added,
+    /// One of the kind was already pending for the address.
+    Duplicate,
+    /// The queue was full, with this many.
+    Full(u64),
+}
+
+fn request_exists(c: &Connection, kind: RequestKind, address: &Address) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM requests WHERE kind = ?1 AND address = ?2)",
+        params![kind.as_str(), address],
+        |r| r.get(0),
+    )?)
+}
+
+/// What [`Db::accept_requests`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Accepted {
+    /// These addresses were accepted.
+    Done(Vec<Address>),
+    /// Nothing was: these addresses already have an account.
+    Exists(Vec<Address>),
+}
+
+fn account_id(c: &Connection, address: &Address) -> Result<Option<AccountId>> {
+    Ok(
+        c.query_row("SELECT id FROM accounts WHERE address = ?1", [address], |r| r.get(0))
+            .optional()?,
+    )
+}
+
+/// A height asked for by a client or the admin, refused with a 400 past
+/// what SQLite stores (`Height`'s `ToSql` would refuse it too, but as the
+/// server's own failure).
+fn sql_height(height: Height) -> Result<Height> {
+    if height > Height::MAX_STORED {
+        return Err(bad(format!("a height must be at most {}", Height::MAX_STORED)));
+    }
+    Ok(height)
+}
+
+/// Adds an account inside `tx`; `Err(Conflict)` if the address is already here.
+fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<Account> {
+    let start_height = sql_height(new.start_height)?;
+    let n = now();
+    let changed = tx.execute(
+        "INSERT OR IGNORE INTO accounts (address, view_key, spend_pub, view_pub, status, start_height, scan_height, created, access_time, generated_locally) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?7, ?8)",
+        params![
+            new.address,
+            new.view_key.as_bytes().as_slice(),
+            new.address.spend_pub().as_slice(),
+            new.address.view_pub().as_slice(),
+            status.as_str(),
+            start_height,
+            SqlU64(n),
+            new.generated_locally
+        ],
+    )?;
+    if changed == 0 {
+        return Err(Error::Conflict("account exists".into()));
+    }
+    tx.query_row(
+        &format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE address = ?1"),
+        [&new.address],
+        account_row,
+    )
+    .map_err(Error::from)
+}
+
+/// [`Db::rescan`] inside `tx`.
+fn rescan_in(tx: &Transaction, addresses: &[Address], height: Height) -> Result<Vec<Address>> {
+    let height = sql_height(height)?;
+    // From below a stop's height (`Db::halt`), it is the rescan asked for.
+    let clears = meta_u64(tx, "halted_below")?.is_some_and(|halt| height.get() < halt);
+    let mut done = vec![];
+    for a in addresses {
+        let Some(id) = account_id(tx, a)? else { continue };
+        delete_account_from(tx, id, height)?;
+        tx.execute(
+            "UPDATE accounts SET scan_height = MIN(scan_height, ?1) WHERE id = ?2",
+            params![height, id],
+        )?;
+        if clears {
+            tx.execute("DELETE FROM rescan_due WHERE account = ?1", [id])?;
+        }
+        done.push(a.clone());
+    }
+    drop_unused_kept(tx, height)?;
+    Ok(done)
+}
+
+/// [`Db::import`] inside `tx`.
+fn import_in(tx: &Transaction, addresses: &[Address]) -> Result<Vec<Address>> {
+    let done = rescan_in(tx, addresses, Height::ZERO)?;
+    for a in &done {
+        tx.execute("UPDATE accounts SET start_height = 0 WHERE address = ?1", [a])?;
+    }
+    Ok(done)
+}
+
+/// The public keys are not read back: the address holds them.
+const REQUEST_COLS: &str = "kind, address, view_key, start_height, generated_locally";
+
+fn request_row(r: &rusqlite::Row) -> rusqlite::Result<(RequestKind, NewAccount)> {
+    Ok((
+        RequestKind::parse(&r.get::<_, String>(0)?).ok_or(rusqlite::Error::InvalidQuery)?,
+        NewAccount {
+            address: r.get(1)?,
+            view_key: view_key_col(r, 2)?,
+            start_height: r.get(3)?,
+            generated_locally: r.get(4)?,
+        },
+    ))
+}
+
+/// The pending requests of a kind under these addresses, each address once.
+fn named_requests(c: &Connection, kind: RequestKind, addresses: &[Address]) -> Result<Vec<NewAccount>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {REQUEST_COLS} FROM requests WHERE kind = ?1 AND address = ?2"
+    ))?;
+    let mut seen = HashSet::new();
+    let mut out = vec![];
+    for a in addresses {
+        if !seen.insert(a.as_str()) {
+            continue;
+        }
+        if let Some((_, new)) = st.query_row(params![kind.as_str(), a], request_row).optional()? {
+            out.push(new);
+        }
+    }
+    Ok(out)
+}
+
+fn delete_request(tx: &Transaction, kind: RequestKind, address: &Address) -> Result<()> {
+    tx.execute(
+        "DELETE FROM requests WHERE kind = ?1 AND address = ?2",
+        params![kind.as_str(), address],
+    )?;
+    Ok(())
 }
 
 fn merge(mut ranges: Vec<[u32; 2]>) -> Vec<[u32; 2]> {
@@ -865,25 +1404,58 @@ fn merge(mut ranges: Vec<[u32; 2]>) -> Vec<[u32; 2]> {
     out
 }
 
-fn subaddrs_in(c: &Connection, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
+/// The minors of `want` that `have` doesn't cover, as ranges; both sorted,
+/// disjoint and merged (as `merge` leaves them). One sweep of each.
+fn uncovered(want: &[[u32; 2]], have: &[[u32; 2]]) -> Vec<[u32; 2]> {
+    let mut out = vec![];
+    let mut j = 0;
+    for &[lo, hi] in want {
+        // u64, so the minor after u32::MAX doesn't wrap.
+        // The lowest minor not yet accounted for; `None` once past
+        // u32::MAX, so the minor after it doesn't wrap.
+        let mut cursor = Some(lo);
+        // Held ranges wholly below this one are below every later one too.
+        while j < have.len() && have[j][1] < lo {
+            j += 1;
+        }
+        for &[clo, chi] in &have[j..] {
+            let Some(at) = cursor.filter(|at| *at <= hi && clo <= hi) else {
+                break;
+            };
+            if clo > at {
+                // `clo - 1` doesn't wrap: clo > at >= 0.
+                out.push([at, clo - 1]);
+            }
+            cursor = chi.checked_add(1).map(|next| next.max(at));
+        }
+        if let Some(at) = cursor.filter(|at| *at <= hi) {
+            out.push([at, hi]);
+        }
+    }
+    out
+}
+
+pub(crate) fn subaddrs_in(c: &Connection, account: AccountId) -> Result<Vec<lws_api::SubaddrRanges>> {
     let mut st = c.prepare("SELECT maj, min_lo, min_hi FROM subaddrs WHERE account = ?1 ORDER BY maj, min_lo")?;
     let mut out: Vec<lws_api::SubaddrRanges> = vec![];
     for row in st.query_map([account], |r| {
         Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?))
     })? {
         let (maj, lo, hi) = row?;
+        let range = MinorRange::new(lo, hi)
+            .ok_or_else(|| Error::Internal("a stored subaddress range runs backwards".into()))?;
         match out.last_mut() {
-            Some(last) if last.key == maj => last.value.push([lo, hi]),
+            Some(last) if last.key == maj => last.value.push(range),
             _ => out.push(lws_api::SubaddrRanges {
                 key: maj,
-                value: vec![[lo, hi]],
+                value: vec![range],
             }),
         }
     }
     Ok(out)
 }
 
-fn outputs_in(c: &Connection, account: i64) -> Result<Vec<OutputRow>> {
+fn outputs_in(c: &Connection, account: AccountId) -> Result<Vec<OutputRow>> {
     let mut st = c.prepare(
         "SELECT id, tx, out_index, global_index, amount, public_key, tx_pub_key, mask, height, maj, min, commitment FROM outputs WHERE account = ?1 ORDER BY height, id",
     )?;
@@ -892,24 +1464,25 @@ fn outputs_in(c: &Connection, account: i64) -> Result<Vec<OutputRow>> {
             Ok(OutputRow {
                 id: r.get(0)?,
                 tx: r.get(1)?,
-                out_index: r.get::<_, i64>(2)? as u16,
-                global_index: r.get::<_, i64>(3)? as u64,
-                amount: r.get::<_, i64>(4)? as u64,
-                public_key: blob32(r.get(5)?)?,
-                tx_pub_key: blob32(r.get(6)?)?,
-                mask: r.get::<_, Option<Vec<u8>>>(7)?.map(blob32).transpose()?,
-                height: r.get::<_, i64>(8)? as u64,
-                maj: r.get(9)?,
-                min: r.get(10)?,
-                commitment: r.get::<_, Option<Vec<u8>>>(11)?.map(blob32).transpose()?,
+                out_index: r.get(2)?,
+                global_index: r.get(3)?,
+                amount: amount_col(r, 4)?,
+                public_key: r.get(5)?,
+                tx_pub_key: r.get(6)?,
+                mask: r.get(7)?,
+                height: r.get(8)?,
+                subaddress: SubaddressIndex {
+                    major: r.get(9)?,
+                    minor: r.get(10)?,
+                },
+                commitment: r.get(11)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
-fn delete_account_from(tx: &Transaction, account: i64, height: u64) -> Result<()> {
-    let h = height as i64;
+fn delete_account_from(tx: &Transaction, account: AccountId, h: Height) -> Result<()> {
     tx.execute(
         "DELETE FROM spends WHERE account = ?1 AND height >= ?2",
         params![account, h],
@@ -928,8 +1501,7 @@ fn delete_account_from(tx: &Transaction, account: i64, height: u64) -> Result<()
 /// Forgets what proofs were kept from `height` on that no transaction row
 /// needs any more (after a rescan dropped an account's rows; other accounts
 /// may still need the same block or transaction).
-fn drop_unused_kept(tx: &Transaction, height: u64) -> Result<()> {
-    let h = height as i64;
+fn drop_unused_kept(tx: &Transaction, h: Height) -> Result<()> {
     tx.execute(
         "DELETE FROM txs_kept WHERE height >= ?1 AND hash NOT IN (SELECT hash FROM txs WHERE height >= ?1)",
         [h],
@@ -943,6 +1515,51 @@ fn drop_unused_kept(tx: &Transaction, height: u64) -> Result<()> {
     Ok(())
 }
 
+/// Forgets everything from `height` on, for every account, and counts a
+/// reorg. The totals of the transactions left need no recomputing: an
+/// output or spend is written at its transaction's height, so every one
+/// deleted belonged to a transaction deleted with it.
+fn rewind_in(tx: &Transaction, h: Height) -> Result<()> {
+    tx.execute("DELETE FROM spends WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM outputs WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM txs WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM blocks WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM checkpoints WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM blocks_kept WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM txs_kept WHERE height >= ?1", [h])?;
+    tx.execute("UPDATE accounts SET scan_height = MIN(scan_height, ?1)", [h])?;
+    set_meta(tx, "scanner_height", h.get())?;
+    bump_generation(tx)
+}
+
+fn meta_u64(c: &Connection, key: &str) -> Result<Option<u64>> {
+    Ok(c.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+        r.get::<_, String>(0)
+    })
+    .optional()?
+    .and_then(|s| s.parse().ok()))
+}
+
+fn set_meta(tx: &Transaction, key: &str, value: u64) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![key, value.to_string()],
+    )?;
+    Ok(())
+}
+
+fn bump_generation(tx: &Transaction) -> Result<()> {
+    let generation = meta_u64(tx, "reorg_generation")?.unwrap_or(0);
+    set_meta(tx, "reorg_generation", generation.wrapping_add(1))
+}
+
+/// A transaction's running total.
+#[derive(Clone, Copy)]
+enum Total {
+    Received,
+    Sent,
+}
+
 /// Writes the scanner makes, inside one transaction per batch of blocks.
 pub struct ScanWriter<'a> {
     tx: &'a Transaction<'a>,
@@ -953,28 +1570,72 @@ impl<'a> ScanWriter<'a> {
         ScanWriter { tx }
     }
 
-    pub fn set_block(&self, height: u64, hash: &[u8; 32], keep: u64) -> Result<()> {
+    pub fn set_block(&self, height: Height, hash: &BlockHash, keep: u64) -> Result<()> {
         self.tx.execute(
             "INSERT OR REPLACE INTO blocks (height, hash) VALUES (?1, ?2)",
-            params![height as i64, hash.as_slice()],
+            params![height, hash],
         )?;
-        self.tx.execute(
-            "DELETE FROM blocks WHERE height < ?1",
-            [height.saturating_sub(keep) as i64],
-        )?;
+        self.tx
+            .execute("DELETE FROM blocks WHERE height < ?1", [height.saturating_sub(keep)])?;
         self.tx.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('scanner_height', ?1)",
-            [(height + 1).to_string()],
+            [height.next().to_string()],
         )?;
         Ok(())
     }
 
+    /// Keeps a block's hash, as a catch-up lane does near the tip: no older
+    /// hashes are dropped and the scanner's own height doesn't move, as
+    /// both are the live lane's.
+    pub fn keep_hash(&self, height: Height, hash: &BlockHash) -> Result<()> {
+        self.tx.execute(
+            "INSERT OR REPLACE INTO blocks (height, hash) VALUES (?1, ?2)",
+            params![height, hash],
+        )?;
+        Ok(())
+    }
+
+    /// The hash kept for `height`, as this transaction sees it.
+    pub fn block_hash(&self, height: Height) -> Result<Option<BlockHash>> {
+        Ok(self
+            .tx
+            .query_row("SELECT hash FROM blocks WHERE height = ?1", [height], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// The hash known for `height`: one of the last kept, or a checkpoint.
+    pub fn known_hash(&self, height: Height) -> Result<Option<BlockHash>> {
+        match self.block_hash(height)? {
+            Some(hash) => Ok(Some(hash)),
+            None => Ok(self
+                .tx
+                .query_row("SELECT hash FROM checkpoints WHERE height = ?1", [height], |r| r.get(0))
+                .optional()?),
+        }
+    }
+
+    /// Keeps `hash` for good if `height` is a checkpoint's (`CHECKPOINT_EVERY`).
+    pub fn checkpoint(&self, height: Height, hash: &BlockHash) -> Result<()> {
+        if height.get().is_multiple_of(CHECKPOINT_EVERY) {
+            self.tx.execute(
+                "INSERT OR REPLACE INTO checkpoints (height, hash) VALUES (?1, ?2)",
+                params![height, hash],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `Db::reorg_generation`, as this transaction sees it.
+    pub fn reorg_generation(&self) -> Result<u64> {
+        Ok(meta_u64(self.tx, "reorg_generation")?.unwrap_or(0))
+    }
+
     /// Keeps a block that pays an account, for proofs: its hash and its blob
     /// as the node sent it.
-    pub fn keep_block(&self, height: u64, hash: &[u8; 32], blob: &[u8]) -> Result<()> {
+    pub fn keep_block(&self, height: Height, hash: &BlockHash, blob: &[u8]) -> Result<()> {
         self.tx.execute(
             "INSERT OR REPLACE INTO blocks_kept (height, hash, blob) VALUES (?1, ?2, ?3)",
-            params![height as i64, hash.as_slice(), blob],
+            params![height, hash, blob],
         )?;
         Ok(())
     }
@@ -982,15 +1643,15 @@ impl<'a> ScanWriter<'a> {
     /// Keeps a transaction that pays an account (not a miner transaction,
     /// which its block holds), for proofs: its pruned parts. A prunable hash
     /// already settled stays when the same transaction comes again without.
-    pub fn keep_tx(&self, hash: &[u8; 32], height: u64, parts: &crate::proof::TxParts) -> Result<()> {
+    pub fn keep_tx(&self, hash: &TxHash, height: Height, parts: &crate::proof::TxParts) -> Result<()> {
         self.tx.execute(
             "INSERT INTO txs_kept (hash, height, prefix, rct_base, prunable_hash) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(hash) DO UPDATE SET height = excluded.height, prefix = excluded.prefix,
                  rct_base = excluded.rct_base,
                  prunable_hash = COALESCE(excluded.prunable_hash, txs_kept.prunable_hash)",
             params![
-                hash.as_slice(),
-                height as i64,
+                hash,
+                height,
                 parts.prefix,
                 parts.rct_base,
                 parts.prunable_hash.as_ref().map(|h| h.as_slice())
@@ -1002,47 +1663,46 @@ impl<'a> ScanWriter<'a> {
     /// Where `account` stands now, and whether it is still scanned: what a
     /// batch checks before writing, as the account may have been rescanned,
     /// rewound or hidden while the batch was fetched.
-    pub fn standing(&self, account: i64) -> Result<Option<(u64, Status)>> {
+    pub fn standing(&self, account: AccountId) -> Result<Option<(Height, Status)>> {
         Ok(self
             .tx
             .query_row(
                 "SELECT scan_height, status FROM accounts WHERE id = ?1",
                 [account],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+                |r| Ok((r.get(0)?, status_col(r, 1)?)),
             )
-            .optional()?
-            .map(|(h, s)| (h, Status::parse(&s).unwrap_or(Status::Hidden))))
+            .optional()?)
     }
 
-    pub fn set_scan_height(&self, account: i64, height: u64) -> Result<()> {
+    pub fn set_scan_height(&self, account: AccountId, height: Height) -> Result<()> {
         self.tx.execute(
             "UPDATE accounts SET scan_height = ?1 WHERE id = ?2",
-            params![height as i64, account],
+            params![height, account],
         )?;
         Ok(())
     }
 
     /// The transaction's row id, made if it wasn't there.
-    pub fn tx_row(&self, account: i64, new: &NewTx) -> Result<i64> {
+    pub fn tx_row(&self, account: AccountId, new: &NewTx) -> Result<TxId> {
         self.tx.execute(
             "INSERT OR IGNORE INTO txs (account, hash, prefix_hash, height, timestamp, unlock_time, coinbase, mixin, fee, payment_id, tx_pub_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 account,
-                new.hash.as_slice(),
+                new.hash,
                 new.prefix_hash.as_slice(),
-                new.height as i64,
-                new.timestamp as i64,
-                new.unlock_time as i64,
-                new.coinbase as i64,
+                new.height,
+                SqlU64(new.timestamp),
+                SqlU64(new.unlock_time),
+                new.coinbase,
                 new.mixin,
-                new.fee as i64,
+                SqlU64(new.fee.0),
                 new.payment_id,
-                new.tx_pub_key.as_slice()
+                new.tx_pub_key
             ],
         )?;
         let id = self.tx.query_row(
             "SELECT id FROM txs WHERE account = ?1 AND hash = ?2",
-            params![account, new.hash.as_slice()],
+            params![account, new.hash],
             |r| r.get(0),
         )?;
         Ok(id)
@@ -1050,84 +1710,103 @@ impl<'a> ScanWriter<'a> {
 
     /// Adds an output and gives its row id; `None` if one with that key was
     /// already here (the burning bug: only the first counts).
-    pub fn add_output(&self, account: i64, tx: i64, o: &NewOutput) -> Result<Option<i64>> {
+    pub fn add_output(&self, account: AccountId, tx: TxId, o: &NewOutput) -> Result<Option<OutputId>> {
         let changed = self.tx.execute(
             "INSERT OR IGNORE INTO outputs (account, tx, out_index, global_index, amount, public_key, tx_pub_key, mask, height, maj, min, commitment) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 account,
                 tx,
                 o.out_index,
-                o.global_index as i64,
-                o.amount as i64,
-                o.public_key.as_slice(),
-                o.tx_pub_key.as_slice(),
+                o.global_index,
+                SqlU64(o.amount.0),
+                o.public_key,
+                o.tx_pub_key,
                 o.mask.as_ref().map(|m| m.as_slice()),
-                o.height as i64,
-                o.maj,
-                o.min,
+                o.height,
+                o.subaddress.major,
+                o.subaddress.minor,
                 o.commitment.as_ref().map(|c| c.as_slice())
             ],
         )?;
         if changed == 0 {
             return Ok(None);
         }
-        self.tx.execute(
-            "UPDATE txs SET total_received = total_received + ?1 WHERE id = ?2",
-            params![o.amount as i64, tx],
-        )?;
-        Ok(Some(self.tx.last_insert_rowid()))
+        let id = OutputId::from_rowid(self.tx.last_insert_rowid())?;
+        self.add_to_total(Total::Received, tx, o.amount)?;
+        Ok(Some(id))
+    }
+
+    /// Adds `amount` to a transaction's total, in Rust, so that a sum past
+    /// what the column stores is an error rather than SQL's `+` turning it
+    /// into a REAL. Past `i64::MAX` (9.2 million XMR in one transaction to
+    /// one account) the write fails rather than storing it negative.
+    fn add_to_total(&self, total: Total, tx: TxId, amount: Amount) -> Result<()> {
+        let (select, update) = match total {
+            Total::Received => (
+                "SELECT total_received FROM txs WHERE id = ?1",
+                "UPDATE txs SET total_received = ?1 WHERE id = ?2",
+            ),
+            Total::Sent => (
+                "SELECT total_sent FROM txs WHERE id = ?1",
+                "UPDATE txs SET total_sent = ?1 WHERE id = ?2",
+            ),
+        };
+        let now = self.tx.query_row(select, [tx], |r| amount_col(r, 0))?;
+        let sum = now
+            .0
+            .checked_add(amount.0)
+            .ok_or_else(|| Error::Internal("a transaction's total would pass 2^64".into()))?;
+        self.tx.execute(update, params![SqlU64(sum), tx])?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn add_spend(
         &self,
-        account: i64,
-        tx: i64,
-        output: i64,
-        amount: u64,
-        key_image: &[u8; 32],
+        account: AccountId,
+        tx: TxId,
+        output: OutputId,
+        amount: Amount,
+        key_image: &KeyImage,
         mixin: u32,
-        height: u64,
+        height: Height,
     ) -> Result<()> {
         let changed = self.tx.execute(
             "INSERT OR IGNORE INTO spends (account, tx, output, key_image, mixin, height) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![account, tx, output, key_image.as_slice(), mixin, height as i64],
+            params![account, tx, output, key_image, mixin, height],
         )?;
         if changed > 0 {
-            self.tx.execute(
-                "UPDATE txs SET total_sent = total_sent + ?1 WHERE id = ?2",
-                params![amount as i64, tx],
-            )?;
+            self.add_to_total(Total::Sent, tx, amount)?;
         }
         Ok(())
     }
 
     /// Owned outputs by global index, for matching rings against.
-    pub fn owned_indexes(&self, account: i64) -> Result<HashMap<u64, OutputRow>> {
+    pub fn owned_indexes(&self, account: AccountId) -> Result<HashMap<GlobalIndex, OutputRow>> {
         Ok(outputs_in(self.tx, account)?
             .into_iter()
             .filter(|o| o.mask.is_some())
             .map(|o| (o.global_index, o))
             .collect())
     }
-
-    pub fn subaddrs(&self, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
-        subaddrs_in(self.tx, account)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::mr;
+
+    /// A stagenet address for a name (`"A"`, `"B"`).
+    fn addr(name: &str) -> Address {
+        crate::testkit::Wallet::new(u64::from(name.as_bytes()[0])).address()
+    }
 
     fn acct(db: &Db) -> Account {
         db.add_account(
             &NewAccount {
-                address: "A".into(),
-                view_key: [1; 32],
-                spend_pub: [2; 32],
-                view_pub: [3; 32],
-                start_height: 10,
+                address: addr("A"),
+                view_key: PrivateViewKey::from_bytes(&[1; 32]),
+                start_height: Height::new(10),
                 generated_locally: false,
             },
             Status::Active,
@@ -1139,15 +1818,13 @@ mod tests {
     fn accounts_round_trip() {
         let db = Db::in_memory();
         let a = acct(&db);
-        assert_eq!(a.scan_height, 10);
+        assert_eq!(a.scan_height, Height::new(10));
         assert!(
             db.add_account(
                 &NewAccount {
-                    address: "A".into(),
-                    view_key: [1; 32],
-                    spend_pub: [2; 32],
-                    view_pub: [3; 32],
-                    start_height: 0,
+                    address: addr("A"),
+                    view_key: PrivateViewKey::from_bytes(&[1; 32]),
+                    start_height: Height::new(0),
                     generated_locally: false
                 },
                 Status::Active
@@ -1155,11 +1832,28 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            db.set_status(&["A".into(), "B".into()], Status::Hidden).unwrap(),
-            vec!["A".to_string()]
+            db.set_status(&[addr("A"), addr("B")], Status::Hidden).unwrap(),
+            vec![addr("A")]
         );
-        assert_eq!(db.account("A").unwrap().unwrap().status, Status::Hidden);
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().status, Status::Hidden);
         assert!(db.accounts(Some(Status::Active)).unwrap().is_empty());
+    }
+
+    /// A status the code doesn't know is an error, not taken as hidden (or
+    /// anything else).
+    #[test]
+    fn an_unknown_stored_status_is_an_error() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        db.write(|tx| {
+            tx.execute("UPDATE accounts SET status = 'deleted' WHERE id = ?1", [a.id])?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(db.account(&addr("A")).is_err());
+        assert!(db.accounts(None).is_err());
+        let standing = db.write(|tx| ScanWriter::new(tx).standing(a.id));
+        assert!(standing.is_err());
     }
 
     #[test]
@@ -1171,7 +1865,7 @@ mod tests {
                 a.id,
                 &[lws_api::SubaddrRanges {
                     key: 0,
-                    value: vec![[1, 10]],
+                    value: vec![mr(1, 10)],
                 }],
                 1000,
             )
@@ -1180,7 +1874,7 @@ mod tests {
             new,
             vec![lws_api::SubaddrRanges {
                 key: 0,
-                value: vec![[1, 10]]
+                value: vec![mr(1, 10)]
             }]
         );
         let new = db
@@ -1188,7 +1882,7 @@ mod tests {
                 a.id,
                 &[lws_api::SubaddrRanges {
                     key: 0,
-                    value: vec![[5, 15], [20, 20]],
+                    value: vec![mr(5, 15), mr(20, 20)],
                 }],
                 1000,
             )
@@ -1197,7 +1891,7 @@ mod tests {
             new,
             vec![lws_api::SubaddrRanges {
                 key: 0,
-                value: vec![[11, 15], [20, 20]]
+                value: vec![mr(11, 15), mr(20, 20)]
             }]
         );
         let all = db.subaddrs(a.id).unwrap();
@@ -1205,7 +1899,7 @@ mod tests {
             all,
             vec![lws_api::SubaddrRanges {
                 key: 0,
-                value: vec![[1, 15], [20, 20]]
+                value: vec![mr(1, 15), mr(20, 20)]
             }]
         );
         assert!(
@@ -1213,7 +1907,7 @@ mod tests {
                 a.id,
                 &[lws_api::SubaddrRanges {
                     key: 1,
-                    value: vec![[0, 100]]
+                    value: vec![mr(0, 100)]
                 }],
                 50
             )
@@ -1224,7 +1918,7 @@ mod tests {
                 a.id,
                 &[lws_api::SubaddrRanges {
                     key: 0,
-                    value: vec![[2, 3]],
+                    value: vec![mr(2, 3)],
                 }],
                 1000,
             )
@@ -1241,16 +1935,16 @@ mod tests {
             let t = w.tx_row(
                 a.id,
                 &NewTx {
-                    hash: [9; 32],
+                    hash: TxHash([9; 32]),
                     prefix_hash: [8; 32],
-                    height: 12,
+                    height: Height::new(12),
                     timestamp: 5,
                     unlock_time: 0,
                     coinbase: false,
                     mixin: 15,
-                    fee: 3,
+                    fee: Amount(3),
                     payment_id: None,
-                    tx_pub_key: [7; 32],
+                    tx_pub_key: PublicKey([7; 32]),
                 },
             )?;
             assert!(
@@ -1258,15 +1952,14 @@ mod tests {
                     a.id,
                     t,
                     &NewOutput {
-                        out_index: 0,
-                        global_index: 100,
-                        amount: 50,
-                        public_key: [4; 32],
-                        tx_pub_key: [7; 32],
+                        out_index: OutIndex::new(0),
+                        global_index: GlobalIndex::new(100),
+                        amount: Amount(50),
+                        public_key: PublicKey([4; 32]),
+                        tx_pub_key: PublicKey([7; 32]),
                         mask: Some([5; 32]),
-                        height: 12,
-                        maj: 0,
-                        min: 0,
+                        height: Height::new(12),
+                        subaddress: SubaddressIndex::default(),
                         commitment: None
                     }
                 )?
@@ -1277,15 +1970,14 @@ mod tests {
                     a.id,
                     t,
                     &NewOutput {
-                        out_index: 1,
-                        global_index: 101,
-                        amount: 50,
-                        public_key: [4; 32],
-                        tx_pub_key: [7; 32],
+                        out_index: OutIndex::new(1),
+                        global_index: GlobalIndex::new(101),
+                        amount: Amount(50),
+                        public_key: PublicKey([4; 32]),
+                        tx_pub_key: PublicKey([7; 32]),
                         mask: Some([5; 32]),
-                        height: 12,
-                        maj: 0,
-                        min: 0,
+                        height: Height::new(12),
+                        subaddress: SubaddressIndex::default(),
                         commitment: None
                     }
                 )?
@@ -1294,40 +1986,295 @@ mod tests {
             let t2 = w.tx_row(
                 a.id,
                 &NewTx {
-                    hash: [10; 32],
+                    hash: TxHash([10; 32]),
                     prefix_hash: [8; 32],
-                    height: 14,
+                    height: Height::new(14),
                     timestamp: 6,
                     unlock_time: 0,
                     coinbase: false,
                     mixin: 15,
-                    fee: 3,
+                    fee: Amount(3),
                     payment_id: None,
-                    tx_pub_key: [7; 32],
+                    tx_pub_key: PublicKey([7; 32]),
                 },
             )?;
             let owned = w.owned_indexes(a.id)?;
-            let o = &owned[&100];
-            w.add_spend(a.id, t2, o.id, o.amount, &[6; 32], 15, 14)?;
-            w.set_block(14, &[1; 32], 100)?;
-            w.set_scan_height(a.id, 15)?;
+            let o = &owned[&GlobalIndex::new(100)];
+            w.add_spend(a.id, t2, o.id, o.amount, &KeyImage([6; 32]), 15, Height::new(14))?;
+            w.set_block(Height::new(14), &BlockHash([1; 32]), 100)?;
+            w.set_scan_height(a.id, Height::new(15))?;
             Ok(())
         })
         .unwrap();
         let txs = db.txs(a.id).unwrap();
         assert_eq!(txs.len(), 2);
-        assert_eq!(txs[0].total_received, 50);
-        assert_eq!(txs[1].total_sent, 50);
+        assert_eq!(txs[0].total_received, Amount(50));
+        assert_eq!(txs[1].total_sent, Amount(50));
         assert_eq!(db.spends(a.id).unwrap().len(), 1);
-        assert_eq!(db.scanner_height().unwrap(), Some(15));
-        db.rewind(13).unwrap();
+        assert_eq!(db.scanner_height().unwrap(), Some(Height::new(15)));
+        db.rewind(Height::new(13)).unwrap();
         assert_eq!(db.txs(a.id).unwrap().len(), 1);
         assert!(db.spends(a.id).unwrap().is_empty());
-        assert_eq!(db.account("A").unwrap().unwrap().scan_height, 13);
-        assert_eq!(db.scanner_height().unwrap(), Some(13));
-        db.rescan(&["A".into()], 0).unwrap();
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, Height::new(13));
+        assert_eq!(db.scanner_height().unwrap(), Some(Height::new(13)));
+        db.rescan(&[addr("A")], Height::new(0)).unwrap();
         assert!(db.outputs(a.id).unwrap().is_empty());
-        assert_eq!(db.account("A").unwrap().unwrap().scan_height, 0);
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, Height::new(0));
+    }
+
+    fn new_tx(hash: u8, height: u64) -> NewTx {
+        NewTx {
+            hash: TxHash([hash; 32]),
+            prefix_hash: [0; 32],
+            height: Height::new(height),
+            timestamp: 0,
+            unlock_time: 0,
+            coinbase: false,
+            mixin: 15,
+            fee: Amount(0),
+            payment_id: None,
+            tx_pub_key: PublicKey([0; 32]),
+        }
+    }
+
+    fn new_output(key: u8, global_index: u64, amount: u64, height: u64) -> NewOutput {
+        NewOutput {
+            out_index: OutIndex::new(0),
+            global_index: GlobalIndex::new(global_index),
+            amount: Amount(amount),
+            public_key: PublicKey([key; 32]),
+            tx_pub_key: PublicKey([0; 32]),
+            mask: Some([1; 32]),
+            height: Height::new(height),
+            subaddress: SubaddressIndex::default(),
+            commitment: None,
+        }
+    }
+
+    #[test]
+    fn set_block_keeps_only_the_last_hashes() {
+        let db = Db::in_memory();
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            for h in 1..=30 {
+                w.set_block(Height::new(h), &BlockHash([h as u8; 32]), 10)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let kept = db.recent_blocks().unwrap();
+        assert_eq!(kept.len(), 11);
+        assert_eq!((kept[0].0, kept[10].0), (Height::new(30), Height::new(20)));
+    }
+
+    /// A rewind and a stop for a reorg too deep each count a reorg; a stop
+    /// marks the accounts to be rescanned, a rescan from below its height
+    /// clears the mark, and `resume` drops everything from the stop's
+    /// height on.
+    #[test]
+    fn reorgs_are_counted_and_a_stop_lasts_until_resumed() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            assert_eq!(w.reorg_generation()?, 0);
+            let t = w.tx_row(a.id, &new_tx(1, 20))?;
+            w.add_output(a.id, t, &new_output(1, 100, 5, 20))?;
+            for h in 15..=25 {
+                w.set_block(Height::new(h), &BlockHash([h as u8; 32]), 100)?;
+            }
+            w.set_scan_height(a.id, Height::new(26))?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.reorg_generation().unwrap(), 0);
+        db.rewind(Height::new(24)).unwrap();
+        assert_eq!(db.reorg_generation().unwrap(), 1);
+        assert_eq!(db.halted().unwrap(), None);
+        db.halt(Height::new(15)).unwrap();
+        assert_eq!(db.reorg_generation().unwrap(), 2);
+        assert_eq!(db.halted().unwrap(), Some(Height::new(15)));
+        assert_eq!(db.outputs(a.id).unwrap().len(), 1, "a stop rewinds nothing");
+        assert_eq!(db.rescans_due().unwrap(), [addr("A")]);
+        db.rescan(&[addr("A")], Height::new(15)).unwrap();
+        assert_eq!(
+            db.rescans_due().unwrap(),
+            [addr("A")],
+            "a rescan from the stop's height isn't enough"
+        );
+        db.rescan(&[addr("A")], Height::new(14)).unwrap();
+        assert!(db.rescans_due().unwrap().is_empty());
+        db.resume(Height::new(15)).unwrap();
+        assert_eq!(db.halted().unwrap(), None);
+        assert!(db.recent_blocks().unwrap().is_empty());
+        assert!(db.outputs(a.id).unwrap().is_empty());
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, Height::new(14));
+    }
+
+    /// A database from before checkpoints gets them from the block hashes
+    /// it kept, at the heights a checkpoint falls on, and if it was stopped
+    /// for a deep reorg, the accounts at or above the stop marked to be
+    /// rescanned; a rewind drops checkpoints from its height on.
+    #[test]
+    fn checkpoints_are_seeded_from_the_kept_hashes_and_rewound() {
+        let path = std::env::temp_dir().join(format!("lws-checkpoints-{}-{}.sqlite", std::process::id(), now()));
+        {
+            let db = Db::open(&path).unwrap();
+            db.write(|tx| {
+                let w = ScanWriter::new(tx);
+                for h in 999..=3_001u64 {
+                    w.set_block(Height::new(h), &BlockHash([(h % 251) as u8; 32]), 10_000)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert!(db.checkpoints().unwrap().is_empty(), "set_block keeps none itself");
+            // Stopped by a version that marked no account to rescan.
+            let a = acct(&db);
+            db.write(|tx| {
+                ScanWriter::new(tx).set_scan_height(a.id, Height::new(3_002))?;
+                set_meta(tx, "halted_below", 1_000)
+            })
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let heights = |db: &Db| -> Vec<u64> { db.checkpoints().unwrap().iter().map(|(h, _)| h.get()).collect() };
+        assert_eq!(heights(&db), [1_000, 2_000, 3_000]);
+        assert_eq!(
+            db.rescans_due().unwrap(),
+            [addr("A")],
+            "the account the old rule waited for"
+        );
+        assert_eq!(db.checkpoints().unwrap()[1].1, BlockHash([(2_000 % 251) as u8; 32]));
+        db.rewind(Height::new(2_000)).unwrap();
+        assert_eq!(heights(&db), [1_000]);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// A rewind leaves the totals of the transactions before it as they
+    /// were, received and sent, without recomputing them.
+    #[test]
+    fn totals_stay_right_after_a_rewind() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t1 = w.tx_row(a.id, &new_tx(1, 10))?;
+            let o70 = w.add_output(a.id, t1, &new_output(1, 100, 70, 10))?.unwrap();
+            let o30 = w.add_output(a.id, t1, &new_output(2, 101, 30, 10))?.unwrap();
+            let t2 = w.tx_row(a.id, &new_tx(2, 11))?;
+            w.add_output(a.id, t2, &new_output(3, 102, 5, 11))?;
+            w.add_spend(a.id, t2, o70, Amount(70), &KeyImage([7; 32]), 15, Height::new(11))?;
+            let t3 = w.tx_row(a.id, &new_tx(3, 20))?;
+            w.add_output(a.id, t3, &new_output(4, 103, 9, 20))?;
+            w.add_spend(a.id, t3, o30, Amount(30), &KeyImage([8; 32]), 15, Height::new(20))?;
+            Ok(())
+        })
+        .unwrap();
+        let totals = |db: &Db| -> Vec<(u64, u64, u64)> {
+            db.txs(a.id)
+                .unwrap()
+                .iter()
+                .map(|t| (t.height.get(), t.total_received.0, t.total_sent.0))
+                .collect()
+        };
+        assert_eq!(totals(&db), vec![(10, 100, 0), (11, 5, 70), (20, 9, 30)]);
+        db.rewind(Height::new(15)).unwrap();
+        assert_eq!(totals(&db), vec![(10, 100, 0), (11, 5, 70)]);
+        assert_eq!(db.spends(a.id).unwrap().len(), 1);
+    }
+
+    /// Totals are added in Rust and stored checked: up to `i64::MAX` they
+    /// read back whole, and past it the write fails, nothing written,
+    /// rather than storing a negative number.
+    #[test]
+    fn totals_past_what_sqlite_stores_are_refused() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        let max = i64::MAX.unsigned_abs();
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t = w.tx_row(a.id, &new_tx(1, 10))?;
+            w.add_output(a.id, t, &new_output(1, 100, max - 7, 10))?;
+            w.add_output(a.id, t, &new_output(2, 101, 7, 10))?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.txs(a.id).unwrap()[0].total_received, Amount(max));
+        let over = db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t = w.tx_row(a.id, &new_tx(1, 10))?;
+            w.add_output(a.id, t, &new_output(3, 102, 1, 10))?;
+            Ok(())
+        });
+        assert!(over.is_err());
+        assert_eq!(db.txs(a.id).unwrap()[0].total_received, Amount(max), "nothing written");
+        assert_eq!(db.outputs(a.id).unwrap().len(), 2);
+        // An output past it is refused on its own, as is a total past 2^64.
+        let alone = db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t = w.tx_row(a.id, &new_tx(2, 11))?;
+            w.add_output(a.id, t, &new_output(4, 103, max + 1, 11))?;
+            Ok(())
+        });
+        assert!(alone.is_err());
+    }
+
+    /// Integer columns that hold something no write makes (a negative
+    /// amount, height or timestamp; an out index past u16) are read as
+    /// errors, not cast into a number that isn't what was stored.
+    #[test]
+    fn out_of_range_columns_are_read_as_errors() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t = w.tx_row(a.id, &new_tx(1, 10))?;
+            w.add_output(a.id, t, &new_output(1, 100, 5, 10))?;
+            Ok(())
+        })
+        .unwrap();
+        for (column, value) in [
+            ("amount", "-1"),
+            ("height", "-1"),
+            ("global_index", "-5"),
+            ("out_index", "70000"),
+        ] {
+            db.write(|tx| {
+                tx.execute(&format!("UPDATE outputs SET {column} = {value}"), [])?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(db.outputs(a.id).is_err(), "{column} = {value}");
+            db.write(|tx| {
+                tx.execute(&format!("UPDATE outputs SET {column} = 1"), [])?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(db.outputs(a.id).is_ok());
+        }
+        for column in ["timestamp", "fee", "total_sent"] {
+            db.write(|tx| {
+                tx.execute(&format!("UPDATE txs SET {column} = -1"), [])?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(db.txs(a.id).is_err(), "{column}");
+            db.write(|tx| {
+                tx.execute(&format!("UPDATE txs SET {column} = 0"), [])?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        db.write(|tx| {
+            tx.execute("UPDATE accounts SET scan_height = -1", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(db.account(&addr("A")).is_err());
     }
 
     #[test]
@@ -1355,8 +2302,179 @@ mod tests {
         .unwrap();
         migrate(&mut conn).unwrap();
         migrate(&mut conn).unwrap();
-        let outputs = outputs_in(&conn, 1).unwrap();
+        let outputs = outputs_in(&conn, AccountId::new(1)).unwrap();
         assert_eq!(outputs[0].commitment, Some(crate::crypto::commit(&mask, 1234)));
         assert_eq!(outputs[1].commitment, None, "a pre-RingCT output has none");
+    }
+
+    /// Holds a write transaction open on another thread until told to go
+    /// on, having written one transaction row for `account` in it.
+    fn hold_writer(db: &Arc<Db>, account: AccountId) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let writer = db.clone();
+        let handle = std::thread::spawn(move || {
+            writer
+                .write(|tx| {
+                    ScanWriter::new(tx).tx_row(account, &new_tx(9, 50))?;
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        held.recv().unwrap();
+        (handle, go)
+    }
+
+    /// A read goes through a read connection while the writer is in the
+    /// middle of a transaction (the scanner's batch), and sees the last
+    /// commit, not the write in progress.
+    #[test]
+    fn a_read_goes_on_while_a_write_is_held() {
+        let db = Arc::new(Db::scratch());
+        assert_eq!(db.readers(), 2);
+        let a = acct(&db);
+        let (writer, go) = hold_writer(&db, a.id);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reader = db.clone();
+        std::thread::spawn(move || {
+            let read = (
+                reader.account(&addr("A")).unwrap(),
+                reader.holdings(a.id).unwrap().txs.len(),
+            );
+            done_tx.send(read).unwrap();
+        });
+        let (account, txs) = done
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the read waited for the writer");
+        assert_eq!(account.map(|a| a.id), Some(a.id));
+        assert_eq!(txs, 0, "the write in progress isn't seen");
+        go.send(()).unwrap();
+        writer.join().unwrap();
+        assert_eq!(db.holdings(a.id).unwrap().txs.len(), 1, "seen once committed");
+    }
+
+    /// From async code, with the writer held: `AsyncDb::call` answers on a
+    /// one-thread runtime (nothing parks its only worker), and the runtime
+    /// keeps running other tasks meanwhile.
+    #[test]
+    fn async_reads_never_wait_on_the_writer() {
+        let db = Arc::new(Db::scratch());
+        let a = acct(&db);
+        let (writer, go) = hold_writer(&db, a.id);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = AsyncDb::new(db.clone());
+        let found = rt.block_on(async move {
+            let ticker = tokio::spawn(async { tokio::task::yield_now().await });
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                handle.call(move |db| db.holdings(a.id)),
+            )
+            .await
+            .expect("answered while the writer was held")
+            .unwrap();
+            ticker.await.unwrap();
+            read.txs.len()
+        });
+        assert_eq!(found, 0);
+        go.send(()).unwrap();
+        writer.join().unwrap();
+    }
+
+    /// A login's access time doesn't wait for the writer: it is written
+    /// with the transaction that holds it, before that commits.
+    #[test]
+    fn touch_never_waits_for_the_writer() {
+        let db = Arc::new(Db::scratch());
+        let a = acct(&db);
+        db.write(|tx| {
+            tx.execute("UPDATE accounts SET access_time = 1 WHERE id = ?1", [a.id])?;
+            Ok(())
+        })
+        .unwrap();
+        let (writer, go) = hold_writer(&db, a.id);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let toucher = db.clone();
+        std::thread::spawn(move || done_tx.send(toucher.touch(a.id).is_ok()).unwrap());
+        assert!(
+            done.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("touch waited")
+        );
+        assert_eq!(
+            db.account(&addr("A")).unwrap().unwrap().access_time,
+            1,
+            "not yet: the writer is held"
+        );
+        go.send(()).unwrap();
+        writer.join().unwrap();
+        assert!(db.account(&addr("A")).unwrap().unwrap().access_time >= now() - 5);
+        // With the writer free, at once.
+        db.write(|tx| {
+            tx.execute("UPDATE accounts SET access_time = 1 WHERE id = ?1", [a.id])?;
+            Ok(())
+        })
+        .unwrap();
+        db.touch(a.id).unwrap();
+        assert!(db.account(&addr("A")).unwrap().unwrap().access_time >= now() - 5);
+    }
+
+    /// Each read is one snapshot: a commit landing between its statements
+    /// (the scanner writing a transaction and its output) is wholly unseen,
+    /// so `holdings` never gives an output without its transaction.
+    #[test]
+    fn a_read_is_one_snapshot() {
+        let db = Arc::new(Db::scratch());
+        let a = acct(&db);
+        let (txs, outputs) = db
+            .read(|c| {
+                let txs = txs_in(c, a.id)?.len();
+                let writer = db.clone();
+                std::thread::spawn(move || {
+                    writer
+                        .write(|tx| {
+                            let w = ScanWriter::new(tx);
+                            let t = w.tx_row(a.id, &new_tx(1, 10))?;
+                            w.add_output(a.id, t, &new_output(1, 100, 5, 10))?;
+                            Ok(())
+                        })
+                        .unwrap()
+                })
+                .join()
+                .unwrap();
+                Ok((txs, outputs_in(c, a.id)?.len()))
+            })
+            .unwrap();
+        assert_eq!((txs, outputs), (0, 0), "the commit in between isn't half seen");
+        let h = db.holdings(a.id).unwrap();
+        assert_eq!((h.txs.len(), h.outputs.len()), (1, 1));
+        let (h, _) = db.holdings_and_proofs(a.id).unwrap();
+        assert_eq!(h.outputs[0].tx, h.txs[0].id);
+    }
+
+    /// Read connections refuse to write, and wait their turn when all are out.
+    #[test]
+    fn readers_are_read_only_and_shared() {
+        let db = Arc::new(Db::scratch());
+        let a = acct(&db);
+        let wrote = db.read(|c| Ok(c.execute("UPDATE accounts SET access_time = 0", [])?));
+        assert!(wrote.is_err(), "query_only");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        assert_eq!(db.account(&addr("A")).unwrap().unwrap().id, a.id);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(lock(&db.readers).len(), 2, "every reader given back");
     }
 }

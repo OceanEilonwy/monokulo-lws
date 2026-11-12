@@ -885,6 +885,8 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1141,6 +1143,7 @@ dependencies = [
  "clap",
  "curve25519-dalek",
  "hex",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "lws-api",

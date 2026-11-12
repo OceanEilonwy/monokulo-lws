@@ -3,7 +3,8 @@
 //! token buckets, and a global bucket for new accounts and import requests.
 //!
 //! A client is an IPv4 address or an IPv6 /64, since one IPv6 host usually
-//! holds a whole /64.
+//! holds a whole /64. Since one site usually holds a whole /48, each IPv6
+//! /48 has buckets of its own too, and a request must pass both.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -125,11 +126,19 @@ fn parse_entry(entry: &str) -> Option<IpAddr> {
 /// The key a client's buckets are kept under: the address, or its /64.
 pub fn client_key(ip: IpAddr) -> IpAddr {
     match canonical(ip) {
-        IpAddr::V6(v6) => {
-            let masked = u128::from(v6) & (u128::MAX << 64);
-            IpAddr::V6(Ipv6Addr::from(masked))
-        }
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
         v4 => v4,
+    }
+}
+
+/// The key of a client's wider network, for the second tier of buckets: an
+/// IPv6 address's /48 (a site's usual allocation, so one holder of a /48
+/// can't spend 65,536 /64 buckets). An IPv4 address has none: its own
+/// bucket is already as narrow as an address gets.
+pub fn network_key(ip: IpAddr) -> Option<IpAddr> {
+    match canonical(ip) {
+        IpAddr::V6(v6) => Some(IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 80)))),
+        IpAddr::V4(_) => None,
     }
 }
 
@@ -140,27 +149,141 @@ struct Bucket {
     at: Instant,
 }
 
-/// Per-client buckets of one kind. `per_minute` 0 turns it off.
-pub struct RateLimiter {
+/// Buckets kept per tier at most. Past it the least recently used tenth go
+/// (a bucket that is gone is a full one, so eviction can only be generous,
+/// and an attacker who forces it needs this many /64s or /48s at once).
+pub const MAX_BUCKETS: usize = 200_000;
+/// Below this many buckets a tier is never swept.
+const SWEEP_FLOOR: usize = 1_024;
+
+/// One tier's rate and how it keys a client.
+struct Tier {
     per_minute: u32,
     burst: u32,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    key: fn(IpAddr) -> Option<IpAddr>,
 }
 
-/// More clients than this and idle buckets are swept before a new one is made.
-const SWEEP_AT: usize = 100_000;
+impl Tier {
+    fn enabled(&self) -> bool {
+        self.per_minute > 0
+    }
+
+    fn rate(&self) -> f64 {
+        f64::from(self.per_minute) / 60.0
+    }
+
+    fn key(&self, ip: IpAddr) -> Option<IpAddr> {
+        if self.enabled() { (self.key)(ip) } else { None }
+    }
+}
+
+/// One tier's buckets. Sweeps are amortised: the map is swept of refilled
+/// buckets only once it has doubled since the last sweep (so each sweep is
+/// paid for by as many new buckets as it walks), and when it reaches its cap
+/// the least recently used tenth are dropped too. No `check` walks the map
+/// on every call.
+struct Buckets {
+    map: HashMap<IpAddr, Bucket>,
+    sweep_at: usize,
+    cap: usize,
+}
+
+impl Buckets {
+    fn new(cap: usize) -> Buckets {
+        Buckets {
+            map: HashMap::new(),
+            sweep_at: SWEEP_FLOOR.min(cap),
+            cap,
+        }
+    }
+
+    /// Makes room for one more bucket, if the map has reached a threshold.
+    fn make_room(&mut self, tier: &Tier, now: Instant) {
+        if self.map.len() < self.sweep_at {
+            return;
+        }
+        let rate = tier.rate();
+        let burst = f64::from(tier.burst);
+        // A bucket that has refilled is the same as no bucket.
+        self.map
+            .retain(|_, b| b.tokens + now.saturating_duration_since(b.at).as_secs_f64() * rate < burst);
+        if self.map.len() >= self.cap {
+            // Still full of live buckets: drop the least recently used tenth.
+            let drop = (self.cap / 10).max(1);
+            let mut ages: Vec<Instant> = self.map.values().map(|b| b.at).collect();
+            let (_, cutoff, _) = ages.select_nth_unstable(drop - 1);
+            let cutoff = *cutoff;
+            let mut dropped = 0;
+            self.map.retain(|_, b| {
+                if dropped < drop && b.at <= cutoff {
+                    dropped += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            tracing::warn!(
+                "the rate limiter is full ({} clients): dropped the {dropped} idlest",
+                self.cap
+            );
+        }
+        self.sweep_at = (self.map.len() * 2).clamp(SWEEP_FLOOR.min(self.cap), self.cap);
+    }
+
+    /// The bucket for `key`, refilled to `now`.
+    fn refill(&mut self, tier: &Tier, key: IpAddr, now: Instant) -> &mut Bucket {
+        if !self.map.contains_key(&key) {
+            self.make_room(tier, now);
+        }
+        let burst = f64::from(tier.burst);
+        let bucket = self.map.entry(key).or_insert(Bucket { tokens: burst, at: now });
+        let elapsed = now.saturating_duration_since(bucket.at).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * tier.rate()).min(burst);
+        bucket.at = now;
+        bucket
+    }
+}
+
+/// Per-client buckets of one kind, in two tiers: per client (an IPv4
+/// address or IPv6 /64) and per IPv6 /48. A request takes a token from
+/// both or from neither. A tier with `per_minute` 0 is off.
+pub struct RateLimiter {
+    tiers: [Tier; 2],
+    buckets: Mutex<[Buckets; 2]>,
+}
 
 impl RateLimiter {
+    /// One tier only: per client.
+    #[cfg(test)]
     pub fn new(per_minute: u32, burst: u32) -> RateLimiter {
+        RateLimiter::tiered(per_minute, burst, 0, 0)
+    }
+
+    /// Per client and per IPv6 /48.
+    pub fn tiered(per_minute: u32, burst: u32, per_48_minute: u32, burst_48: u32) -> RateLimiter {
+        RateLimiter::with_cap(per_minute, burst, per_48_minute, burst_48, MAX_BUCKETS)
+    }
+
+    fn with_cap(per_minute: u32, burst: u32, per_48_minute: u32, burst_48: u32, cap: usize) -> RateLimiter {
         RateLimiter {
-            per_minute,
-            burst: burst.max(1),
-            buckets: Mutex::new(HashMap::new()),
+            tiers: [
+                Tier {
+                    per_minute,
+                    burst: burst.max(1),
+                    key: |ip| Some(client_key(ip)),
+                },
+                Tier {
+                    per_minute: per_48_minute,
+                    burst: burst_48.max(1),
+                    key: network_key,
+                },
+            ],
+            buckets: Mutex::new([Buckets::new(cap), Buckets::new(cap)]),
         }
     }
 
     pub fn enabled(&self) -> bool {
-        self.per_minute > 0
+        self.tiers.iter().any(Tier::enabled)
     }
 
     /// Takes a token for `ip`, or says how long until there is one.
@@ -172,25 +295,35 @@ impl RateLimiter {
         if !self.enabled() {
             return Ok(());
         }
-        let rate = f64::from(self.per_minute) / 60.0;
-        let burst = f64::from(self.burst);
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        if buckets.len() >= SWEEP_AT {
-            // A bucket that has refilled is the same as no bucket.
-            buckets.retain(|_, b| b.tokens + now.saturating_duration_since(b.at).as_secs_f64() * rate < burst);
+        // First see whether every tier has a token, then take them: a
+        // request refused by one tier costs nothing in the other.
+        let mut wait: Option<Duration> = None;
+        for (tier, buckets) in self.tiers.iter().zip(buckets.iter_mut()) {
+            let Some(key) = tier.key(ip) else { continue };
+            let bucket = buckets.refill(tier, key, now);
+            if bucket.tokens < 1.0 {
+                let w = Duration::from_secs_f64(((1.0 - bucket.tokens) / tier.rate()).max(1.0));
+                wait = Some(wait.map_or(w, |o| o.max(w)));
+            }
         }
-        let bucket = buckets
-            .entry(client_key(ip))
-            .or_insert(Bucket { tokens: burst, at: now });
-        let elapsed = now.saturating_duration_since(bucket.at).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * rate).min(burst);
-        bucket.at = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            Ok(())
-        } else {
-            Err(Duration::from_secs_f64(((1.0 - bucket.tokens) / rate).max(1.0)))
+        if let Some(wait) = wait {
+            return Err(wait);
         }
+        for (tier, buckets) in self.tiers.iter().zip(buckets.iter_mut()) {
+            if let Some(key) = tier.key(ip)
+                && let Some(bucket) = buckets.map.get_mut(&key)
+            {
+                bucket.tokens -= 1.0;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> [usize; 2] {
+        let b = self.buckets.lock().unwrap();
+        [b[0].map.len(), b[1].map.len()]
     }
 }
 
@@ -233,6 +366,9 @@ impl GlobalLimiter {
     }
 }
 
+/// What a /48 may do by default against what one /64 may: four /64s' worth.
+pub const PER_48_FACTOR: u32 = 4;
+
 /// Per-client limits on one listener.
 pub struct Limits {
     pub client_ip: ClientIpConfig,
@@ -247,6 +383,8 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// The /48 tiers at their defaults, `PER_48_FACTOR` times the /64's.
+    #[cfg(test)]
     pub fn new(
         client_ip: ClientIpConfig,
         per_minute: u32,
@@ -254,11 +392,36 @@ impl Limits {
         creations_per_hour: u32,
         max_pending_requests: u64,
     ) -> Limits {
+        Limits::with_per_48(
+            client_ip,
+            [per_minute, per_minute.saturating_mul(PER_48_FACTOR)],
+            [strict_per_minute, strict_per_minute.saturating_mul(PER_48_FACTOR)],
+            creations_per_hour,
+            max_pending_requests,
+        )
+    }
+
+    /// `general` and `strict` are a minute's requests per client and per
+    /// IPv6 /48.
+    pub fn with_per_48(
+        client_ip: ClientIpConfig,
+        general: [u32; 2],
+        strict: [u32; 2],
+        creations_per_hour: u32,
+        max_pending_requests: u64,
+    ) -> Limits {
+        let [per_minute, per_48_minute] = general;
+        let [strict_per_minute, strict_per_48_minute] = strict;
         Limits {
             client_ip,
             // A burst of a minute's worth, at least a few.
-            general: RateLimiter::new(per_minute, per_minute.max(10)),
-            strict: RateLimiter::new(strict_per_minute, strict_per_minute.clamp(1, 10)),
+            general: RateLimiter::tiered(per_minute, per_minute.max(10), per_48_minute, per_48_minute.max(10)),
+            strict: RateLimiter::tiered(
+                strict_per_minute,
+                strict_per_minute.clamp(1, 10),
+                strict_per_48_minute,
+                strict_per_48_minute.clamp(1, 10 * PER_48_FACTOR),
+            ),
             creation: GlobalLimiter::new(creations_per_hour),
             max_pending_requests,
         }
@@ -372,6 +535,60 @@ mod tests {
         assert!(r.check_at("2001:db8:1:2::1".parse().unwrap(), t).is_ok());
         assert!(r.check_at("2001:db8:1:2:ffff::9".parse().unwrap(), t).is_err());
         assert!(r.check_at("2001:db8:1:3::1".parse().unwrap(), t).is_ok());
+    }
+
+    #[test]
+    fn an_ipv6_slash_48_has_its_own_bucket() {
+        // One a minute per /64, two per /48.
+        let r = RateLimiter::tiered(60, 1, 60, 2);
+        let t = Instant::now();
+        assert!(r.check_at("2001:db8:1:1::1".parse().unwrap(), t).is_ok());
+        assert!(r.check_at("2001:db8:1:2::1".parse().unwrap(), t).is_ok());
+        let wait = r.check_at("2001:db8:1:3::1".parse().unwrap(), t).unwrap_err();
+        assert!(wait >= Duration::from_secs(1));
+        // Another /48 is not held back.
+        assert!(r.check_at("2001:db8:2:1::1".parse().unwrap(), t).is_ok());
+        // IPv4 has no /48 tier: only its own bucket counts.
+        assert!(r.check_at("198.51.100.1".parse().unwrap(), t).is_ok());
+        assert!(r.check_at("198.51.100.2".parse().unwrap(), t).is_ok());
+        assert!(r.check_at("198.51.100.3".parse().unwrap(), t).is_ok());
+    }
+
+    #[test]
+    fn a_refusal_by_one_tier_costs_nothing_in_the_other() {
+        let r = RateLimiter::tiered(60, 1, 60, 3);
+        let t = Instant::now();
+        let a: IpAddr = "2001:db8:1:1::1".parse().unwrap();
+        assert!(r.check_at(a, t).is_ok());
+        // Refused by its /64 bucket, several times: the /48 keeps its tokens.
+        for _ in 0..5 {
+            assert!(r.check_at(a, t).is_err());
+        }
+        assert!(r.check_at("2001:db8:1:2::1".parse().unwrap(), t).is_ok());
+        assert!(r.check_at("2001:db8:1:3::1".parse().unwrap(), t).is_ok());
+        assert!(r.check_at("2001:db8:1:4::1".parse().unwrap(), t).is_err());
+    }
+
+    #[test]
+    fn the_bucket_map_has_a_hard_cap() {
+        let r = RateLimiter::with_cap(1, 1, 0, 0, 2_000);
+        let t = Instant::now();
+        let v4 = |i: u32| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+        // Every bucket is still refilling (a token takes a minute), so the
+        // sweep of refilled buckets can't help; the cap holds anyway.
+        for i in 0..10_000u32 {
+            assert!(r.check_at(v4(i), t + Duration::from_millis(u64::from(i))).is_ok());
+            assert!(r.len()[0] <= 2_000);
+        }
+        // The newest client's bucket survived the evictions.
+        assert!(r.check_at(v4(9_999), t + Duration::from_millis(10_000)).is_err());
+        // Refilled buckets are swept once the map has grown.
+        let r = RateLimiter::with_cap(60_000, 1, 0, 0, 100_000);
+        for i in 0..5_000u32 {
+            // Two milliseconds refill a bucket at 1,000 a second.
+            assert!(r.check_at(v4(i), t + Duration::from_millis(u64::from(i) * 2)).is_ok());
+        }
+        assert!(r.len()[0] < 2_100, "{:?}", r.len());
     }
 
     #[test]

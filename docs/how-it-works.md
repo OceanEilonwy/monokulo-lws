@@ -21,15 +21,34 @@
   height says where it is.
 - Candidate spends: every RingCT input's ring, resolved to global indices,
   looked up once per ring member in one map of every account's outputs.
-- 200 block hashes are kept; a batch whose first block doesn't follow the
-  last kept one, or (once caught up) a top block whose hash isn't the one
-  kept for that height, means a reorg: outputs, candidate spends and
-  transactions from the fork on are dropped for every account, accounts
-  past it move back to it, what the pool held is forgotten and looked at
-  again, and the new blocks are scanned with the node's global indices.
-- One SQLite transaction per batch: outputs, spends, block hashes and scan
-  heights land together or not at all, so a kill mid-batch leaves every
-  account at a height it really scanned to. A batch writes only for the
+- 10,000 block hashes are kept (catch-up lanes keep theirs too once within
+  that of the tip); a batch whose blocks don't follow, or aren't, the ones
+  kept, or (once caught up) a top block whose hash isn't the one kept for
+  that height, means a reorg. The fork is found by bisecting the kept
+  hashes, and outputs, candidate spends and transactions from it on are
+  dropped for every account, accounts past it move back to it (catch-up
+  accounts too), what the pool held is forgotten and looked at again, and
+  the new blocks are scanned with the node's global indices. A batch
+  fetched before a reorg was unwound is not written. Besides the last
+  10,000, every 1,000th block's hash is kept for good (a checkpoint, by
+  whichever lane scanned it, and checked by catch-up lanes far below the
+  tip): a reorg deeper than the last 10,000 is bracketed by bisecting them
+  and unwound from just above the highest checkpoint still on the node's
+  chain, by itself. A reorg deeper than every checkpoint too (or a node on
+  another chain) stops scanning with an error in the log and
+  `/daemon_status`, rewinding nothing, and marks every account there is to
+  be rescanned; the API goes on serving. Rescan every active account
+  (admin `rescan`) from below the lowest checkpoint and scanning resumes
+  by itself once none is left (a hidden or inactive account still marked
+  then starts again from the lowest height it held anything at). Reorgs that keep ending at the same fork with nothing
+  scanned between (a node whose blocks and headers disagree) are retried
+  after a wait, from a second doubling to a minute, logged at warn.
+- A batch is written in chunks of about 50 ms, each one SQLite transaction
+  with its own reorg checks: a chunk's outputs, spends, block hashes and
+  scan heights land together or not at all, so a kill mid-batch leaves
+  every account at a height it really scanned to, and a client's write
+  waits for the writer at most about a chunk (writes take it in turn,
+  first come, first served). A batch writes only for the
   accounts still where it was planned from: one rescanned (admin `rescan`,
   `/import_wallet_request`), rewound by a reorg or hidden while its blocks
   were fetched is left for the next batch, so no block is lost or written
@@ -46,7 +65,10 @@
 - Ring members for `/get_random_outs` are drawn from the RingCT output
   distribution with wallet2's gamma over age, fetched with `get_outs`, and
   kept only if unlocked.
-- Storage is one SQLite file in WAL mode.
+- Storage is one SQLite file in WAL mode: one writer connection, and a
+  few read-only connections the API reads through, so reads never wait
+  for the scanner's batch. Every database call from async code runs on
+  tokio's blocking threads.
 
 Cost on the GPU is accounts × transaction keys derivations: on an RX 6800
 XT about 2.6 million a second, so the replay of 2,000 mainnet blocks

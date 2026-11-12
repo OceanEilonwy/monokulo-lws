@@ -111,8 +111,8 @@ fetching back to 2019 and every other account sees no new block until it
 has caught up. The design is lanes:
 
 - **The live lane**: the keyring of every caught-up account. Follows the
-  tip block by block, looks at the mempool, keeps the 200 block hashes and
-  handles reorgs. Its batches are small (about 57 keys × accounts a block),
+  tip block by block, looks at the mempool, keeps the last 10,000 block
+  hashes and handles reorgs. Its batches are small (about 57 keys × accounts a block),
   so it is never starved.
 - **Catch-up lanes**: each one fetches from the lowest start height of the
   accounts queued for it, with its own keyring of only those accounts. An
@@ -120,9 +120,29 @@ has caught up. The design is lanes:
   lane's keyring when the cursor passes it (`follow`); one below the cursor
   waits for the next run (`wait`). When a lane's cursor reaches the live
   lane's height, its accounts move into the live keyring and the lane ends;
-  if anything is queued, a new run starts. Catch-up lanes are below the
-  reorg window by construction until they merge, so they don't check
-  hashes.
+  if anything is queued, a new run starts. A catch-up lane writes a batch
+  only if it follows the hashes kept and no reorg was unwound while it was
+  fetched; within 10,000 blocks of the tip it keeps its blocks' hashes, so
+  the live lane can check what it merges, and blocks that don't follow the
+  kept hashes make the live lane look for a reorg, accounts or not.
+  Every lane also keeps every 1,000th block's hash for good (`checkpoints`,
+  about 150 KB for all of mainnet) and checks its blocks against those
+  below the last 10,000. A reorg deeper than the last 10,000 hashes
+  (`find_fork`: the lowest kept hash isn't the node's) is bracketed by
+  bisecting the checkpoints below them, a dozen header requests, and
+  unwound like any other from just above the highest one still on the
+  node's chain: up to 1,000 blocks more than the real fork, as no other
+  hash of the orphaned chain is known there, so nothing orphaned is left
+  for any account, catch-up accounts already past the fork included. Every
+  write checks the reorg generation in its own transaction, so a catch-up
+  lane's batch fetched before the rewind is never written, and a lane that
+  merges later brings in only what it scanned after it. Only when even the
+  lowest checkpoint isn't the node's does scanning stop (`halted_below`),
+  with every account there is marked in `rescan_due`; an admin `rescan`
+  from below the lowest checkpoint clears an account's mark, and scanning
+  resumes once no active account is marked, dropping everything from that
+  height on (and wiping, back to the lowest height it held, a hidden or
+  inactive account still marked).
 - **Shared**: one daemon connection, the live lane's requests first. One
   GPU device, but an *arena* per lane. Today `fob-scanner` keeps one device
   and one arena (the 39 MB state buffer, the output buffer, a command buffer
@@ -230,9 +250,19 @@ the monero-oxide fan-out) stays Fob's.
   per transaction and account, and an account whose block is read whole is
   not also scanned per transaction. Each found output's commitment is taken
   from the transaction's RingCT base (`outPk`; `G + amount·H` for a miner
-  output) and stored with it, as is the fee. A batch is one SQLite
-  transaction and writes only for the accounts still at the height it was
-  planned from, so an admin `rescan`, an import, a reorg's rewind or a
+  output) and stored with it, as is the fee. A batch is scanned first (the
+  prefilter, then monero-oxide on what it flags), with no hold on the
+  database's writer, and then written in chunks: each chunk is one SQLite
+  transaction of as many blocks as fit in 50 ms (one at least), holding
+  only that chunk's checks (no reorg unwound since the fetch, its blocks
+  follow the hashes kept) and inserts, and moving its accounts' scan
+  heights to its end. The writer is taken first come, first served, so a
+  client's write (a new account, a request, subaddresses, an import, a
+  rescan) waits at most about one chunk, not a batch: a catch-up batch of
+  1,000 busy blocks for 1,000 accounts held the writer for about 1.7 s in
+  one transaction on a Ryzen 5950X, which a router would make well over
+  ten (`correctness::measure_write_hold`). It writes only for the accounts still at
+  the height it was planned from (or where its earlier chunks left them), so an admin `rescan`, an import, a reorg's rewind or a
   status change made while the batch was being fetched is never undone by
   it. The pool's scan finds candidate spends as well as outputs (one map of
   the live accounts' outputs), is redone whenever the live lane's accounts

@@ -3,7 +3,8 @@
 //! Every request goes through [`guard`]: the client address is found
 //! (`limits::ClientIpConfig`), the per-client rate limits are applied, the
 //! request gets a time limit, and the response gets security headers.
-//! Bodies are read by [`ApiJson`], with a size limit per endpoint and errors
+//! Bodies are read by [`ApiBody`] into a buffer that is wiped once parsed,
+//! with a size limit per endpoint, and parsed by [`ApiJson`], with errors
 //! that never echo what was sent.
 
 pub mod admin;
@@ -17,21 +18,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    Router,
-    body::Bytes,
+    RequestExt, Router,
+    body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State},
     http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{MethodRouter, get, post},
 };
+use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use zeroize::Zeroizing;
 
 use crate::daemon::{Daemon, FeeEstimate, Info};
-use crate::db::Db;
+use crate::db::AsyncDb;
 use crate::decoys::Picker;
 use crate::error::{Error, bad};
 use crate::limits::{ClientIp, Limits};
@@ -64,7 +67,8 @@ pub struct Config {
 
 /// What every handler reaches.
 pub struct App {
-    pub db: Arc<Db>,
+    /// The store, reached only off the tokio workers (`AsyncDb::call`).
+    pub db: AsyncDb,
     pub daemon: Daemon,
     pub scanner: Arc<Scanner>,
     pub config: Config,
@@ -132,35 +136,120 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// `axum::Json`, but a rejection says only where the JSON went wrong (line
-/// and column), never what it held: serde's messages quote values, and the
+/// A JSON request body, read into a buffer that is wiped when dropped.
+///
+/// Bodies carry private view keys and admin keys as hex text. axum's own
+/// `Bytes` extractor would leave that text in a buffer that is freed without
+/// being wiped (and, for a body that came in several frames, in one more
+/// buffer it concatenates them into). Here each frame hyper hands over is
+/// copied into a [`Zeroizing`] buffer and dropped at once, and the buffer
+/// grows only by moving into a bigger wiped one, so every copy made here is
+/// wiped. What hyper (and rustls, with TLS) keep in their own read buffers
+/// until they reuse them is out of reach; see `docs/security.md`, "Memory".
+///
+/// The per-endpoint body limit (`DefaultBodyLimit`) applies as with
+/// `Bytes`: past it, the read stops and the answer is 413.
+pub struct ApiBody(pub Zeroizing<Vec<u8>>);
+
+impl<S: Send + Sync> FromRequest<S> for ApiBody {
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, ApiError> {
+        if !is_json(req.headers()) {
+            return Err(Error::NotJson.into());
+        }
+        let hint = req
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        read_body(req.into_limited_body(), hint)
+            .await
+            .map(ApiBody)
+            .map_err(ApiError)
+    }
+}
+
+/// How much of the buffer is set aside before the body arrives, at most:
+/// enough for every key-carrying wallet request in one allocation, without
+/// letting a `Content-Length` (which may lie) reserve more.
+const PRESIZE_CAP: usize = SMALL_BODY;
+
+async fn read_body(mut body: Body, hint: usize) -> crate::error::Result<Zeroizing<Vec<u8>>> {
+    let mut buf = Zeroizing::new(Vec::with_capacity(hint.min(PRESIZE_CAP)));
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| {
+            if is_length_limit(e) {
+                Error::TooLarge
+            } else {
+                bad("the request body couldn't be read")
+            }
+        })?;
+        // The frame (hyper's `Bytes`) is dropped as soon as it is copied.
+        if let Ok(data) = frame.into_data() {
+            append(&mut buf, &data);
+        }
+    }
+    Ok(buf)
+}
+
+/// `buf.extend_from_slice(data)`, but a reallocation moves into a new wiped
+/// buffer and wipes the old one, where `Vec`'s own growth would free it with
+/// the bytes still in it.
+fn append(buf: &mut Zeroizing<Vec<u8>>, data: &[u8]) {
+    let needed = buf.len().saturating_add(data.len());
+    if needed > buf.capacity() {
+        let mut grown = Zeroizing::new(Vec::with_capacity(needed.max(buf.capacity().saturating_mul(2))));
+        grown.extend_from_slice(buf);
+        // The old buffer is dropped here, and wiped.
+        *buf = grown;
+    }
+    buf.extend_from_slice(data);
+}
+
+/// Whether a body error is the body limit's. `into_limited_body` wraps
+/// `http_body_util::Limited` in axum's `Body`, which boxes its error in an
+/// `axum::Error` (twice over, as axum's own `Bytes` extractor unwraps it).
+fn is_length_limit(e: axum::Error) -> bool {
+    let mut err: axum::BoxError = e.into_inner();
+    for _ in 0..3 {
+        if err.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        match err.downcast::<axum::Error>() {
+            Ok(inner) => err = inner.into_inner(),
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// `axum::Json`, but the body is read by [`ApiBody`] (and so wiped once
+/// parsed), and a rejection says only where the JSON went wrong (line and
+/// column), never what it held: serde's messages quote values, and the
 /// values here are view keys and addresses.
+///
+/// serde_json parses from the wiped buffer and lends a string without
+/// escapes to the field's type, so a key's hex goes from the body straight
+/// into its `PrivateViewKey`, with no `String` in between. A string with
+/// escapes (`0...`, which no client needs for hex) is first unescaped
+/// into serde_json's internal scratch buffer, which is freed without being
+/// wiped; the owned copy the key type is then handed is wiped.
 pub struct ApiJson<T>(pub T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for ApiJson<T> {
     type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, ApiError> {
-        if !is_json(req.headers()) {
-            return Err(Error::NotJson.into());
-        }
-        let bytes = Bytes::from_request(req, state).await.map_err(|r| {
-            if r.status() == StatusCode::PAYLOAD_TOO_LARGE {
-                Error::TooLarge
-            } else {
-                bad("the request body couldn't be read")
-            }
-        })?;
-        parse_json(&bytes).map(ApiJson).map_err(ApiError)
+        let body = ApiBody::from_request(req, state).await?;
+        parse_json(&body.0).map(ApiJson).map_err(ApiError)
+        // `body` is wiped here, whether the parse succeeded or not.
     }
 }
 
 pub fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> crate::error::Result<T> {
     serde_json::from_slice(bytes).map_err(|e| json_error(&e))
-}
-
-pub fn parse_value<T: DeserializeOwned>(value: serde_json::Value) -> crate::error::Result<T> {
-    serde_json::from_value(value).map_err(|e| json_error(&e))
 }
 
 fn json_error(e: &serde_json::Error) -> Error {

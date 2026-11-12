@@ -12,8 +12,8 @@
 # in /etc/monokulo-lws/secrets/, root's alone (the server keeps only its
 # hash). A bad setting never stops a running server: a reload (a save in
 # LuCI, `uci commit`) whose settings this script refuses leaves it running
-# on its earlier ones, and the reason is in /tmp/monokulo-lws.check for
-# LuCI to show. What the server itself refuses is in its log (logread).
+# on its earlier ones, and the reason is in /var/run/monokulo-lws/check
+# for LuCI to show. What the server itself refuses is in its log (logread).
 
 START=99
 STOP=10
@@ -29,8 +29,10 @@ SECRETS_DIR=/etc/monokulo-lws/secrets
 KEY_FILE=$SECRETS_DIR/MONOKULO_LWS_ADMIN_KEY
 DEFAULT_DATA_DIR=/srv/monokulo-lws
 DB_FILE=lws.sqlite
+# Root's alone, in memory (rpcd.uc keeps its request bodies here too).
+RUN_DIR=/var/run/monokulo-lws
 # What the last start refused, for LuCI.
-CHECK_FILE=/tmp/monokulo-lws.check
+CHECK_FILE=$RUN_DIR/check
 # Which build the package installed (its Makefile writes it).
 VERSION_FILE=/usr/share/monokulo-lws/version
 
@@ -74,7 +76,12 @@ log() {
 # refuse <why>: logged, and kept for LuCI.
 refuse() {
 	log "$1"
-	printf '%s\n' "$1" >"$CHECK_FILE"
+	run_dir && printf '%s\n' "$1" >"$CHECK_FILE"
+}
+
+# run_dir: RUN_DIR made, root's alone.
+run_dir() {
+	mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
 }
 
 # Whether procd runs the server now. Not procd_running, which would reset
@@ -99,27 +106,78 @@ listen_addr() {
 	echo "$addr"
 }
 
-# Use the data folder only if it is the server's own: new, empty, or
-# already owned by its user. Never take over some other directory. A
-# refusal says why on stdout.
-prepare_data_dir() {
-	local dir="$1"
-	case "$dir" in
-	/tmp/* | /var/*) echo "the data folder $dir is in memory and would be lost on reboot: choose one on storage in $PAGE"; return 1 ;;
-	/*) ;;
-	*) echo "the data folder must be an absolute path, not '$dir'"; return 1 ;;
+# dir_refusal <dir>: why the folder can't be the data folder, if it is a
+# system folder or in one, a top-level folder, or in memory; fails if it
+# can be. Root makes the data folder the server's user's, so it must never
+# be one the system or root relies on. LuCI's page checks the same.
+dir_refusal() {
+	case "$1" in
+	/tmp | /tmp/* | /var | /var/*)
+		echo "the data folder $1 is in memory and would be lost on reboot: choose one on storage in $PAGE"
+		;;
+	/ | /etc | /etc/* | /root | /root/* | /usr | /usr/* | /bin | /bin/* | /sbin | /sbin/* | \
+		/lib | /lib/* | /lib64 | /lib64/* | /proc | /proc/* | /sys | /sys/* | /dev | /dev/* | \
+		/www | /www/* | /rom | /rom/* | /overlay | /overlay/*)
+		echo "not using the data folder $1: it is a system folder or in one; choose a folder of its own, such as $DEFAULT_DATA_DIR, in $PAGE"
+		;;
+	/*/*) return 1 ;;
+	*)
+		echo "not using the data folder $1: choose a folder of its own inside another, such as $DEFAULT_DATA_DIR, in $PAGE"
+		;;
 	esac
-	[ -e "$dir" ] || mkdir -p "$dir" || return 1
+}
+
+# Use the data folder only if it is the server's own: new, empty, or
+# already owned by its user, and not a system folder. Never take over some
+# other directory, and never reach, as root, into what the server's user
+# may change: only the folder itself is chowned, never what it holds (the
+# server's user makes its own files there). A refusal says why on stdout.
+prepare_data_dir() {
+	local dir real why
+	# One spelling: no trailing slash, no '.' or '..' parts, no '//', so the
+	# checks see the folder that is used.
+	dir=$(printf '%s' "$1" | sed 's:/*$::')
+	[ -n "$dir" ] || dir=/
+	case "$dir" in
+	/*) ;;
+	*) echo "the data folder must be an absolute path, not '$1'"; return 1 ;;
+	esac
+	case "$dir/" in
+	*//* | */./* | */../*) echo "the data folder must be a plain path, without '.', '..' or '//': not '$1'"; return 1 ;;
+	esac
+	why=$(dir_refusal "$dir") && { echo "$why"; return 1; }
+	[ -e "$dir" ] || [ -L "$dir" ] || mkdir -p "$dir" || return 1
+	if [ -L "$dir" ]; then
+		echo "not using the data folder $dir: it is a symbolic link; name the folder itself in $PAGE"
+		return 1
+	fi
 	if [ ! -d "$dir" ]; then
 		echo "the data folder $dir is not a folder: choose another in $PAGE"
 		return 1
 	fi
-	if [ "$(ls -ldn "$dir" | awk '{ print $3 }')" != "$(id -u "$RUN_AS")" ] && [ -n "$(ls -A "$dir")" ]; then
-		echo "not using the data folder $dir: it holds other files and isn't $NAME's own; choose a new or empty folder in $PAGE"
-		return 1
+	# A link higher up the path (/srv on a USB disk, say) is fine, as long
+	# as the folder it leads to passes the same checks.
+	real=$(readlink -f "$dir") || return 1
+	why=$(dir_refusal "$real") && { echo "$why (it is $real)"; return 1; }
+	if [ "$(ls -ldn "$dir" | awk '{ print $3 }')" != "$(id -u "$RUN_AS")" ]; then
+		if [ -n "$(ls -A "$dir")" ]; then
+			echo "not using the data folder $dir: it holds other files and isn't $NAME's own; choose a new or empty folder in $PAGE"
+			return 1
+		fi
+		chown -h "$RUN_AS:$RUN_AS" "$dir" || return 1
 	fi
-	chown -R "$RUN_AS:$RUN_AS" "$dir"
 	chmod 700 "$dir"
+}
+
+# give_file <file>: a file root put in the data folder (a TLS certificate
+# or key, as the page suggests) made the server's, so it can read it. Only
+# a plain file, not a link (symbolic or hard), and only if root's: never
+# hand over a file reached through something the server's user controls.
+give_file() {
+	[ -f "$1" ] && [ ! -L "$1" ] || return 0
+	# ls -ln: the mode, the number of links, the owner's uid.
+	[ "$(ls -ln "$1" | awk '{ print $2, $3 }')" = "1 0" ] || return 0
+	chown -h "$RUN_AS:$RUN_AS" "$1"
 }
 
 # The admin key for the LuCI page, made with the database (the server
@@ -131,8 +189,18 @@ ensure_admin_key() {
 	mkdir -p "$SECRETS_DIR" || return 1
 	chown root:root "${SECRETS_DIR%/*}" "$SECRETS_DIR"
 	chmod 700 "${SECRETS_DIR%/*}" "$SECRETS_DIR"
+	if [ -L "$db" ]; then
+		echo "not using the database $db: it is a symbolic link"
+		return 1
+	fi
 	if [ ! -s "$db" ] || [ ! -s "$KEY_FILE" ]; then
-		key=$("$BIN" admin create-key --db "$db" 2>/dev/null) || {
+		# Made as the server's user, who owns the data folder and so what
+		# the path leads to; only the printed key comes back to root. The
+		# pid file is never written: it keeps start-stop-daemon from
+		# refusing because the server itself runs (-x alone matches it).
+		run_dir || return 1
+		key=$(start-stop-daemon -S -c "$RUN_AS" -p "$RUN_DIR/create-key.pid" \
+			-x "$BIN" -- admin create-key --db "$db" 2>/dev/null) || {
 			echo "couldn't make an admin key in $db: logread -e $NAME says why"
 			return 1
 		}
@@ -180,7 +248,7 @@ append_options() {
 # succeeds; or sets REASON and fails. WAITING=1 marks a LAN address not
 # there yet, which isn't a refusal: the interface trigger starts it.
 prepare() {
-	local tls_cert tls_key
+	local tls_cert tls_key f
 	REASON=
 	WAITING=0
 	config_get PORT main port 8443
@@ -224,8 +292,10 @@ prepare() {
 	fi
 	REASON=$(prepare_data_dir "$DATA_DIR" 2>&1) || return 1
 	REASON=$(ensure_admin_key "$DB" 2>&1) || return 1
-	# The database the key was made with belongs to the server.
-	chown -R "$RUN_AS:$RUN_AS" "$DATA_DIR"
+	# TLS files root put in the data folder, for the server to read.
+	for f in "$tls_cert" "$tls_key"; do
+		[ -n "$f" ] && [ "${f%/*}" = "$DATA_DIR" ] && give_file "$f"
+	done
 
 	# The scanner's CPUs, as taskset takes them; a list this router can't
 	# honour is dropped. Its niceness, 0 to 19.
@@ -276,6 +346,8 @@ start_service() {
 	procd_set_param env RUST_LOG="$LOG_LEVEL"
 	procd_set_param user "$RUN_AS"
 	procd_set_param nice "$NICE"
+	# No core dumps: one would hold every account's private view key.
+	procd_set_param limits core="0"
 	# The build, kept with the instance so LuCI reports the one running,
 	# not only the one installed. A new build changes it, as new settings
 	# change the command line, so procd restarts the instance onto them.
@@ -316,6 +388,11 @@ admin_key() {
 	local data_dir i=0
 	config_load "$NAME"
 	config_get data_dir main data_dir "$DEFAULT_DATA_DIR"
+	if ! REASON=$(prepare_data_dir "$data_dir" 2>&1); then
+		log "$REASON"
+		echo "$REASON" >&2
+		return 1
+	fi
 	stop
 	while running_now && [ $i -lt 15 ]; do
 		sleep 1
@@ -328,6 +405,5 @@ admin_key() {
 		start
 		return 1
 	fi
-	chown -R "$RUN_AS:$RUN_AS" "$data_dir"
 	start
 }

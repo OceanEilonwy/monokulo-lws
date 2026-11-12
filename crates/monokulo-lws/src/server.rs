@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tower::ServiceExt;
 
-use crate::limits::Cidr;
+use crate::limits::{Cidr, client_key};
 
 /// Time a client has to send a request's headers, from the moment the
 /// connection is ready for one (so it bounds an idle keep-alive connection
@@ -39,8 +39,8 @@ pub struct ListenerConfig {
     pub tls: Option<tokio_rustls::TlsAcceptor>,
     /// Open connections at most; more wait in the kernel's backlog.
     pub max_connections: usize,
-    /// Open connections from one peer address at most, except from a
-    /// trusted proxy. 0 is no cap.
+    /// Open connections from one client (an IPv4 address or IPv6 /64) at
+    /// most, except from a trusted proxy. 0 is no cap.
     pub max_connections_per_ip: usize,
     pub trusted_proxies: Vec<Cidr>,
 }
@@ -70,7 +70,9 @@ pub fn tls_acceptor(cert: &Path, key: &Path) -> anyhow::Result<tokio_rustls::Tls
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
-/// Counts connections per peer address; a slot is given back when its
+/// Counts connections per client, keyed as the rate limiter keys them
+/// (`limits::client_key`: an IPv4 address or an IPv6 /64, so one host with a
+/// routed /64 can't take a slot per address); a slot is given back when its
 /// guard goes.
 #[derive(Clone, Default)]
 struct PerIp(Arc<Mutex<HashMap<IpAddr, usize>>>);
@@ -82,6 +84,7 @@ struct PerIpSlot {
 
 impl PerIp {
     fn take(&self, ip: IpAddr, max: usize) -> Option<PerIpSlot> {
+        let ip = client_key(ip);
         let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let n = map.entry(ip).or_insert(0);
         if *n >= max {
@@ -186,5 +189,20 @@ mod tests {
         assert!(per_ip.take("198.51.100.2".parse().unwrap(), 2).is_some());
         drop(a);
         assert!(per_ip.take(ip, 2).is_some());
+    }
+
+    #[test]
+    fn an_ipv6_slash_64_shares_one_set_of_slots() {
+        let per_ip = PerIp::default();
+        let _a = per_ip.take("2001:db8:1:2::1".parse().unwrap(), 2).unwrap();
+        let _b = per_ip.take("2001:db8:1:2::2".parse().unwrap(), 2).unwrap();
+        assert!(
+            per_ip.take("2001:db8:1:2:ffff::9".parse().unwrap(), 2).is_none(),
+            "another address in the same /64 is the same client"
+        );
+        assert!(per_ip.take("2001:db8:1:3::1".parse().unwrap(), 2).is_some());
+        // An IPv4-mapped address is its IPv4 address.
+        let _c = per_ip.take("198.51.100.7".parse().unwrap(), 1).unwrap();
+        assert!(per_ip.take("::ffff:198.51.100.7".parse().unwrap(), 1).is_none());
     }
 }

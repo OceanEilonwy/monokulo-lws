@@ -26,6 +26,7 @@ use crate::error::Error;
 use crate::rest::{App, wallet};
 use crate::scanner::{Batch, Ring, pool_block, record_batch, scan_pool_block, stand_in};
 use crate::testkit::*;
+use crate::types::{BlockHash, Height, TxHash};
 
 fn unwrap<T>(r: std::result::Result<Json<T>, crate::rest::ApiError>) -> T {
     match r {
@@ -60,14 +61,14 @@ async fn unspent(app: &Arc<App>, w: &Wallet) -> UnspentOuts {
 
 /// What each way of scanning writes for these accounts: (account, global
 /// index, out index, amount, height), sorted.
-fn outputs_of(db: &Db, accounts: &[Account]) -> Vec<(i64, u64, u16, u64, u64)> {
+fn outputs_of(db: &Db, accounts: &[Account]) -> Vec<(crate::types::AccountId, u64, u16, u64, Height)> {
     let mut all: Vec<_> = accounts
         .iter()
         .flat_map(|a| {
             db.outputs(a.id)
                 .unwrap()
                 .into_iter()
-                .map(move |o| (a.id, o.global_index, o.out_index, o.amount, o.height))
+                .map(move |o| (a.id, o.global_index.get(), o.out_index.get(), o.amount.0, o.height))
         })
         .collect();
     all.sort();
@@ -99,7 +100,7 @@ fn both_ways(wallets: &[&Wallet], start: u64, make: impl Fn() -> Vec<Made>) -> (
 }
 
 fn found(w: &Wallet, block: ScannableBlock) -> Vec<(u64, [u8; 32], u64)> {
-    let pair = crypto::view_pair(&w.spend_pub().compress().to_bytes(), &w.view.to_bytes()).unwrap();
+    let pair = crypto::view_pair(&w.spend_pub().compress().to_bytes(), &w.view_key()).unwrap();
     let mut scanner = OxideScanner::new(pair);
     let mut out: Vec<_> = scanner
         .scan(block)
@@ -165,6 +166,42 @@ fn a_stand_in_block_numbers_outputs_as_the_whole_block_does() {
     assert_eq!(outputs_of(&db, &accounts).len(), 5);
 }
 
+/// The mainnet fixture (monokulo-8ar's
+/// prototypes/fixtures/mainnet-3797000-2000.bin, outside this repository)
+/// if it is at `path`. Missing, it fails the test when `required`
+/// (LWS_REQUIRE_FIXTURE=1, as CI sets it, so the test can't pass without
+/// running); otherwise the test is skipped, and says so.
+fn find_fixture(path: std::path::PathBuf, required: bool) -> Option<std::path::PathBuf> {
+    if path.exists() {
+        return Some(path);
+    }
+    assert!(
+        !required,
+        "no fixture at {} and LWS_REQUIRE_FIXTURE=1: set LWS_FIXTURE to monokulo-8ar's \
+         prototypes/fixtures/mainnet-3797000-2000.bin",
+        path.display()
+    );
+    eprintln!(
+        "SKIPPED: no fixture at {}, so the mainnet-shaped test did not run; set LWS_FIXTURE to monokulo-8ar's \
+         prototypes/fixtures/mainnet-3797000-2000.bin (LWS_REQUIRE_FIXTURE=1 makes a missing fixture fail)",
+        path.display()
+    );
+    None
+}
+
+#[test]
+#[should_panic(expected = "LWS_REQUIRE_FIXTURE=1")]
+fn a_missing_fixture_fails_when_it_is_required() {
+    find_fixture("/nonexistent/mainnet-3797000-2000.bin".into(), true);
+}
+
+#[test]
+fn a_missing_fixture_is_skipped_when_it_is_not_required() {
+    assert!(find_fixture("/nonexistent/mainnet-3797000-2000.bin".into(), false).is_none());
+    let here = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    assert_eq!(find_fixture(here.clone(), true), Some(here));
+}
+
 /// The fixture's first blocks, mainnet-shaped (about 57 transactions a
 /// block), with payments to `w` planted in some transactions: each planted
 /// output gets the transaction's own key and RingCT parts.
@@ -175,10 +212,8 @@ fn fixture_with_payments(w: &Wallet) -> Option<(Vec<Made>, Vec<u64>)> {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../monokulo-8ar/prototypes/fixtures/mainnet-3797000-2000.bin")
         });
-    if !path.exists() {
-        eprintln!("no fixture at {}: skipped", path.display());
-        return None;
-    }
+    let required = std::env::var("LWS_REQUIRE_FIXTURE").is_ok_and(|v| v == "1");
+    let path = find_fixture(path, required)?;
     let (blocks, firsts, _) = crate::scanner::fixture_blocks(&path).unwrap();
     let mut made = vec![];
     let mut expected = vec![];
@@ -240,7 +275,7 @@ fn stand_in_blocks_keep_global_indexes_on_mainnet_shaped_blocks() {
         .outputs(accounts[0].id)
         .unwrap()
         .iter()
-        .map(|o| o.global_index)
+        .map(|o| o.global_index.get())
         .collect();
     let mut got_sorted = got.clone();
     got_sorted.sort();
@@ -277,7 +312,11 @@ async fn the_served_commitment_is_the_chains_and_heads_the_rct_blob() {
     let payment = &txs.transactions[1];
     assert!(coinbase.coinbase && !payment.coinbase);
     let r = &payment.receives[0];
-    assert_eq!(r.global_index, 5_002, "after the miner's output and the stranger's");
+    assert_eq!(
+        r.global_index,
+        Amount(5_002),
+        "after the miner's output and the stranger's"
+    );
     assert_eq!(r.amount, Amount(7_000_000));
     let commitment = r.commitment.expect("served").0;
     assert_eq!(commitment, paid.commitment, "the transaction's outPk");
@@ -291,7 +330,7 @@ async fn the_served_commitment_is_the_chains_and_heads_the_rct_blob() {
     assert_eq!(opened.compress().to_bytes(), commitment, "mask·G + amount·H");
 
     let m = &coinbase.receives[0];
-    assert_eq!(m.global_index, 5_000);
+    assert_eq!(m.global_index, Amount(5_000));
     assert_eq!(m.amount, Amount(mined.amount));
     assert_eq!(m.rct.unwrap().0, *DScalar::ONE.as_bytes(), "a miner output's mask is 1");
     assert_eq!(
@@ -341,7 +380,7 @@ async fn the_served_commitment_is_the_chains_and_heads_the_rct_blob() {
     // The regular output's blob decrypts to its mask and amount.
     let o = outs.outputs.iter().find(|o| o.global_index == Amount(5_002)).unwrap();
     let blob = &o.rct.as_ref().unwrap().0;
-    let shared = crypto::shared_scalar(&w.view.to_bytes(), &o.tx_pub_key.0, o.index as u64).unwrap();
+    let shared = crypto::shared_scalar(&w.view_key(), &o.tx_pub_key.0, o.index as u64).unwrap();
     let s1: DScalar = Scalar::hash(shared.as_bytes()).into();
     let s2: DScalar = Scalar::hash(s1.as_bytes()).into();
     assert_eq!(
@@ -375,13 +414,13 @@ fn several_accounts_in_one_transaction_and_one_paid_twice() {
     assert_eq!(
         a_out
             .iter()
-            .map(|o| (o.out_index, o.global_index, o.amount))
+            .map(|o| (o.out_index.get(), o.global_index.get(), o.amount.0))
             .collect::<Vec<_>>(),
         vec![(0, 901, 10), (2, 903, 30)]
     );
     let a_txs = db.txs(accounts[0].id).unwrap();
     assert_eq!(a_txs.len(), 1, "one transaction row");
-    assert_eq!(a_txs[0].total_received, 40);
+    assert_eq!(a_txs[0].total_received, Amount(40));
     assert_eq!(db.outputs(accounts[1].id).unwrap().len(), 1);
     assert!(db.outputs(accounts[2].id).unwrap().is_empty());
 }
@@ -416,22 +455,24 @@ async fn subaddresses_through_additional_keys_and_the_lookahead() {
     let (db, accounts) = both_ways(&[&w], 100, make);
     let outs = db.outputs(accounts[0].id).unwrap();
     assert_eq!(
-        outs.iter().map(|o| (o.maj, o.min, o.global_index)).collect::<Vec<_>>(),
+        outs.iter()
+            .map(|o| (o.subaddress.major, o.subaddress.minor, o.global_index.get()))
+            .collect::<Vec<_>>(),
         vec![(0, 2, 51), (0, 0, 52)]
     );
     let (_, main) = tx_key(70);
     let r0 = tx_key(71).0;
     assert_eq!(
-        outs[0].tx_pub_key,
+        outs[0].tx_pub_key.0,
         (r0 * w.sub_spend(0, 2)).compress().to_bytes(),
         "the additional key it came by"
     );
     let r1 = tx_key(72).0;
     assert_eq!(
-        outs[1].tx_pub_key,
+        outs[1].tx_pub_key.0,
         (&r1 * ED25519_BASEPOINT_TABLE).compress().to_bytes()
     );
-    assert_ne!(outs[1].tx_pub_key, main.compress().to_bytes());
+    assert_ne!(outs[1].tx_pub_key.0, main.compress().to_bytes());
 
     // Registering (1, 5) and scanning again finds it.
     let db = Arc::new(db);
@@ -439,17 +480,19 @@ async fn subaddresses_through_additional_keys_and_the_lookahead() {
         accounts[0].id,
         &[lws_api::SubaddrRanges {
             key: 1,
-            value: vec![[5, 5]],
+            value: vec![mr(5, 5)],
         }],
         100,
     )
     .unwrap();
-    db.rescan(&[w.address()], 100).unwrap();
+    db.rescan(&[w.address()], Height::new(100)).unwrap();
     let account = db.account(&w.address()).unwrap().unwrap();
     write(&db, &[account], make(), 100, true, Some(&every_hit));
     let outs = db.outputs(accounts[0].id).unwrap();
     assert_eq!(
-        outs.iter().map(|o| (o.maj, o.min)).collect::<Vec<_>>(),
+        outs.iter()
+            .map(|o| (o.subaddress.major, o.subaddress.minor))
+            .collect::<Vec<_>>(),
         vec![(0, 2), (0, 0), (1, 5)]
     );
     let app = app(db, 200);
@@ -512,25 +555,25 @@ fn a_reorg_drops_what_the_orphaned_blocks_held_and_the_new_chain_is_scanned() {
     let accounts = vec![a.add(&db, 100), b.add(&db, 100)];
     write(&db, &accounts, pay_then_ring()(&a, &b), 100, true, None);
     assert_eq!(db.spends(accounts[0].id).unwrap().len(), 1);
-    assert!(db.block_hash(101).unwrap().is_some());
+    assert!(db.block_hash(Height::new(101)).unwrap().is_some());
 
     // Block 101 is orphaned: the spend goes, the outputs of 100 stay.
-    db.rewind(101).unwrap();
+    db.rewind(Height::new(101)).unwrap();
     assert!(db.spends(accounts[0].id).unwrap().is_empty());
     assert_eq!(db.txs(accounts[0].id).unwrap().len(), 1);
-    assert_eq!(db.txs(accounts[0].id).unwrap()[0].total_sent, 0);
-    assert!(db.block_hash(101).unwrap().is_none());
-    assert_eq!(db.account(&a.address()).unwrap().unwrap().scan_height, 101);
+    assert_eq!(db.txs(accounts[0].id).unwrap()[0].total_sent, Amount(0));
+    assert!(db.block_hash(Height::new(101)).unwrap().is_none());
+    assert_eq!(db.account(&a.address()).unwrap().unwrap().scan_height, Height::new(101));
 
     // Then 100 too: and the new 100 pays `a` at another index.
-    db.rewind(100).unwrap();
+    db.rewind(Height::new(100)).unwrap();
     assert!(db.outputs(accounts[0].id).unwrap().is_empty());
     assert!(db.txs(accounts[0].id).unwrap().is_empty());
     let accounts: Vec<Account> = [&a, &b]
         .iter()
         .map(|w| db.account(&w.address()).unwrap().unwrap())
         .collect();
-    assert_eq!(accounts[0].scan_height, 100);
+    assert_eq!(accounts[0].scan_height, Height::new(100));
     let (_, k) = tx_key(90);
     let other = Tx::new(k, vec![stranger(1), stranger(2), a.pay(&k, 0, 0, 2, 555)]);
     let new_100 = block(100, [9; 32], dull_miner(100), vec![other.build()], 1_000, 1);
@@ -538,15 +581,19 @@ fn a_reorg_drops_what_the_orphaned_blocks_held_and_the_new_chain_is_scanned() {
     write(&db, &accounts, vec![new_100], 100, true, None);
     let outs = db.outputs(accounts[0].id).unwrap();
     assert_eq!(
-        outs.iter().map(|o| (o.global_index, o.amount)).collect::<Vec<_>>(),
+        outs.iter()
+            .map(|o| (o.global_index.get(), o.amount.0))
+            .collect::<Vec<_>>(),
         vec![(1_003, 555)]
     );
     assert!(db.outputs(accounts[1].id).unwrap().is_empty());
-    assert_eq!(db.block_hash(100).unwrap(), Some(hash));
+    assert_eq!(db.block_hash(Height::new(100)).unwrap(), Some(BlockHash(hash)));
 }
 
+/// Every block's hash is kept while under `KEEP_HASHES` behind the tip (the
+/// pruning past it is `db::tests::set_block_keeps_only_the_last_hashes`).
 #[test]
-fn two_hundred_block_hashes_are_kept() {
+fn block_hashes_are_kept_behind_the_tip() {
     let w = Wallet::new(42);
     let db = Db::in_memory();
     let mut account = w.add(&db, 1);
@@ -564,10 +611,11 @@ fn two_hundred_block_hashes_are_kept() {
         account = db.account(&w.address()).unwrap().unwrap();
     }
     let kept = db.recent_blocks().unwrap();
-    assert_eq!(kept.first().unwrap().0, 250);
-    assert_eq!(kept.last().unwrap().0, 50);
-    assert_eq!(kept.len(), 201);
-    assert_eq!(account.scan_height, 251);
+    const { assert!(crate::scanner::KEEP_HASHES > 250) };
+    assert_eq!(kept.first().unwrap().0, Height::new(250));
+    assert_eq!(kept.last().unwrap().0, Height::new(1));
+    assert_eq!(kept.len(), 250);
+    assert_eq!(account.scan_height, Height::new(251));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -592,7 +640,10 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
     let outgoing_hash = [0xee; 32];
     let pool = pool_block(
         &last,
-        vec![(incoming_hash, incoming.build()), (outgoing_hash, outgoing.build())],
+        vec![
+            (TxHash(incoming_hash), incoming.build()),
+            (TxHash(outgoing_hash), outgoing.build()),
+        ],
     )
     .unwrap();
     let look = || {
@@ -601,7 +652,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
             let sw = ScanWriter::new(tx);
             let ring = Ring::get(
                 &mut slot,
-                &sw,
+                tx,
                 std::slice::from_ref(&account),
                 LOOKAHEAD,
                 &monokulo_8ar::Arena::new(),
@@ -610,7 +661,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
         })
         .unwrap()
     };
-    let hashes = [incoming_hash, outgoing_hash];
+    let hashes = [TxHash(incoming_hash), TxHash(outgoing_hash)];
     app.scanner.mempool.lock().unwrap().reset(vec![account.id]);
     app.scanner.mempool.lock().unwrap().add(&hashes, look());
     // Looked at again (as after a lost race): nothing twice.
@@ -655,7 +706,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
         .collect();
     assert_eq!(same.len(), 1);
     assert_eq!((same[0].mempool, same[0].height), (false, Some(101)));
-    assert_eq!(same[0].receives[0].global_index, 6_001);
+    assert_eq!(same[0].receives[0].global_index, Amount(6_001));
     check_proof(same[0], mined_hash);
 
     // Then dropped from the pool: the outgoing one goes.
@@ -663,7 +714,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
         .mempool
         .lock()
         .unwrap()
-        .retain(&HashSet::from([incoming_hash]));
+        .retain(&HashSet::from([TxHash(incoming_hash)]));
     let served = txs(&app, &w).await;
     assert!(served.transactions.iter().all(|t| !t.mempool));
     assert_eq!(served.transactions.len(), 3);
@@ -676,18 +727,18 @@ fn a_batch_leaves_alone_an_account_rescanned_or_hidden_meanwhile() {
     let accounts = vec![a.add(&db, 100), b.add(&db, 100), c.add(&db, 100)];
     // The batch is planned, then (while it is fetched) `a` is rescanned from 0
     // and `c` hidden.
-    db.rescan(&[a.address()], 0).unwrap();
+    db.rescan(&[a.address()], Height::new(0)).unwrap();
     db.set_status(&[c.address()], Status::Hidden).unwrap();
     write(&db, &accounts, pay_then_ring()(&a, &b), 100, true, Some(&every_hit));
     assert_eq!(
         db.account(&a.address()).unwrap().unwrap().scan_height,
-        0,
+        Height::ZERO,
         "the rescan holds"
     );
     assert!(db.outputs(accounts[0].id).unwrap().is_empty());
-    assert_eq!(db.account(&b.address()).unwrap().unwrap().scan_height, 102);
+    assert_eq!(db.account(&b.address()).unwrap().unwrap().scan_height, Height::new(102));
     assert_eq!(db.outputs(accounts[1].id).unwrap().len(), 1);
-    assert_eq!(db.account(&c.address()).unwrap().unwrap().scan_height, 100);
+    assert_eq!(db.account(&c.address()).unwrap().unwrap().scan_height, Height::new(100));
 }
 
 #[test]
@@ -716,9 +767,15 @@ fn an_account_joining_mid_batch_sees_only_its_own_blocks() {
         write(&db, &accounts, make(), 100, false, hits);
         assert_eq!(db.outputs(accounts[0].id).unwrap().len(), 3);
         let b_outs = db.outputs(accounts[1].id).unwrap();
-        assert_eq!(b_outs.iter().map(|o| o.height).collect::<Vec<_>>(), vec![102]);
-        assert_eq!(db.account(&b.address()).unwrap().unwrap().scan_height, 103);
-        assert!(db.block_hash(100).unwrap().is_none(), "a catch-up lane keeps no hashes");
+        assert_eq!(
+            b_outs.iter().map(|o| o.height).collect::<Vec<_>>(),
+            vec![Height::new(102)]
+        );
+        assert_eq!(db.account(&b.address()).unwrap().unwrap().scan_height, Height::new(103));
+        assert!(
+            db.block_hash(Height::new(100)).unwrap().is_none(),
+            "a catch-up lane keeps no hashes"
+        );
     }
 }
 
@@ -738,7 +795,7 @@ fn a_batch_cut_short_leaves_nothing_behind() {
         let sw = ScanWriter::new(tx);
         let ring = Ring::get(
             &mut slot,
-            &sw,
+            tx,
             std::slice::from_ref(&account),
             LOOKAHEAD,
             &monokulo_8ar::Arena::new(),
@@ -749,7 +806,7 @@ fn a_batch_cut_short_leaves_nothing_behind() {
             LOOKAHEAD,
             std::slice::from_ref(&account),
             &batch,
-            100,
+            Height::new(100),
             None,
             true,
         )?;
@@ -758,9 +815,9 @@ fn a_batch_cut_short_leaves_nothing_behind() {
     assert!(result.is_err());
     assert!(db.outputs(account.id).unwrap().is_empty());
     assert!(db.txs(account.id).unwrap().is_empty());
-    assert!(db.block_hash(100).unwrap().is_none());
+    assert!(db.block_hash(Height::new(100)).unwrap().is_none());
     assert_eq!(db.scanner_height().unwrap(), None);
-    assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, 100);
+    assert_eq!(db.account(&w.address()).unwrap().unwrap().scan_height, Height::new(100));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -830,7 +887,7 @@ async fn totals_locks_unlock_times_and_timestamps() {
         coinbase.timestamp,
         Some(Timestamp::from_unix(1_700_000_000 + 150 * 120))
     );
-    assert_eq!(coinbase.timestamp.as_ref().unwrap().0, "2023-11-15T03:13:20Z");
+    assert_eq!(coinbase.timestamp.as_ref().unwrap().as_str(), "2023-11-15T03:13:20Z");
     // As monero-lws: every received output is listed, locked or not, and the
     // client decides from the transaction's unlock time.
     let outs = unspent(&app, &w).await;
@@ -860,7 +917,10 @@ async fn login_starts_a_new_account_at_the_top_block() {
     assert!(made.new_address);
     assert_eq!(made.start_height, Some(999), "the top block, scanned too");
     let account = db.account(&w.address()).unwrap().unwrap();
-    assert_eq!((account.start_height, account.scan_height), (999, 999));
+    assert_eq!(
+        (account.start_height, account.scan_height),
+        (Height::new(999), Height::new(999))
+    );
     let again = unwrap(wallet::login(State(app.clone()), None, ApiJson(request(true))).await);
     assert!(!again.new_address);
     assert_eq!(again.start_height, Some(999));
@@ -888,7 +948,10 @@ async fn an_import_starts_the_account_at_block_zero() {
     let reply = unwrap(wallet::import_wallet_request(State(app.clone()), None, ApiJson(w.login())).await);
     assert!(reply.request_fulfilled && reply.new_request);
     let account = db.account(&w.address()).unwrap().unwrap();
-    assert_eq!((account.start_height, account.scan_height), (0, 0));
+    assert_eq!(
+        (account.start_height, account.scan_height),
+        (Height::ZERO, Height::ZERO)
+    );
     assert_eq!(info(&app, &w).await.start_height, 0);
     let again = unwrap(wallet::import_wallet_request(State(app.clone()), None, ApiJson(w.login())).await);
     assert!(!again.new_request, "already from 0: nothing more to do");
@@ -940,9 +1003,16 @@ async fn a_mined_receive_comes_with_a_proof_of_its_block() {
         let (made, _, _) = paying_block(&w);
         let hash = made.block.block.hash();
         write(&db, &[account], vec![made], 100, true, hits);
-        let (kept_hash, blob) = db.kept_block(100).unwrap().expect("the paying block is kept");
-        assert_eq!(kept_hash, hash);
-        assert_eq!(db.block_hash(100).unwrap(), Some(hash), "the hash the live lane keeps");
+        let (kept_hash, blob) = db
+            .kept_block(Height::new(100))
+            .unwrap()
+            .expect("the paying block is kept");
+        assert_eq!(kept_hash, BlockHash(hash));
+        assert_eq!(
+            db.block_hash(Height::new(100)).unwrap(),
+            Some(BlockHash(hash)),
+            "the hash the live lane keeps"
+        );
         assert_eq!(
             crate::proof::block_hash(&blob),
             Some(hash),
@@ -972,9 +1042,12 @@ async fn proofs_are_kept_only_where_an_account_is_paid() {
     let accounts = vec![a.add(&db, 100), b.add(&db, 100)];
     // A catch-up lane (no hashes kept) keeps proofs all the same.
     write(&db, &accounts, pay_then_ring()(&a, &b), 100, false, Some(&every_hit));
-    assert!(db.block_hash(100).unwrap().is_none());
-    assert!(db.kept_block(100).unwrap().is_some(), "100 pays both");
-    assert!(db.kept_block(101).unwrap().is_none(), "101 only spends from a ring");
+    assert!(db.block_hash(Height::new(100)).unwrap().is_none());
+    assert!(db.kept_block(Height::new(100)).unwrap().is_some(), "100 pays both");
+    assert!(
+        db.kept_block(Height::new(101)).unwrap().is_none(),
+        "101 only spends from a ring"
+    );
     assert_eq!(db.kept_counts().unwrap(), (1, 1), "one transaction pays both");
     let app = app(db.clone(), 200);
     let served = txs(&app, &a).await;
@@ -988,10 +1061,10 @@ async fn proofs_are_kept_only_where_an_account_is_paid() {
 
     // A rescan of one account leaves what the other still needs, and a
     // rescan of both lets it go.
-    db.rescan(&[a.address()], 0).unwrap();
+    db.rescan(&[a.address()], Height::new(0)).unwrap();
     assert_eq!(db.kept_counts().unwrap(), (1, 1));
     check_proof(&txs(&app, &b).await.transactions[0], block);
-    db.rescan(&[b.address()], 50).unwrap();
+    db.rescan(&[b.address()], Height::new(50)).unwrap();
     assert_eq!(db.kept_counts().unwrap(), (0, 0));
 }
 
@@ -1003,8 +1076,8 @@ async fn a_reorg_drops_the_kept_block_and_the_new_one_is_proved() {
     let (made, _, _) = paying_block(&w);
     write(&db, &[account], vec![made], 100, true, None);
     assert_eq!(db.kept_counts().unwrap(), (1, 1));
-    db.rewind(100).unwrap();
-    assert!(db.kept_block(100).unwrap().is_none());
+    db.rewind(Height::new(100)).unwrap();
+    assert!(db.kept_block(Height::new(100)).unwrap().is_none());
     assert_eq!(db.kept_counts().unwrap(), (0, 0));
 
     let account = db.account(&w.address()).unwrap().unwrap();
@@ -1013,7 +1086,10 @@ async fn a_reorg_drops_the_kept_block_and_the_new_one_is_proved() {
     let new_100 = block(100, [9; 32], dull_miner(100), vec![other.build()], 1_000, 1);
     let hash = new_100.block.block.hash();
     write(&db, &[account], vec![new_100], 100, true, None);
-    assert_eq!(db.kept_block(100).unwrap().map(|k| k.0), Some(hash));
+    assert_eq!(
+        db.kept_block(Height::new(100)).unwrap().map(|k| k.0),
+        Some(BlockHash(hash))
+    );
     let served = txs(&app(db, 200), &w).await;
     assert_eq!(served.transactions.len(), 1);
     check_proof(&served.transactions[0], hash);
@@ -1134,5 +1210,272 @@ async fn a_database_from_before_proofs_serves_old_rows_without_one() {
     check_proof(&served.transactions[2], hash);
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+/// Measures how long the scanner's write transaction holds the writer, on
+/// the fixture's mainnet-shaped blocks: `accounts` accounts with
+/// `owned` outputs each already, `paid` planted payments a block to
+/// accounts picked at random, and `decoys` ring members a block that are
+/// accounts' outputs (candidate spends to write); each overridden by
+/// `LWS_ACCOUNTS`, `LWS_OWNED`, `LWS_PAID`, `LWS_DECOYS`. Writes each batch
+/// in one transaction, or with `LWS_CHUNKED=1` as the scanner does (in
+/// chunks of `LWS_BUDGET_MS`, by default `WRITE_BUDGET`), while a client
+/// writes all along, and prints how long the writing took and the longest
+/// the client waited. Run by hand, with the fixture's absolute path:
+/// `LWS_FIXTURE=... cargo test --release -p monokulo-lws measure_write_hold -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_write_hold() {
+    use crate::db::{NewOutput, NewTx};
+    use crate::scanner::{scan_blocks, write_scanned};
+    use crate::types::{GlobalIndex, OutIndex, PublicKey, SubaddressIndex};
+    use monero_wallet::transaction::Input;
+    let Some(path) = std::env::var("LWS_FIXTURE").ok().map(std::path::PathBuf::from) else {
+        eprintln!("set LWS_FIXTURE");
+        return;
+    };
+    let (blocks, firsts, _) = crate::scanner::fixture_blocks(&path).unwrap();
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut rand = move |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    let env = |name: &str, default: usize| std::env::var(name).map_or(default, |v| v.parse().unwrap());
+    let (owned, paid, decoys) = (env("LWS_OWNED", 20), env("LWS_PAID", 10), env("LWS_DECOYS", 30));
+    let accounts_n = env("LWS_ACCOUNTS", 1_000);
+    let wallets: Vec<Wallet> = (0..accounts_n).map(|i| Wallet::new(10_000 + i as u64)).collect();
+    for (size, live) in [(100usize, true), (100, false), (1_000, false), (1_000, true)] {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/measure-{}-{size}.sqlite", std::process::id()));
+        let db = Db::open(&file).unwrap();
+        let start = 3_797_000u64;
+        let accounts: Vec<Account> = wallets.iter().map(|w| w.add(&db, start)).collect();
+        // What the accounts held before: `owned` outputs each, below the batch.
+        let mut global = 10_000_000u64;
+        let mut owned_at = vec![];
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            for (i, a) in accounts.iter().enumerate() {
+                for o in 0..owned {
+                    let mut hash = [0u8; 32];
+                    hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    hash[8..16].copy_from_slice(&(o as u64).to_le_bytes());
+                    let height = Height::new(start - 1 - o as u64);
+                    let tx_id = w.tx_row(
+                        a.id,
+                        &NewTx {
+                            hash: TxHash(hash),
+                            prefix_hash: [0; 32],
+                            height,
+                            timestamp: 0,
+                            unlock_time: 0,
+                            coinbase: false,
+                            mixin: 15,
+                            fee: lws_api::Amount(0),
+                            payment_id: None,
+                            tx_pub_key: PublicKey([0; 32]),
+                        },
+                    )?;
+                    w.add_output(
+                        a.id,
+                        tx_id,
+                        &NewOutput {
+                            out_index: OutIndex::new(0),
+                            global_index: GlobalIndex::new(global),
+                            amount: lws_api::Amount(1_000),
+                            public_key: PublicKey(hash),
+                            tx_pub_key: PublicKey([0; 32]),
+                            mask: Some([1; 32]),
+                            height,
+                            subaddress: SubaddressIndex::default(),
+                            commitment: None,
+                        },
+                    )?;
+                    owned_at.push(global);
+                    global += 1;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        // The batch, payments and decoys planted.
+        let mut made_blocks = vec![];
+        let mut flagged = vec![];
+        let mut planted = 0;
+        let mut key_image = 0u64;
+        for (b, (mut block, first_indexes)) in blocks
+            .iter()
+            .cloned()
+            .zip(firsts.iter().cloned())
+            .take(size)
+            .enumerate()
+        {
+            let n = block.transactions.len();
+            for _ in 0..paid.min(n) {
+                let t = 1 + rand(n);
+                let who = rand(accounts_n);
+                let tx = &block.transactions[t - 1];
+                let prefix = tx.prefix().clone();
+                let Ok(extra) = Extra::read(&mut prefix.extra.as_slice()) else {
+                    continue;
+                };
+                let Some(keys) = extra.keys() else { continue };
+                let key: curve25519_dalek::EdwardsPoint = keys.0[0].into();
+                let Some(at) = prefix.outputs.iter().position(|o| o.key != CompressedPoint::IDENTITY) else {
+                    continue;
+                };
+                let pay = wallets[who].pay(&key, 0, 0, at as u64, 5_000);
+                let mut outputs = prefix.outputs.clone();
+                outputs[at] = pay.output.clone();
+                let strangers: Vec<Out> = (0..outputs.len()).map(|i| stranger(i as u64 + 1)).collect();
+                let mut commitments: Vec<CompressedPoint> =
+                    strangers.iter().map(|s| CompressedPoint::from(s.commitment)).collect();
+                let mut encrypted: Vec<EncryptedAmount> = strangers.iter().map(|s| s.encrypted.clone()).collect();
+                commitments[at] = CompressedPoint::from(pay.commitment);
+                encrypted[at] = pay.encrypted.clone();
+                block.transactions[t - 1] = Transaction::V2 {
+                    prefix: monero_wallet::transaction::TransactionPrefix { outputs, ..prefix },
+                    proofs: Some(PrunedRctProofs {
+                        rct_type: RctType::ClsagBulletproofPlus,
+                        base: RctBase {
+                            fee: 1,
+                            pseudo_outs: vec![],
+                            encrypted_amounts: encrypted,
+                            commitments,
+                        },
+                    }),
+                };
+                planted += 1;
+                flagged.push((b, t, who));
+            }
+            // Each transaction spends one input of a 16-member ring; `decoys`
+            // members a block are accounts' outputs.
+            let mut ours = decoys;
+            for tx in block.transactions.iter_mut() {
+                let Transaction::V2 { prefix, .. } = tx else { continue };
+                let mut members: Vec<u64> = (0..16).map(|m| 1_000 + m * 7_919 + rand(7_000) as u64).collect();
+                for _ in 0..2 {
+                    if ours > 0 {
+                        members.pop();
+                        members.insert(0, owned_at[rand(owned_at.len())]);
+                        ours -= 1;
+                    }
+                }
+                members.sort_unstable();
+                members.dedup();
+                let mut last = 0;
+                let key_offsets = members
+                    .iter()
+                    .map(|m| {
+                        let o = m - last;
+                        last = *m;
+                        o
+                    })
+                    .collect();
+                key_image += 1;
+                let mut image = [0u8; 32];
+                image[..8].copy_from_slice(&key_image.to_le_bytes());
+                prefix.inputs = vec![Input::ToKey {
+                    amount: None,
+                    key_offsets,
+                    key_image: CompressedPoint::from(image),
+                }];
+            }
+            made_blocks.push(Made {
+                block,
+                first_indexes,
+                next: 0,
+                raw: None,
+            });
+        }
+        let batch = Batch {
+            first_indexes: made_blocks.iter().map(|m| m.first_indexes.clone()).collect(),
+            raw: made_blocks.iter().map(|m| m.raw.clone()).collect(),
+            blocks: made_blocks.into_iter().map(|m| m.block).collect(),
+        };
+        let mut slot = None;
+        let arena = monokulo_8ar::Arena::new();
+        db.read(|c| Ring::get(&mut slot, c, &accounts, LOOKAHEAD, &arena).map(|_| ()))
+            .unwrap();
+        let ring = slot.as_mut().unwrap();
+        // Each planted payment is a hit for the account paid, as the
+        // prefilter would flag it.
+        let ids = ring.keyring_ids();
+        let flagged: Vec<monokulo_8ar::Hit> = flagged
+            .into_iter()
+            .map(|(b, t, who)| monokulo_8ar::Hit {
+                account: ids[who],
+                block: b,
+                tx: t,
+            })
+            .collect();
+        let scan = std::time::Instant::now();
+        let scanned = scan_blocks(ring, LOOKAHEAD, &accounts, &batch, Height::new(start), Some(&flagged)).unwrap();
+        let scan = scan.elapsed();
+        let hold = std::time::Instant::now();
+        // A client writing all along: the longest it waited for the writer.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut longest = std::time::Duration::ZERO;
+        std::thread::scope(|sc| {
+            let client = sc.spawn(|| {
+                let mut longest = std::time::Duration::ZERO;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) && std::env::var("LWS_NOCLIENT").is_err() {
+                    let t = std::time::Instant::now();
+                    db.write(|_| Ok(())).unwrap();
+                    longest = longest.max(t.elapsed());
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                longest
+            });
+            if std::env::var("LWS_CHUNKED").is_ok_and(|v| v == "1") {
+                let budget = std::env::var("LWS_BUDGET_MS").map_or(crate::scanner::WRITE_BUDGET, |v| {
+                    std::time::Duration::from_millis(v.parse().unwrap())
+                });
+                // The fixture's blocks don't chain (each one's previous is
+                // zeros), so the live lane's checks would stop at the
+                // first chunk: written as a lane's.
+                let at = crate::scanner::Window {
+                    start: Height::new(start),
+                    live: false,
+                    generation: db.reorg_generation().unwrap(),
+                    keep_from: Height::MAX,
+                };
+                crate::scanner::write_in_chunks(&db, &accounts, &batch, scanned, &at, budget).unwrap();
+            } else {
+                db.write(|tx| {
+                    write_scanned(
+                        &ScanWriter::new(tx),
+                        &accounts,
+                        &batch,
+                        Height::new(start),
+                        scanned,
+                        live,
+                    )
+                })
+                .unwrap();
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            longest = client.join().unwrap();
+        });
+        let hold = hold.elapsed();
+        let outputs: usize = accounts.iter().map(|a| db.outputs(a.id).unwrap().len()).sum();
+        let spends: usize = accounts.iter().map(|a| db.spends(a.id).unwrap().len()).sum();
+        println!(
+            "{size:>5} blocks ({}), {accounts_n} accounts with {owned} outputs: {planted} planted, \
+             {} outputs and {spends} candidate spends after; scan {:.0} ms, written in {:.1} ms, \
+             a client waited at most {:.1} ms",
+            if live { "live" } else { "lane" },
+            outputs,
+            scan.as_secs_f64() * 1e3,
+            hold.as_secs_f64() * 1e3,
+            longest.as_secs_f64() * 1e3,
+        );
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
+        }
     }
 }

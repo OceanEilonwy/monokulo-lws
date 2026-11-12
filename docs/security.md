@@ -41,13 +41,15 @@ malformed JSON; spoof `X-Forwarded-For`.
   and that holder owns it anyway. (`rest::tests::unknown_accounts_and_wrong_keys_look_the_same`)
 - *Fill the database or the scanner.* Account creation and import requests
   take a token from a strict per-client bucket (`--strict-rate-limit`,
-  default 12 a minute) and from a global bucket (`--max-new-accounts-per-hour`,
+  default 12 a minute, and `--strict-rate-limit-per-48`, default 48 a minute
+  per IPv6 /48) and from a global bucket (`--max-new-accounts-per-hour`,
   default 1,000); pending requests are capped (`--max-pending-requests`,
   default 10,000, monero-lws's `--create-queue-max`); subaddresses are capped
   per account (`--max-subaddresses`).
 - *Exhaust connections or memory.* Per listener: at most
   `--max-connections` open connections (1,024) and `--max-connections-per-ip`
-  from one address (64); request headers must arrive within 10 s (this also
+  from one client (64; a client is an IPv4 address or an IPv6 /64, as for
+  the rate limits, so a host can't take a slot per address of its /64); request headers must arrive within 10 s (this also
   closes idle keep-alive connections) in at most 16 KiB; the TLS handshake
   within 10 s; a whole request, body included, within `--request-timeout`
   (30 s). Bodies are capped per endpoint: 4 KiB for login-shaped calls,
@@ -58,7 +60,13 @@ malformed JSON; spoof `X-Forwarded-For`.
   per-client bucket (`--rate-limit`, 300 a minute); `/submit_raw_tx`,
   `/get_random_outs`, `/import_wallet_request` and account creation also
   take one from the strict bucket. A client is an IPv4 address or an IPv6
-  /64. `/get_random_outs` is capped at monero-lws's limits (20 members a
+  /64; each IPv6 /48 also has a bucket of its own in both classes
+  (`--rate-limit-per-48` and `--strict-rate-limit-per-48`, by default four
+  times the per-client rates), and a request must find a token in both, so
+  one holder of a /48 can't spend 65,536 per-/64 buckets. Each class keeps
+  at most 200,000 buckets per tier; past that the least recently used tenth
+  are dropped, and refilled buckets are swept only when the map has doubled,
+  so no request walks the whole map. `/get_random_outs` is capped at monero-lws's limits (20 members a
   ring, 150 rings) and needs no account. Each round draws only what every
   ring still lacks and asks the node for all of it in one `get_outs` (in
   chunks of 1,000), so the most a request asks for in its first round is
@@ -73,6 +81,24 @@ malformed JSON; spoof `X-Forwarded-For`.
   its sender a real fee. `get_info` for the public `/get_version` and
   `/daemon_status` is cached for 5 s, so those endpoints don't make a node
   call each.
+- *Stall the API behind the scanner, or the scanner behind the API.* The
+  database has one writer connection and a pool of read-only ones
+  (`query_only`, up to four, fewer on a machine with fewer cores). Under
+  WAL a read sees the last commit and never waits for the scanner's batch
+  transaction, and each read is one read transaction, so an account's
+  transactions, outputs, spends and proofs come from one snapshot. Handlers
+  reach the database only through `db::AsyncDb::call`, which runs on
+  tokio's blocking threads, so no request parks a runtime worker on SQLite;
+  the scanner's own calls go the same way or through `block_in_place`. A
+  login's access time is written with whichever write holds the writer
+  rather than waiting for it. What still waits for the writer are the
+  rare, rate-limited writes a client asks for (a new account, a request,
+  subaddresses, an import), on a blocking thread, and for at most about
+  50 ms: the scanner commits a batch in chunks of that long, and the
+  writer is taken in turn, so a waiting write goes before the scanner's
+  next chunk (`scanner::tests::a_client_write_goes_between_the_chunks_of_a_batch`).
+  (`db::tests::a_read_goes_on_while_a_write_is_held`,
+  `db::tests::async_reads_never_wait_on_the_writer`)
 - *Pick their own client address.* `X-Forwarded-For` (or the header named
   by `--client-ip-header`) is read only when the TCP peer is in
   `--trusted-proxies`; the client is then the rightmost address in it that is
@@ -135,7 +161,9 @@ shown to clients are wrong (a fake incoming payment, a missing spend); lie
 about the output distribution or ring members, which weakens the privacy of
 transactions built with `/get_random_outs` (decoys the node chose); refuse
 or drop submitted transactions; reorganise the chain at will, forcing
-rescans; observe the server's requests (which blocks, which outputs, which
+rescans (done by the server itself down to the oldest checkpoint, one kept
+every 1,000 blocks; a reorg deeper than that, or a node on another chain,
+stops scanning until the operator rescans every account); observe the server's requests (which blocks, which outputs, which
 transactions are submitted, from which server). With `/submit_raw_tx`, the
 node sees the transaction come from the server's address, not the client's.
 
@@ -292,9 +320,13 @@ users (a view key can't be changed; only a new wallet escapes it).
 
 No view key and no address appears in the log at any level:
 
-- The types that hold them (`Login`, `admin::AddAccount`, `admin::Validate`,
-  `admin::Request`, `db::Account`, `db::NewAccount`, `crypto::Checked`) print
-  `<redacted>` for both in `Debug`.
+- A key is never a bare byte array: `lws_api::PrivateViewKey` and
+  `lws_api::AdminKey` print `<redacted>` in `Debug` and `Display`, so any
+  struct that holds one, derived `Debug` or not, can't print it. Inside the
+  server an address is an `address::Address` (parsed once, a primary
+  address on the server's network), which prints `<redacted>` in `Debug`
+  and has no `Display`. The wire types that carry an address as text
+  (`Login`, `admin::AddAccount`) print `<redacted>` for it too.
 - Accounts are named by row id in log lines (`new account #12`), never by
   address, not even shortened.
 - No error variant carries a key or an address; a request that fails
@@ -325,13 +357,60 @@ HSTS. The certificate is read at start; restart to renew.
 
 ## Memory
 
-`crypto::Checked`, which carries a copy of the presented view key through a
-request, wipes it when dropped; the admin CLI wipes the keys it reads and
-prints. Beyond that, keys are where they must be: in the database's pages
-and SQLite's cache, in the scanner's keyring and monero-oxide scanners for
-as long as an account is scanned, and in request buffers until they're
-freed. Wiping every transient copy would not change what someone who can
-read the process's memory learns.
+View keys and admin keys are `lws_api::PrivateViewKey` and
+`lws_api::AdminKey` from the moment a request is parsed (or a row read) to
+the moment they're dropped. Each holds its 32 bytes on the heap, so a move
+copies a pointer and not the key, and wipes them when dropped. Neither is
+`Copy` or `Clone`: a login's key is moved into `crypto::Checked` and from
+there into a new account, and an account is passed by reference; a copy is
+made only explicitly, from `as_bytes()`. Comparison is constant time
+(`subtle`), `==` included. The hex written and read for them goes through
+wiped buffers, a key column is read from SQLite's buffer straight into the
+key's own, and the derivations made from a view key (`crypto`: the view key
+as a scalar, `8·a·R`, `H_s(8·a·R ‖ i)` and what is hashed from it, the
+subaddress hash input) are wiped too. The admin CLI wipes the keys it reads
+and prints.
+
+Request bodies are wiped too, as far as the server's own code reaches.
+`rest::ApiBody` reads a body frame by frame, copies each frame into a
+`Zeroizing<Vec<u8>>` and drops the frame at once; the buffer is set aside
+from `Content-Length` up to 4 KiB at most (so a lying header reserves
+nothing large) and grows only by moving into a bigger wiped buffer, the old
+one wiped, never by `Vec`'s own reallocation. The per-endpoint body limits
+apply as before (413 past them, frame-by-frame bodies included). `ApiJson`
+parses from that buffer with `serde_json::from_slice` and the buffer is
+wiped when the extractor returns, parsed or refused. serde_json lends a
+string without escapes straight from the buffer, so a key's hex goes from
+the body into its `PrivateViewKey` with no `String` in between; the admin
+API reads `auth` and then each command's `params` from the same buffer
+rather than through a `serde_json::Value`, which would hold a key as a
+`String`. A rejection carries line and column only, never a part of the
+body. Admin keys travel only in the body's `auth` (there is no key
+header), so they get the same treatment. (`rest::tests::bodies_are_read_into_a_wiped_buffer_within_the_limit`,
+`rest::tests::admin_params_are_read_from_the_body`)
+
+What is not wiped, because it is out of the server's reach without a
+zeroing allocator (which was decided against):
+
+- hyper's connection read buffer, which holds the request as it came off
+  the socket (the frames copied above are slices of it) until hyper reuses
+  or frees it;
+- with `--tls-cert`, rustls's buffers of decrypted plaintext, likewise
+  until reused (behind a reverse proxy, the proxy's own buffers instead);
+- a key written with JSON escapes (`0...`, which no client needs for
+  hex): serde_json unescapes it into its internal scratch buffer, which is
+  freed without being wiped (the owned copy then handed to the key type is
+  wiped);
+- the kernel's socket buffers.
+
+What is left beyond that is where keys must be: in the database's pages and
+SQLite's cache, and in the scanner's keyring and monero-oxide scanners for
+as long as an account is scanned. None of this changes what someone who
+can read the process's memory learns while the process runs; it shortens
+how long stale copies of keys of finished requests linger. A core dump
+would hold all of it, so the OpenWrt service turns core dumps off
+(`procd_set_param limits core="0"`); elsewhere, the operator should
+(`ulimit -c 0`, or `LimitCORE=0` under systemd).
 
 ## Dependencies
 
@@ -357,7 +436,7 @@ read the process's memory learns.
 | Body limits | Per endpoint: 2 KiB login family, 10 KiB upsert, 512 KiB submit | Per endpoint: 4 KiB, 64 KiB, 2 MB (monerod's 1 MB transaction cap) |
 | Timeouts | Handshake 5 s, first request 5 s, after login 5 min, response 15 s | Headers 10 s (idle included), handshake 10 s, whole request 30 s |
 | Connection caps | None | Per listener and per address |
-| Rate limits | None | Per client (IPv4 or IPv6 /64), strict class, global creation cap |
+| Rate limits | None | Per client (IPv4 or IPv6 /64) and per IPv6 /48, strict class, global creation cap |
 | Pending requests | `--create-queue-max` 10,000 | `--max-pending-requests` 10,000 |
 | `/get_random_outs` | 20 a ring, 150 rings | The same |
 | `/get_random_outs` over the caps | 500 (`exceeded_rest_request_limit` isn't mapped) | 400 with a sentence |
@@ -427,4 +506,9 @@ except where it says otherwise.
 - **PROXY protocol.** Only a header from a trusted proxy is supported.
 - **Reloading the TLS certificate without a restart.** Not needed at the
   rates the server restarts; a reverse proxy does it if wanted.
-- **Wiping every transient copy of a view key.** See "Memory".
+- **Wiping hyper's and rustls's buffers.** The server wipes its own copy of
+  a request body, but hyper's read buffer and rustls's plaintext buffers
+  keep the request's text until they are reused. Reaching them would take a
+  zeroing global allocator, a cost on every allocation the scanner makes,
+  for copies that live in the same process as every key in the keyring.
+  See "Memory".

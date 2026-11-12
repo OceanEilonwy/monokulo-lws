@@ -21,6 +21,7 @@ use rand_distr::{Distribution as _, Gamma};
 use crate::daemon::{Daemon, Distribution};
 use crate::error::{Error, Result};
 use crate::scanner::SPENDABLE_AGE;
+use crate::types::{Height, PublicKey};
 
 const GAMMA_SHAPE: f64 = 19.28;
 const GAMMA_SCALE: f64 = 1.0 / 1.61;
@@ -56,7 +57,7 @@ pub struct Picker {
 #[derive(Clone, Debug)]
 pub struct Member {
     pub global_index: u64,
-    pub public_key: [u8; 32],
+    pub public_key: PublicKey,
     pub commitment: [u8; 32],
 }
 
@@ -70,11 +71,13 @@ impl Picker {
     /// The node's distribution; a cached one while it is fresh, which is
     /// while it reaches `chain_height` (the scanner's last word; 0 for
     /// unknown) and is under two minutes old, and always for 5 s.
-    async fn distribution(&self, daemon: &Daemon, chain_height: u64) -> Result<Arc<Distribution>> {
+    async fn distribution(&self, daemon: &Daemon, chain_height: Height) -> Result<Arc<Distribution>> {
         let mut cached = self.distribution.lock().await;
         if let Some((at, d)) = cached.as_ref() {
-            let top = d.start_height + d.cumulative.len() as u64;
-            let current = chain_height == 0 || top >= chain_height;
+            let top = d
+                .start_height
+                .saturating_add(u64::try_from(d.cumulative.len()).unwrap_or(u64::MAX));
+            let current = chain_height == Height::ZERO || top >= chain_height;
             if at.elapsed() < FRESH_AT_LEAST || (current && at.elapsed() < FRESH_FOR) {
                 return Ok(d.clone());
             }
@@ -96,7 +99,7 @@ impl Picker {
         daemon: &Daemon,
         count: usize,
         rings: usize,
-        chain_height: u64,
+        chain_height: Height,
     ) -> Result<Vec<Vec<Member>>> {
         let d = self.distribution(daemon, chain_height).await?;
         let Some(picker) = GammaPicker::new(&d.cumulative) else {
@@ -142,14 +145,10 @@ impl Picker {
                     if out[ring].len() >= count || !o.unlocked {
                         continue;
                     }
-                    let (Some(key), Some(commitment)) = (crate::daemon::hex32(&o.key), crate::daemon::hex32(&o.mask))
-                    else {
-                        return Err(Error::Daemon("get_outs: a key that isn't hex".into()));
-                    };
                     out[ring].push(Member {
                         global_index: index,
-                        public_key: key,
-                        commitment,
+                        public_key: o.key,
+                        commitment: o.mask.0,
                     });
                 }
             }
@@ -182,7 +181,7 @@ impl<'a> GammaPicker<'a> {
     /// `None` where wallet2 throws: fewer blocks than the spendable age, no
     /// spendable output, or no output in the last year.
     fn new(offsets: &'a [u64]) -> Option<GammaPicker<'a>> {
-        let age = (SPENDABLE_AGE as usize).max(1);
+        let age = usize::try_from(SPENDABLE_AGE).unwrap_or(usize::MAX).max(1);
         if offsets.len() < age {
             return None;
         }
@@ -229,6 +228,8 @@ impl<'a> GammaPicker<'a> {
             // Too young to spend: somewhere in the recent spend window.
             rng.gen_range(0..RECENT_SPEND_WINDOW) as f64
         };
+        // Float to integer `as` saturates (and takes NaN to 0), which is
+        // what is wanted: an age past every output is refused just below.
         let back = (x / self.average_output_time) as u64;
         if back >= self.num_rct_outputs {
             return None;
