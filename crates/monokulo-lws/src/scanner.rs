@@ -489,6 +489,10 @@ impl Scanner {
     pub async fn step(self: &Arc<Self>) -> Result<bool> {
         let info = self.daemon.info().await?;
         let chain_height = info.height;
+        if chain_height == 0 {
+            // Even a new chain has its genesis block.
+            return Err(Error::Daemon("the node says it has no blocks".into()));
+        }
         self.set_status(|s| {
             s.chain_height = chain_height;
             s.last_error = None;
@@ -514,8 +518,9 @@ impl Scanner {
             // Caught up: a reorg that replaced the top block without making the
             // chain longer shows only in the top block's hash.
             let top = crate::daemon::hex32(&info.top_block_hash);
-            if let (Some(kept), Some(top)) = (self.db.block_hash(chain_height - 1)?, top)
-                && start == chain_height
+            if start == chain_height
+                && let Some(top) = top
+                && let Some(kept) = self.db.block_hash(chain_height - 1)?
                 && kept != top
             {
                 self.reorg().await?;
@@ -536,7 +541,8 @@ impl Scanner {
         }
 
         // A reorg shows as the first block not following the one we kept.
-        if let Some(kept) = self.db.block_hash(start - 1)?
+        if let Some(before) = start.checked_sub(1)
+            && let Some(kept) = self.db.block_hash(before)?
             && kept != fetched[0].block.block.header.previous
         {
             self.reorg().await?;
@@ -1174,7 +1180,7 @@ impl TxMeta {
             .map(|s| (s.account(), s.address()))
             .unwrap_or((0, 0));
         let key_offset: DScalar = output.key_offset().into();
-        let extra_key = additional.get(index as usize);
+        let extra_key = usize::try_from(index).ok().and_then(|i| additional.get(i));
         let derived_key = crypto::derived_by(view_key, index, &key_offset, sub, &main_key, extra_key);
         TxMeta {
             prefix_hash: prefix_hash(tx),
@@ -1237,6 +1243,7 @@ fn record_received(
     for output in outputs {
         let tx_hash = output.transaction();
         let Some((tx_index, tx)) = tx_of(tx_hash) else { continue };
+        let out_index = out_index(&output)?;
         let meta = TxMeta::of(tx, &output, &account.view_key);
         let tx_id = w.tx_row(account.id, &meta.new_tx(tx_hash, height, timestamp))?;
         if kept.insert(tx_hash) {
@@ -1244,9 +1251,9 @@ fn record_received(
         }
         let mask: DScalar = output.commitment().mask.into();
         let rct = !matches!(tx, Transaction::V1 { .. });
-        let index = output.index_in_transaction() as usize;
+        let index = usize::from(out_index);
         let new = NewOutput {
-            out_index: output.index_in_transaction() as u16,
+            out_index,
             global_index: output.index_on_blockchain(),
             amount: output.commitment().amount,
             public_key: output.key().compress().to_bytes(),
@@ -1355,8 +1362,9 @@ pub fn scan_pool_block(
                 continue;
             };
             let tx = &block.transactions[i];
+            let out_index = out_index(&output)?;
+            let index = usize::from(out_index);
             let meta = TxMeta::of(tx, &output, &account.view_key);
-            let index = output.index_in_transaction() as usize;
             let list = found.received.entry(account.id).or_default();
             let public_key = output.key().compress().to_bytes();
             // The burning bug: a key already received in this pool transaction counts once.
@@ -1367,7 +1375,7 @@ pub fn scan_pool_block(
                 tx_hash,
                 tx_prefix_hash: meta.prefix_hash,
                 tx_pub_key: meta.derived_key,
-                out_index: index as u16,
+                out_index,
                 amount: output.commitment().amount,
                 public_key,
                 mask: Some(output.commitment().mask.into()).map(|m: DScalar| *m.as_bytes()),
@@ -1389,6 +1397,7 @@ pub fn scan_pool_block(
     for (i, tx) in block.transactions.iter().enumerate() {
         let tx_hash = hashes[i];
         let mixin = mixin(tx);
+        let fee = fee(tx);
         let unlock_time = unlock_time(tx.prefix().additional_timelock);
         for input in &tx.prefix().inputs {
             let Input::ToKey {
@@ -1418,7 +1427,7 @@ pub fn scan_pool_block(
                             key_image,
                             mixin,
                             unlock_time,
-                            fee: fee(tx),
+                            fee,
                         });
                     }
                 }
@@ -1444,7 +1453,9 @@ fn record_spends(
     let timestamp = block.block.header.timestamp;
     for (i, tx) in block.transactions.iter().enumerate() {
         let hash = block.block.transactions[i];
-        let ring_size = mixin(tx) + 1;
+        // Worked out (the prefix hashed, the extra read) the first time an
+        // input of this transaction has one of ours in its ring, then reused.
+        let mut meta: Option<TxMeta> = None;
         for input in &tx.prefix().inputs {
             let Input::ToKey {
                 amount,
@@ -1464,7 +1475,7 @@ fn record_spends(
                     if accounts.get(account).is_none_or(|a| a.scan_height > height) {
                         continue;
                     }
-                    let meta = TxMeta::spend_only(tx);
+                    let meta = meta.get_or_insert_with(|| TxMeta::spend_only(tx));
                     let tx_id = w.tx_row(*account, &meta.new_tx(hash, height, timestamp))?;
                     w.add_spend(
                         *account,
@@ -1472,7 +1483,7 @@ fn record_spends(
                         ours.id,
                         ours.amount,
                         &key_image.to_bytes(),
-                        ring_size - 1,
+                        meta.mixin,
                         height,
                     )?;
                 }
@@ -1530,12 +1541,23 @@ fn is_coinbase(tx: &Transaction<Pruned>) -> bool {
     matches!(tx.prefix().inputs.first(), Some(Input::Gen(_)))
 }
 
+/// An output's index in its transaction, which the chain keeps far below
+/// 65,536 (a RingCT transaction has at most 16 outputs; a pre-RingCT one is
+/// bounded by its size): an index past that is a node making things up.
+fn out_index(output: &WalletOutput) -> Result<u16> {
+    u16::try_from(output.index_in_transaction())
+        .map_err(|_| Error::Daemon(format!("an output index of {}", output.index_in_transaction())))
+}
+
+/// Ring members less one (saturating, for a ring no transaction can have).
 fn mixin(tx: &Transaction<Pruned>) -> u32 {
     tx.prefix()
         .inputs
         .iter()
         .find_map(|i| match i {
-            Input::ToKey { key_offsets, .. } => Some(key_offsets.len().saturating_sub(1) as u32),
+            Input::ToKey { key_offsets, .. } => {
+                Some(u32::try_from(key_offsets.len().saturating_sub(1)).unwrap_or(u32::MAX))
+            }
             Input::Gen(_) => None,
         })
         .unwrap_or(0)
@@ -2251,6 +2273,22 @@ mod tests {
         };
         let (db, a, b) = record(Some(&gpu));
         check_recorded(&db, &a, &b);
+    }
+
+    /// A node that says it has no blocks is an error, not an underflow.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_at_height_zero_is_an_error() {
+        use crate::testkit::{self, Wallet, fake_node};
+        let node = fake_node(|route, _| match route {
+            "get_info" => serde_json::json!({ "height": 0, "top_block_hash": "00".repeat(32) }),
+            _ => serde_json::json!({}),
+        })
+        .await;
+        let db = Arc::new(Db::in_memory());
+        Wallet::new(5).add(&db, 0);
+        let app = testkit::app_with_node(db, 0, &node.url);
+        let e = app.scanner.step().await.unwrap_err();
+        assert!(e.to_string().contains("no blocks"), "{e}");
     }
 
     /// A pool of 150 transactions on a node that answers 100 hashes a
