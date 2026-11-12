@@ -114,6 +114,40 @@ row_id!(
     OutputId
 );
 
+sql_u64!(
+    /// An output's index among all RingCT outputs on the chain (what a ring
+    /// member names). Served as a `uint64-string`.
+    GlobalIndex
+);
+
+/// An output's index in its transaction. The chain keeps it far below
+/// 65,536 (a RingCT transaction has at most 16 outputs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OutIndex(u16);
+
+impl OutIndex {
+    pub const fn new(v: u16) -> OutIndex {
+        OutIndex(v)
+    }
+
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl ToSql for OutIndex {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.0))
+    }
+}
+
+impl FromSql for OutIndex {
+    /// rusqlite's own `u16` reading, which refuses a value out of range.
+    fn column_result(v: ValueRef<'_>) -> FromSqlResult<Self> {
+        u16::column_result(v).map(OutIndex)
+    }
+}
+
 /// A block height: the number of blocks below it, so the genesis block is
 /// at 0 and a chain of `n` blocks has its top at `n - 1`.
 ///
@@ -233,6 +267,19 @@ mod tests {
         assert!(OutputId::from_rowid(-1).is_err());
         assert_eq!(OutputId::from_rowid(7).unwrap(), OutputId::new(7));
         assert!(c.query_row("SELECT v FROM t", [], |r| r.get::<_, Height>(0)).is_err());
+        assert!(
+            c.query_row("SELECT v FROM t", [], |r| r.get::<_, GlobalIndex>(0))
+                .is_err()
+        );
+        assert!(c.query_row("SELECT v FROM t", [], |r| r.get::<_, OutIndex>(0)).is_err());
+    }
+
+    /// An out index past 65,535 in the database is an error, not truncated.
+    #[test]
+    fn out_indexes_past_u16_are_refused() {
+        let c = conn();
+        c.execute("INSERT INTO t VALUES (65536)", []).unwrap();
+        assert!(c.query_row("SELECT v FROM t", [], |r| r.get::<_, OutIndex>(0)).is_err());
     }
 
     /// Heights past the database's range are refused on write; the steps

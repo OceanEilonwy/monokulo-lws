@@ -66,7 +66,7 @@ pub fn create(db: &Db) -> Result<Zeroizing<[u8; 32]>> {
     db.write(|tx| {
         tx.execute(
             "INSERT OR IGNORE INTO admin_keys (key, created) VALUES (?1, ?2)",
-            params![hashed.as_slice(), now() as i64],
+            params![hashed.as_slice(), crate::types::SqlU64(now())],
         )?;
         Ok(())
     })?;
@@ -75,7 +75,12 @@ pub fn create(db: &Db) -> Result<Zeroizing<[u8; 32]>> {
 
 /// How many keys there are.
 pub fn count(db: &Db) -> Result<u64> {
-    db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM admin_keys", [], |r| r.get::<_, i64>(0))? as u64))
+    db.read(|c| {
+        Ok(c.query_row("SELECT COUNT(*) FROM admin_keys", [], |r| {
+            r.get::<_, crate::types::SqlU64>(0)
+        })?
+        .0)
+    })
 }
 
 /// Whether `presented` is one of the keys. The presented key is hashed and

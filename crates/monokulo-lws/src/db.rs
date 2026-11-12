@@ -22,12 +22,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lws_api::admin::RequestKind;
-use lws_api::{MinorRange, PrivateViewKey};
+use lws_api::{Amount, MinorRange, PrivateViewKey};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use crate::address::Address;
 use crate::error::{Error, Result, bad};
-use crate::types::{AccountId, Height, OutputId, SqlU64, TxId};
+use crate::types::{AccountId, GlobalIndex, Height, OutIndex, OutputId, SqlU64, TxId};
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -177,20 +177,20 @@ pub struct TxRow {
     pub unlock_time: u64,
     pub coinbase: bool,
     pub mixin: u32,
-    pub fee: u64,
+    pub fee: Amount,
     pub payment_id: Option<Vec<u8>>,
     pub tx_pub_key: [u8; 32],
-    pub total_received: u64,
-    pub total_sent: u64,
+    pub total_received: Amount,
+    pub total_sent: Amount,
 }
 
 #[derive(Clone, Debug)]
 pub struct OutputRow {
     pub id: OutputId,
     pub tx: TxId,
-    pub out_index: u16,
-    pub global_index: u64,
-    pub amount: u64,
+    pub out_index: OutIndex,
+    pub global_index: GlobalIndex,
+    pub amount: Amount,
     pub public_key: [u8; 32],
     /// The transaction public key this output was derived from (the
     /// additional one for a subaddress, when the sender used one).
@@ -238,15 +238,15 @@ pub struct NewTx<'a> {
     pub unlock_time: u64,
     pub coinbase: bool,
     pub mixin: u32,
-    pub fee: u64,
+    pub fee: Amount,
     pub payment_id: Option<&'a [u8]>,
     pub tx_pub_key: [u8; 32],
 }
 
 pub struct NewOutput {
-    pub out_index: u16,
-    pub global_index: u64,
-    pub amount: u64,
+    pub out_index: OutIndex,
+    pub global_index: GlobalIndex,
+    pub amount: Amount,
     pub public_key: [u8; 32],
     pub tx_pub_key: [u8; 32],
     pub mask: Option<[u8; 32]>,
@@ -320,6 +320,12 @@ fn blob32(v: Vec<u8>) -> rusqlite::Result<[u8; 32]> {
 /// (no `Vec` copy left behind). A blob of the wrong length is an error.
 /// (`PrivateViewKey` is `lws_api`'s, so it can't implement `FromSql` here;
 /// it is written as `key.as_bytes().as_slice()`.)
+/// An amount column, checked as `SqlU64` is. (`Amount` is `lws_api`'s, so
+/// it can't implement `FromSql` here; it is written as `SqlU64(amount.0)`.)
+fn amount_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Amount> {
+    Ok(Amount(r.get::<_, SqlU64>(i)?.0))
+}
+
 fn view_key_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<PrivateViewKey> {
     let blob = r.get_ref(i)?.as_blob()?;
     PrivateViewKey::from_slice(blob).ok_or_else(|| {
@@ -339,8 +345,8 @@ fn account_row(r: &rusqlite::Row) -> rusqlite::Result<Account> {
         status: status_col(r, 3)?,
         start_height: r.get(4)?,
         scan_height: r.get(5)?,
-        access_time: r.get::<_, i64>(6)? as u64,
-        generated_locally: r.get::<_, i64>(7)? != 0,
+        access_time: r.get::<_, SqlU64>(6)?.0,
+        generated_locally: r.get(7)?,
     })
 }
 
@@ -368,13 +374,13 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if !has_commitment {
         tx.execute("ALTER TABLE outputs ADD COLUMN commitment BLOB", [])?;
     }
-    let missing: Vec<(i64, Vec<u8>, i64)> = tx
+    let missing: Vec<(OutputId, Vec<u8>, Amount)> = tx
         .prepare("SELECT id, mask, amount FROM outputs WHERE commitment IS NULL AND mask IS NOT NULL")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, amount_col(r, 2)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (id, mask, amount) in missing {
         let mask = blob32(mask)?;
-        let commitment = crate::crypto::commit(&mask, amount as u64);
+        let commitment = crate::crypto::commit(&mask, amount.0);
         tx.execute(
             "UPDATE outputs SET commitment = ?1 WHERE id = ?2",
             params![commitment.as_slice(), id],
@@ -692,9 +698,9 @@ impl Db {
             if request_exists(tx, kind, &new.address)? {
                 return Ok(Queued::Duplicate);
             }
-            let pending = tx.query_row("SELECT COUNT(*) FROM requests", [], |r| r.get::<_, i64>(0))?;
-            if u64::try_from(pending).unwrap_or(u64::MAX) >= max_pending {
-                return Ok(Queued::Full(pending as u64));
+            let pending = tx.query_row("SELECT COUNT(*) FROM requests", [], |r| r.get::<_, SqlU64>(0))?.0;
+            if pending >= max_pending {
+                return Ok(Queued::Full(pending));
             }
             let changed = tx.execute(
                 "INSERT OR IGNORE INTO requests (kind, address, view_key, spend_pub, view_pub, start_height, generated_locally, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -705,8 +711,8 @@ impl Db {
                     new.address.spend_pub().as_slice(),
                     new.address.view_pub().as_slice(),
                     start_height,
-                    new.generated_locally as i64,
-                    now() as i64
+                    new.generated_locally,
+                    SqlU64(now())
                 ],
             )?;
             Ok(if changed > 0 { Queued::Added } else { Queued::Duplicate })
@@ -959,7 +965,9 @@ impl Db {
             let mut st =
                 c.prepare("SELECT hash, prefix, rct_base FROM txs_kept WHERE prunable_hash IS NULL LIMIT ?1")?;
             let rows = st
-                .query_map([limit as i64], |r| Ok((blob32(r.get(0)?)?, r.get(1)?, r.get(2)?)))?
+                .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                    Ok((blob32(r.get(0)?)?, r.get(1)?, r.get(2)?))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -1004,8 +1012,10 @@ impl Db {
     pub fn kept_counts(&self) -> Result<(u64, u64)> {
         self.read(|c| {
             Ok((
-                c.query_row("SELECT COUNT(*) FROM blocks_kept", [], |r| r.get::<_, i64>(0))? as u64,
-                c.query_row("SELECT COUNT(*) FROM txs_kept", [], |r| r.get::<_, i64>(0))? as u64,
+                c.query_row("SELECT COUNT(*) FROM blocks_kept", [], |r| r.get::<_, SqlU64>(0))?
+                    .0,
+                c.query_row("SELECT COUNT(*) FROM txs_kept", [], |r| r.get::<_, SqlU64>(0))?
+                    .0,
             ))
         })
     }
@@ -1077,15 +1087,15 @@ fn txs_in(c: &Connection, account: AccountId) -> Result<Vec<TxRow>> {
                 hash: blob32(r.get(1)?)?,
                 prefix_hash: blob32(r.get(2)?)?,
                 height: r.get(3)?,
-                timestamp: r.get::<_, i64>(4)? as u64,
-                unlock_time: r.get::<_, i64>(5)? as u64,
-                coinbase: r.get::<_, i64>(6)? != 0,
-                mixin: r.get::<_, i64>(7)? as u32,
-                fee: r.get::<_, i64>(8)? as u64,
+                timestamp: r.get::<_, SqlU64>(4)?.0,
+                unlock_time: r.get::<_, SqlU64>(5)?.0,
+                coinbase: r.get(6)?,
+                mixin: r.get(7)?,
+                fee: amount_col(r, 8)?,
                 payment_id: r.get(9)?,
                 tx_pub_key: blob32(r.get(10)?)?,
-                total_received: r.get::<_, i64>(11)? as u64,
-                total_sent: r.get::<_, i64>(12)? as u64,
+                total_received: amount_col(r, 11)?,
+                total_sent: amount_col(r, 12)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1101,7 +1111,7 @@ fn spends_in(c: &Connection, account: AccountId) -> Result<Vec<SpendRow>> {
                 tx: r.get(0)?,
                 output: r.get(1)?,
                 key_image: blob32(r.get(2)?)?,
-                mixin: r.get::<_, i64>(3)? as u32,
+                mixin: r.get(3)?,
                 height: r.get(4)?,
             })
         })?
@@ -1166,8 +1176,8 @@ fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<
             new.address.view_pub().as_slice(),
             status.as_str(),
             start_height,
-            n as i64,
-            new.generated_locally as i64
+            SqlU64(n),
+            new.generated_locally
         ],
     )?;
     if changed == 0 {
@@ -1217,7 +1227,7 @@ fn request_row(r: &rusqlite::Row) -> rusqlite::Result<(RequestKind, NewAccount)>
             address: r.get(1)?,
             view_key: view_key_col(r, 2)?,
             start_height: r.get(3)?,
-            generated_locally: r.get::<_, i64>(4)? != 0,
+            generated_locally: r.get(4)?,
         },
     ))
 }
@@ -1267,23 +1277,25 @@ fn uncovered(want: &[[u32; 2]], have: &[[u32; 2]]) -> Vec<[u32; 2]> {
     let mut j = 0;
     for &[lo, hi] in want {
         // u64, so the minor after u32::MAX doesn't wrap.
-        let (mut cursor, hi) = (u64::from(lo), u64::from(hi));
+        // The lowest minor not yet accounted for; `None` once past
+        // u32::MAX, so the minor after it doesn't wrap.
+        let mut cursor = Some(lo);
         // Held ranges wholly below this one are below every later one too.
-        while j < have.len() && u64::from(have[j][1]) < cursor {
+        while j < have.len() && have[j][1] < lo {
             j += 1;
         }
         for &[clo, chi] in &have[j..] {
-            let (clo, chi) = (u64::from(clo), u64::from(chi));
-            if clo > hi || cursor > hi {
+            let Some(at) = cursor.filter(|at| *at <= hi && clo <= hi) else {
                 break;
+            };
+            if clo > at {
+                // `clo - 1` doesn't wrap: clo > at >= 0.
+                out.push([at, clo - 1]);
             }
-            if clo > cursor {
-                out.push([cursor as u32, (clo - 1) as u32]);
-            }
-            cursor = cursor.max(chi + 1);
+            cursor = chi.checked_add(1).map(|next| next.max(at));
         }
-        if cursor <= hi {
-            out.push([cursor as u32, hi as u32]);
+        if let Some(at) = cursor.filter(|at| *at <= hi) {
+            out.push([at, hi]);
         }
     }
     out
@@ -1318,9 +1330,9 @@ fn outputs_in(c: &Connection, account: AccountId) -> Result<Vec<OutputRow>> {
             Ok(OutputRow {
                 id: r.get(0)?,
                 tx: r.get(1)?,
-                out_index: r.get::<_, i64>(2)? as u16,
-                global_index: r.get::<_, i64>(3)? as u64,
-                amount: r.get::<_, i64>(4)? as u64,
+                out_index: r.get(2)?,
+                global_index: r.get(3)?,
+                amount: amount_col(r, 4)?,
                 public_key: blob32(r.get(5)?)?,
                 tx_pub_key: blob32(r.get(6)?)?,
                 mask: r.get::<_, Option<Vec<u8>>>(7)?.map(blob32).transpose()?,
@@ -1524,11 +1536,11 @@ impl<'a> ScanWriter<'a> {
                 new.hash.as_slice(),
                 new.prefix_hash.as_slice(),
                 new.height,
-                new.timestamp as i64,
-                new.unlock_time as i64,
-                new.coinbase as i64,
+                SqlU64(new.timestamp),
+                SqlU64(new.unlock_time),
+                new.coinbase,
                 new.mixin,
-                new.fee as i64,
+                SqlU64(new.fee.0),
                 new.payment_id,
                 new.tx_pub_key.as_slice()
             ],
@@ -1550,8 +1562,8 @@ impl<'a> ScanWriter<'a> {
                 account,
                 tx,
                 o.out_index,
-                o.global_index as i64,
-                o.amount as i64,
+                o.global_index,
+                SqlU64(o.amount.0),
                 o.public_key.as_slice(),
                 o.tx_pub_key.as_slice(),
                 o.mask.as_ref().map(|m| m.as_slice()),
@@ -1569,10 +1581,11 @@ impl<'a> ScanWriter<'a> {
         Ok(Some(id))
     }
 
-    /// Adds `amount` to a transaction's total, in Rust: the column holds a
-    /// u64 bit-cast to i64, which SQL's `+` would add as signed (and turn
-    /// into a REAL past i64's range). A sum past u64's range is an error.
-    fn add_to_total(&self, total: Total, tx: TxId, amount: u64) -> Result<()> {
+    /// Adds `amount` to a transaction's total, in Rust, so that a sum past
+    /// what the column stores is an error rather than SQL's `+` turning it
+    /// into a REAL. Past `i64::MAX` (9.2 million XMR in one transaction to
+    /// one account) the write fails rather than storing it negative.
+    fn add_to_total(&self, total: Total, tx: TxId, amount: Amount) -> Result<()> {
         let (select, update) = match total {
             Total::Received => (
                 "SELECT total_received FROM txs WHERE id = ?1",
@@ -1583,11 +1596,12 @@ impl<'a> ScanWriter<'a> {
                 "UPDATE txs SET total_sent = ?1 WHERE id = ?2",
             ),
         };
-        let now: i64 = self.tx.query_row(select, [tx], |r| r.get(0))?;
-        let sum = (now as u64)
-            .checked_add(amount)
+        let now = self.tx.query_row(select, [tx], |r| amount_col(r, 0))?;
+        let sum = now
+            .0
+            .checked_add(amount.0)
             .ok_or_else(|| Error::Internal("a transaction's total would pass 2^64".into()))?;
-        self.tx.execute(update, params![sum as i64, tx])?;
+        self.tx.execute(update, params![SqlU64(sum), tx])?;
         Ok(())
     }
 
@@ -1597,7 +1611,7 @@ impl<'a> ScanWriter<'a> {
         account: AccountId,
         tx: TxId,
         output: OutputId,
-        amount: u64,
+        amount: Amount,
         key_image: &[u8; 32],
         mixin: u32,
         height: Height,
@@ -1613,7 +1627,7 @@ impl<'a> ScanWriter<'a> {
     }
 
     /// Owned outputs by global index, for matching rings against.
-    pub fn owned_indexes(&self, account: AccountId) -> Result<HashMap<u64, OutputRow>> {
+    pub fn owned_indexes(&self, account: AccountId) -> Result<HashMap<GlobalIndex, OutputRow>> {
         Ok(outputs_in(self.tx, account)?
             .into_iter()
             .filter(|o| o.mask.is_some())
@@ -1773,7 +1787,7 @@ mod tests {
                     unlock_time: 0,
                     coinbase: false,
                     mixin: 15,
-                    fee: 3,
+                    fee: Amount(3),
                     payment_id: None,
                     tx_pub_key: [7; 32],
                 },
@@ -1783,9 +1797,9 @@ mod tests {
                     a.id,
                     t,
                     &NewOutput {
-                        out_index: 0,
-                        global_index: 100,
-                        amount: 50,
+                        out_index: OutIndex::new(0),
+                        global_index: GlobalIndex::new(100),
+                        amount: Amount(50),
                         public_key: [4; 32],
                         tx_pub_key: [7; 32],
                         mask: Some([5; 32]),
@@ -1802,9 +1816,9 @@ mod tests {
                     a.id,
                     t,
                     &NewOutput {
-                        out_index: 1,
-                        global_index: 101,
-                        amount: 50,
+                        out_index: OutIndex::new(1),
+                        global_index: GlobalIndex::new(101),
+                        amount: Amount(50),
                         public_key: [4; 32],
                         tx_pub_key: [7; 32],
                         mask: Some([5; 32]),
@@ -1826,13 +1840,13 @@ mod tests {
                     unlock_time: 0,
                     coinbase: false,
                     mixin: 15,
-                    fee: 3,
+                    fee: Amount(3),
                     payment_id: None,
                     tx_pub_key: [7; 32],
                 },
             )?;
             let owned = w.owned_indexes(a.id)?;
-            let o = &owned[&100];
+            let o = &owned[&GlobalIndex::new(100)];
             w.add_spend(a.id, t2, o.id, o.amount, &[6; 32], 15, Height::new(14))?;
             w.set_block(Height::new(14), &[1; 32], 100)?;
             w.set_scan_height(a.id, Height::new(15))?;
@@ -1841,8 +1855,8 @@ mod tests {
         .unwrap();
         let txs = db.txs(a.id).unwrap();
         assert_eq!(txs.len(), 2);
-        assert_eq!(txs[0].total_received, 50);
-        assert_eq!(txs[1].total_sent, 50);
+        assert_eq!(txs[0].total_received, Amount(50));
+        assert_eq!(txs[1].total_sent, Amount(50));
         assert_eq!(db.spends(a.id).unwrap().len(), 1);
         assert_eq!(db.scanner_height().unwrap(), Some(Height::new(15)));
         db.rewind(Height::new(13)).unwrap();
@@ -1864,7 +1878,7 @@ mod tests {
             unlock_time: 0,
             coinbase: false,
             mixin: 15,
-            fee: 0,
+            fee: Amount(0),
             payment_id: None,
             tx_pub_key: [0; 32],
         }
@@ -1872,9 +1886,9 @@ mod tests {
 
     fn new_output(key: u8, global_index: u64, amount: u64, height: u64) -> NewOutput {
         NewOutput {
-            out_index: 0,
-            global_index,
-            amount,
+            out_index: OutIndex::new(0),
+            global_index: GlobalIndex::new(global_index),
+            amount: Amount(amount),
             public_key: [key; 32],
             tx_pub_key: [0; 32],
             mask: Some([1; 32]),
@@ -1948,10 +1962,10 @@ mod tests {
             let o30 = w.add_output(a.id, t1, &new_output(2, 101, 30, 10))?.unwrap();
             let t2 = w.tx_row(a.id, &new_tx(2, 11))?;
             w.add_output(a.id, t2, &new_output(3, 102, 5, 11))?;
-            w.add_spend(a.id, t2, o70, 70, &[7; 32], 15, Height::new(11))?;
+            w.add_spend(a.id, t2, o70, Amount(70), &[7; 32], 15, Height::new(11))?;
             let t3 = w.tx_row(a.id, &new_tx(3, 20))?;
             w.add_output(a.id, t3, &new_output(4, 103, 9, 20))?;
-            w.add_spend(a.id, t3, o30, 30, &[8; 32], 15, Height::new(20))?;
+            w.add_spend(a.id, t3, o30, Amount(30), &[8; 32], 15, Height::new(20))?;
             Ok(())
         })
         .unwrap();
@@ -1959,7 +1973,7 @@ mod tests {
             db.txs(a.id)
                 .unwrap()
                 .iter()
-                .map(|t| (t.height.get(), t.total_received, t.total_sent))
+                .map(|t| (t.height.get(), t.total_received.0, t.total_sent.0))
                 .collect()
         };
         assert_eq!(totals(&db), vec![(10, 100, 0), (11, 5, 70), (20, 9, 30)]);
@@ -1968,30 +1982,94 @@ mod tests {
         assert_eq!(db.spends(a.id).unwrap().len(), 1);
     }
 
-    /// Totals are added as the u64s they are: past 2^63 they read back
-    /// whole, and past 2^64 the write fails rather than wrapping.
+    /// Totals are added in Rust and stored checked: up to `i64::MAX` they
+    /// read back whole, and past it the write fails, nothing written,
+    /// rather than storing a negative number.
     #[test]
-    fn totals_add_as_u64_and_never_wrap() {
+    fn totals_past_what_sqlite_stores_are_refused() {
         let db = Db::in_memory();
         let a = acct(&db);
-        let big = (1u64 << 63) + 5;
+        let max = i64::MAX.unsigned_abs();
         db.write(|tx| {
             let w = ScanWriter::new(tx);
             let t = w.tx_row(a.id, &new_tx(1, 10))?;
-            w.add_output(a.id, t, &new_output(1, 100, big, 10))?;
+            w.add_output(a.id, t, &new_output(1, 100, max - 7, 10))?;
             w.add_output(a.id, t, &new_output(2, 101, 7, 10))?;
             Ok(())
         })
         .unwrap();
-        assert_eq!(db.txs(a.id).unwrap()[0].total_received, big + 7);
+        assert_eq!(db.txs(a.id).unwrap()[0].total_received, Amount(max));
         let over = db.write(|tx| {
             let w = ScanWriter::new(tx);
             let t = w.tx_row(a.id, &new_tx(1, 10))?;
-            w.add_output(a.id, t, &new_output(3, 102, u64::MAX - big, 10))?;
+            w.add_output(a.id, t, &new_output(3, 102, 1, 10))?;
             Ok(())
         });
         assert!(over.is_err());
-        assert_eq!(db.txs(a.id).unwrap()[0].total_received, big + 7, "nothing written");
+        assert_eq!(db.txs(a.id).unwrap()[0].total_received, Amount(max), "nothing written");
+        assert_eq!(db.outputs(a.id).unwrap().len(), 2);
+        // An output past it is refused on its own, as is a total past 2^64.
+        let alone = db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t = w.tx_row(a.id, &new_tx(2, 11))?;
+            w.add_output(a.id, t, &new_output(4, 103, max + 1, 11))?;
+            Ok(())
+        });
+        assert!(alone.is_err());
+    }
+
+    /// Integer columns that hold something no write makes (a negative
+    /// amount, height or timestamp; an out index past u16) are read as
+    /// errors, not cast into a number that isn't what was stored.
+    #[test]
+    fn out_of_range_columns_are_read_as_errors() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t = w.tx_row(a.id, &new_tx(1, 10))?;
+            w.add_output(a.id, t, &new_output(1, 100, 5, 10))?;
+            Ok(())
+        })
+        .unwrap();
+        for (column, value) in [
+            ("amount", "-1"),
+            ("height", "-1"),
+            ("global_index", "-5"),
+            ("out_index", "70000"),
+        ] {
+            db.write(|tx| {
+                tx.execute(&format!("UPDATE outputs SET {column} = {value}"), [])?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(db.outputs(a.id).is_err(), "{column} = {value}");
+            db.write(|tx| {
+                tx.execute(&format!("UPDATE outputs SET {column} = 1"), [])?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(db.outputs(a.id).is_ok());
+        }
+        for column in ["timestamp", "fee", "total_sent"] {
+            db.write(|tx| {
+                tx.execute(&format!("UPDATE txs SET {column} = -1"), [])?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(db.txs(a.id).is_err(), "{column}");
+            db.write(|tx| {
+                tx.execute(&format!("UPDATE txs SET {column} = 0"), [])?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        db.write(|tx| {
+            tx.execute("UPDATE accounts SET scan_height = -1", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(db.account(&addr("A")).is_err());
     }
 
     #[test]

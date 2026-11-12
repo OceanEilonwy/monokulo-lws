@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use curve25519_dalek::scalar::Scalar as DScalar;
-use lws_api::{PrivateViewKey, SubaddrRanges};
+use lws_api::{Amount, PrivateViewKey, SubaddrRanges};
 use monero_wallet::{
     Scanner as OxideScanner, WalletOutput,
     address::{Network, SubaddressIndex},
@@ -41,7 +41,7 @@ use crate::daemon::{Daemon, Fetched, RawBlock};
 use crate::db::{Account, Db, NewOutput, NewTx, OutputRow, ScanWriter, Status};
 use crate::error::{Error, Result};
 use crate::lanes::{Join, Plan};
-use crate::types::{AccountId, Height, OutputId};
+use crate::types::{AccountId, GlobalIndex, Height, OutIndex, OutputId};
 
 /// Blocks the live lane asks for in one request.
 const BATCH: u64 = 100;
@@ -85,14 +85,14 @@ pub struct PoolReceipt {
     pub tx_hash: [u8; 32],
     pub tx_prefix_hash: [u8; 32],
     pub tx_pub_key: [u8; 32],
-    pub out_index: u16,
-    pub amount: u64,
+    pub out_index: OutIndex,
+    pub amount: Amount,
     pub public_key: [u8; 32],
     pub mask: Option<[u8; 32]>,
     pub commitment: Option<[u8; 32]>,
     pub unlock_time: u64,
     pub mixin: u32,
-    pub fee: u64,
+    pub fee: Amount,
     pub payment_id: Option<Vec<u8>>,
     pub maj: u32,
     pub min: u32,
@@ -109,7 +109,7 @@ pub struct PoolSpend {
     pub key_image: [u8; 32],
     pub mixin: u32,
     pub unlock_time: u64,
-    pub fee: u64,
+    pub fee: Amount,
 }
 
 /// What the pool holds for the live lane's accounts, worked out once per
@@ -355,7 +355,7 @@ pub fn stand_in(block: &ScannableBlock, first_indexes: &[Option<u64>], tx: usize
 /// Every lane account's RingCT outputs by global index, for candidate spends:
 /// one lookup per ring member, whoever's it is.
 #[derive(Default)]
-pub struct SpendMap(HashMap<u64, Vec<(AccountId, OutputRow)>>);
+pub struct SpendMap(HashMap<GlobalIndex, Vec<(AccountId, OutputRow)>>);
 
 impl SpendMap {
     fn of<'a>(w: &ScanWriter, accounts: impl IntoIterator<Item = &'a Account>) -> Result<SpendMap> {
@@ -372,7 +372,7 @@ impl SpendMap {
         self.0.entry(row.global_index).or_default().push((account, row));
     }
 
-    fn get(&self, global_index: u64) -> &[(AccountId, OutputRow)] {
+    fn get(&self, global_index: GlobalIndex) -> &[(AccountId, OutputRow)] {
         self.0.get(&global_index).map_or(&[], Vec::as_slice)
     }
 
@@ -1490,7 +1490,7 @@ struct TxMeta {
     unlock_time: u64,
     coinbase: bool,
     mixin: u32,
-    fee: u64,
+    fee: Amount,
     payment_id: Option<Vec<u8>>,
     main_key: [u8; 32],
     /// The key the output in hand was derived from.
@@ -1578,11 +1578,11 @@ fn record_received(
         }
         let mask: DScalar = output.commitment().mask.into();
         let rct = !matches!(tx, Transaction::V1 { .. });
-        let index = usize::from(out_index);
+        let index = usize::from(out_index.get());
         let new = NewOutput {
             out_index,
-            global_index: output.index_on_blockchain(),
-            amount: output.commitment().amount,
+            global_index: GlobalIndex::new(output.index_on_blockchain()),
+            amount: Amount(output.commitment().amount),
             public_key: output.key().compress().to_bytes(),
             tx_pub_key: meta.derived_key,
             mask: rct.then(|| *mask.as_bytes()),
@@ -1690,7 +1690,7 @@ pub fn scan_pool_block(
             };
             let tx = &block.transactions[i];
             let out_index = out_index(&output)?;
-            let index = usize::from(out_index);
+            let index = usize::from(out_index.get());
             let meta = TxMeta::of(tx, &output, &account.view_key);
             let list = found.received.entry(account.id).or_default();
             let public_key = output.key().compress().to_bytes();
@@ -1703,7 +1703,7 @@ pub fn scan_pool_block(
                 tx_prefix_hash: meta.prefix_hash,
                 tx_pub_key: meta.derived_key,
                 out_index,
-                amount: output.commitment().amount,
+                amount: Amount(output.commitment().amount),
                 public_key,
                 mask: Some(output.commitment().mask.into()).map(|m: DScalar| *m.as_bytes()),
                 commitment: onchain_commitment(tx, index, &output),
@@ -1741,7 +1741,7 @@ pub fn scan_pool_block(
             let mut absolute = 0u64;
             for offset in key_offsets {
                 absolute = absolute.saturating_add(*offset);
-                for (account, ours) in spends.get(absolute) {
+                for (account, ours) in spends.get(GlobalIndex::new(absolute)) {
                     let list = found.spent.entry(*account).or_default();
                     let key_image = key_image.to_bytes();
                     if !list
@@ -1798,7 +1798,7 @@ fn record_spends(
             let mut absolute = 0u64;
             for offset in key_offsets {
                 absolute = absolute.saturating_add(*offset);
-                for (account, ours) in spends.get(absolute) {
+                for (account, ours) in spends.get(GlobalIndex::new(absolute)) {
                     if accounts.get(account).is_none_or(|a| a.scan_height > height) {
                         continue;
                     }
@@ -1871,8 +1871,9 @@ fn is_coinbase(tx: &Transaction<Pruned>) -> bool {
 /// An output's index in its transaction, which the chain keeps far below
 /// 65,536 (a RingCT transaction has at most 16 outputs; a pre-RingCT one is
 /// bounded by its size): an index past that is a node making things up.
-fn out_index(output: &WalletOutput) -> Result<u16> {
+fn out_index(output: &WalletOutput) -> Result<OutIndex> {
     u16::try_from(output.index_in_transaction())
+        .map(OutIndex::new)
         .map_err(|_| Error::Daemon(format!("an output index of {}", output.index_in_transaction())))
 }
 
@@ -1892,8 +1893,8 @@ fn mixin(tx: &Transaction<Pruned>) -> u32 {
 
 /// The fee a transaction paid: the RingCT base's for a RingCT transaction,
 /// inputs less outputs for a pre-RingCT one, 0 for a coinbase.
-fn fee(tx: &Transaction<Pruned>) -> u64 {
-    match tx {
+fn fee(tx: &Transaction<Pruned>) -> Amount {
+    Amount(match tx {
         _ if is_coinbase(tx) => 0,
         Transaction::V2 { proofs: Some(p), .. } => p.base.fee,
         Transaction::V2 { proofs: None, .. } => 0,
@@ -1913,7 +1914,7 @@ fn fee(tx: &Transaction<Pruned>) -> u64 {
                 .fold(0u64, u64::saturating_add);
             inputs.saturating_sub(outputs)
         }
-    }
+    })
 }
 
 /// The Pedersen commitment the chain holds for output `index` of `tx`, which
@@ -2424,9 +2425,9 @@ mod tests {
         let row = |global_index: u64| OutputRow {
             id: OutputId::new(global_index),
             tx: crate::types::TxId::new(1),
-            out_index: 0,
-            global_index,
-            amount: 5,
+            out_index: OutIndex::new(0),
+            global_index: GlobalIndex::new(global_index),
+            amount: Amount(5),
             public_key: [0; 32],
             tx_pub_key: [0; 32],
             mask: Some([0; 32]),
@@ -2440,11 +2441,14 @@ mod tests {
         map.add(a(2), row(11));
         map.add(a(3), row(10));
         assert_eq!(
-            map.get(10).iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            map.get(GlobalIndex::new(10))
+                .iter()
+                .map(|(a, _)| *a)
+                .collect::<Vec<_>>(),
             vec![a(1), a(3)]
         );
-        assert_eq!(map.get(11).len(), 1);
-        assert!(map.get(12).is_empty());
+        assert_eq!(map.get(GlobalIndex::new(11)).len(), 1);
+        assert!(map.get(GlobalIndex::new(12)).is_empty());
     }
 
     /// `account` read again: an `Account` isn't `Clone` (its view key isn't).
@@ -2511,7 +2515,7 @@ mod tests {
     fn check_recorded(db: &Db, a: &Account, b: &Account) {
         let outputs = db.outputs(a.id).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].global_index, 1006);
+        assert_eq!(outputs[0].global_index, GlobalIndex::new(1006));
         assert_eq!(outputs[0].height, Height::new(100));
         let spends = db.spends(a.id).unwrap();
         assert_eq!(spends.len(), 1, "the ring at 101 holds 1006");
@@ -3050,7 +3054,7 @@ mod tests {
         }
         let received = app.scanner.mempool.lock().unwrap().for_account(account.id);
         assert_eq!(received.len(), 1);
-        assert_eq!((received[0].tx_hash, received[0].amount), (paying_hash, 42_000));
+        assert_eq!((received[0].tx_hash, received[0].amount), (paying_hash, Amount(42_000)));
 
         let before = node.calls.lock().unwrap().len();
         app.scanner.scan_pool(&accounts).await.unwrap();

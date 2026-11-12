@@ -121,16 +121,16 @@ async fn creation_height(app: &App) -> Result<Height> {
 
 /// The fee served for a transaction, as monero-lws serves it: a
 /// `uint64-string`, `"0"` for a coinbase transaction (stored as 0).
-fn fee_of(fee: u64) -> Option<Amount> {
-    Some(Amount(fee))
+fn fee_of(fee: Amount) -> Option<Amount> {
+    Some(fee)
 }
 
 fn spend_of(o: &OutputRow, key_image: [u8; 32], mixin: u32) -> Spend {
     Spend {
-        amount: Amount(o.amount),
+        amount: o.amount,
         key_image: Hex(key_image),
         tx_pub_key: Hex(o.tx_pub_key),
-        out_index: o.out_index,
+        out_index: o.out_index.get(),
         mixin,
         sender: Some(meta(o.maj, o.min)),
     }
@@ -223,14 +223,14 @@ pub async fn get_address_info(State(app): State<Arc<App>>, ApiJson(login): ApiJs
     let mut total_received = 0u64;
     let mut locked = 0u64;
     for o in outputs.values() {
-        total_received = total_received.saturating_add(o.amount);
+        total_received = total_received.saturating_add(o.amount.0);
         // The schema ties every output to its transaction; one missing is
         // counted as locked rather than taking the request down.
         let unlocked = txs
             .get(&o.tx)
             .is_some_and(|tx| unlocked(o.height, tx.coinbase, tx.unlock_time, chain, now));
         if !unlocked {
-            locked = locked.saturating_add(o.amount);
+            locked = locked.saturating_add(o.amount.0);
         }
     }
     let spent_outputs: Vec<Spend> = spends_by_tx(&spends, &outputs).into_values().flatten().collect();
@@ -286,17 +286,17 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
     for o in outputs.values() {
         receives_by_tx.entry(o.tx).or_default().push(ReceivedOutput {
             commitment: o.commitment.map(Hex),
-            amount: Amount(o.amount),
+            amount: o.amount,
             public_key: Hex(o.public_key),
-            index: o.out_index,
-            global_index: Amount(o.global_index),
+            index: o.out_index.get(),
+            global_index: Amount(o.global_index.get()),
             tx_pub_key: Hex(o.tx_pub_key),
             rct: o.mask.map(Hex),
             recipient: meta(o.maj, o.min),
         });
     }
     let mut spends = spends_by_tx(&spends, &outputs);
-    let mut total_received = outputs.values().map(|o| o.amount).fold(0u64, u64::saturating_add);
+    let mut total_received = outputs.values().map(|o| o.amount.0).fold(0u64, u64::saturating_add);
     let mined: std::collections::HashSet<[u8; 32]> = rows.iter().map(|t| t.hash).collect();
     let mut transactions: Vec<Transaction> = rows
         .into_iter()
@@ -309,8 +309,8 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
                 id: t.id.get(),
                 hash: Hex(t.hash),
                 timestamp: Some(Timestamp::from_unix(t.timestamp)),
-                total_received: Amount(t.total_received),
-                total_sent: Amount(t.total_sent),
+                total_received: t.total_received,
+                total_sent: t.total_sent,
                 unlock_time: t.unlock_time,
                 height: Some(t.height.get()),
                 spent_outputs: spends.remove(&t.id).unwrap_or_default(),
@@ -352,7 +352,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
     let next_id = transactions.iter().map(|t| t.id + 1).max().unwrap_or(1);
     for (n, (hash, mut receipts, spent)) in pooled.into_iter().enumerate() {
         receipts.sort_by_key(|r| r.out_index);
-        let received = receipts.iter().map(|r| r.amount).fold(0, u64::saturating_add);
+        let received = receipts.iter().map(|r| r.amount.0).fold(0, u64::saturating_add);
         // As monero-lws: a pool transaction's outputs count in the total.
         total_received = total_received.saturating_add(received);
         let spent_outputs: Vec<Spend> = spent
@@ -366,7 +366,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
         };
         transactions.push(Transaction {
             proof: None,
-            fee: Some(Amount(fee)),
+            fee: Some(fee),
             id: next_id + n as u64,
             hash: Hex(hash),
             timestamp: None,
@@ -379,9 +379,9 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
                 .iter()
                 .map(|r| ReceivedOutput {
                     commitment: r.commitment.map(Hex),
-                    amount: Amount(r.amount),
+                    amount: r.amount,
                     public_key: Hex(r.public_key),
-                    index: r.out_index,
+                    index: r.out_index.get(),
                     global_index: Amount(0),
                     tx_pub_key: Hex(r.tx_pub_key),
                     rct: r.mask.map(Hex),
@@ -437,35 +437,35 @@ pub async fn get_unspent_outs(
         // is below the one asked for (a coinbase transaction's is 0, so any
         // mixin leaves coinbase outputs out) or its amount is below the
         // dust threshold. Locked outputs are listed; the client decides.
-        if tx.mixin < req.mixin || o.amount < dust {
+        if tx.mixin < req.mixin || o.amount.0 < dust {
             continue;
         }
-        total = total.saturating_add(o.amount);
+        total = total.saturating_add(o.amount.0);
         let rct = o.mask.and_then(|mask| {
             if tx.coinbase {
                 Some(crypto::coinbase_rct())
             } else {
                 // The commitment the chain holds for the output (the same as
                 // monero-lws's `commit(amount, mask)` for a sound output).
-                let commitment = o.commitment.unwrap_or_else(|| crypto::commit(&mask, o.amount));
+                let commitment = o.commitment.unwrap_or_else(|| crypto::commit(&mask, o.amount.0));
                 crypto::legacy_rct(
                     &account.view_key,
                     &o.tx_pub_key,
-                    o.out_index as u64,
+                    u64::from(o.out_index.get()),
                     &commitment,
                     &mask,
-                    o.amount,
+                    o.amount.0,
                 )
             }
             .map(|b| HexBytes(b.to_vec()))
         });
         listed.push(Output {
-            amount: Amount(o.amount),
+            amount: o.amount,
             public_key: Hex(o.public_key),
-            index: o.out_index,
-            global_index: Amount(o.global_index),
+            index: o.out_index.get(),
+            global_index: Amount(o.global_index.get()),
             // monero-lws writes the global index here too.
-            tx_id: o.global_index,
+            tx_id: o.global_index.get(),
             tx_hash: Hex(tx.hash),
             tx_prefix_hash: Hex(tx.prefix_hash),
             tx_pub_key: Hex(o.tx_pub_key),

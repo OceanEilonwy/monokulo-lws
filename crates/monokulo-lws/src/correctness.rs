@@ -68,7 +68,7 @@ fn outputs_of(db: &Db, accounts: &[Account]) -> Vec<(crate::types::AccountId, u6
             db.outputs(a.id)
                 .unwrap()
                 .into_iter()
-                .map(move |o| (a.id, o.global_index, o.out_index, o.amount, o.height))
+                .map(move |o| (a.id, o.global_index.get(), o.out_index.get(), o.amount.0, o.height))
         })
         .collect();
     all.sort();
@@ -275,7 +275,7 @@ fn stand_in_blocks_keep_global_indexes_on_mainnet_shaped_blocks() {
         .outputs(accounts[0].id)
         .unwrap()
         .iter()
-        .map(|o| o.global_index)
+        .map(|o| o.global_index.get())
         .collect();
     let mut got_sorted = got.clone();
     got_sorted.sort();
@@ -414,13 +414,13 @@ fn several_accounts_in_one_transaction_and_one_paid_twice() {
     assert_eq!(
         a_out
             .iter()
-            .map(|o| (o.out_index, o.global_index, o.amount))
+            .map(|o| (o.out_index.get(), o.global_index.get(), o.amount.0))
             .collect::<Vec<_>>(),
         vec![(0, 901, 10), (2, 903, 30)]
     );
     let a_txs = db.txs(accounts[0].id).unwrap();
     assert_eq!(a_txs.len(), 1, "one transaction row");
-    assert_eq!(a_txs[0].total_received, 40);
+    assert_eq!(a_txs[0].total_received, Amount(40));
     assert_eq!(db.outputs(accounts[1].id).unwrap().len(), 1);
     assert!(db.outputs(accounts[2].id).unwrap().is_empty());
 }
@@ -455,7 +455,9 @@ async fn subaddresses_through_additional_keys_and_the_lookahead() {
     let (db, accounts) = both_ways(&[&w], 100, make);
     let outs = db.outputs(accounts[0].id).unwrap();
     assert_eq!(
-        outs.iter().map(|o| (o.maj, o.min, o.global_index)).collect::<Vec<_>>(),
+        outs.iter()
+            .map(|o| (o.maj, o.min, o.global_index.get()))
+            .collect::<Vec<_>>(),
         vec![(0, 2, 51), (0, 0, 52)]
     );
     let (_, main) = tx_key(70);
@@ -557,7 +559,7 @@ fn a_reorg_drops_what_the_orphaned_blocks_held_and_the_new_chain_is_scanned() {
     db.rewind(Height::new(101)).unwrap();
     assert!(db.spends(accounts[0].id).unwrap().is_empty());
     assert_eq!(db.txs(accounts[0].id).unwrap().len(), 1);
-    assert_eq!(db.txs(accounts[0].id).unwrap()[0].total_sent, 0);
+    assert_eq!(db.txs(accounts[0].id).unwrap()[0].total_sent, Amount(0));
     assert!(db.block_hash(Height::new(101)).unwrap().is_none());
     assert_eq!(db.account(&a.address()).unwrap().unwrap().scan_height, Height::new(101));
 
@@ -577,7 +579,9 @@ fn a_reorg_drops_what_the_orphaned_blocks_held_and_the_new_chain_is_scanned() {
     write(&db, &accounts, vec![new_100], 100, true, None);
     let outs = db.outputs(accounts[0].id).unwrap();
     assert_eq!(
-        outs.iter().map(|o| (o.global_index, o.amount)).collect::<Vec<_>>(),
+        outs.iter()
+            .map(|o| (o.global_index.get(), o.amount.0))
+            .collect::<Vec<_>>(),
         vec![(1_003, 555)]
     );
     assert!(db.outputs(accounts[1].id).unwrap().is_empty());
