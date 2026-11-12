@@ -32,7 +32,7 @@
 - **Speaks the light wallet API.** The [REST API](https://github.com/monero-project/meta/blob/master/api/lightwallet_rest.md) MyMonero defined and [monero-lws](https://github.com/vtnerd/monero-lws) implements, with monero-lws's subaddress extensions; the endpoints a wallet sends with answer field for field as monero-lws does. Built for [Fob](https://github.com/OceanEilonwy/monokulo-fob)'s Light Wallet mode and for Monokular shops that run a node already, but any client that speaks the API can use it.
 - **Proves what it reports.** Each output comes with the commitment the chain holds for it, and each mined transaction that pays a wallet with a proof of inclusion: the block and the pruned transaction, so a client can hash it into a block it checks against a node of its own. A server holding the view key can't invent or inflate a payment.
 - **Scans on the GPU.** The [monokulo-8ar](https://github.com/OceanEilonwy/monokulo-8ar) keyring works out 8·a·R for every transaction key with every wallet's view key in one pass: a day of mainnet for 1,000 wallets in about 15 seconds on an RX 6800 XT. Without a usable GPU every block goes to monero-oxide, which is plenty for a shop, a family or a few dozen wallets.
-- **Runs on a router.** An OpenWrt package with a LuCI page, Services › Light Wallet Server, is built on every push to main for aarch64 and x86_64.
+- **Runs on a router.** An OpenWrt package with a LuCI page, Services › Light Wallet Server, is built on every push to main for aarch64 and x86_64 and published as a [signed apk repository](https://oceaneilonwy.github.io/monokulo-lws/). Mainnet, stagenet and testnet run side by side, each turned on with one switch.
 - **Careful by default.** Loopback only until told otherwise, TLS of its own or behind a proxy, limits on request size, time and rate, admin keys stored hashed and served on a listener of their own, and no view key or address in the log at any level.
 - **One small program.** One binary and one SQLite file. A kill mid-batch leaves every wallet at a height it really scanned to, and reorgs are rolled back for every wallet at once.
 
@@ -43,17 +43,19 @@ Any version works; a public node is fine for trying it out.
 
 ### On an OpenWrt router
 
-Take the `monokulo-lws-openwrt-<release>-<arch>` artifact of the newest
-[openwrt package run](https://github.com/OceanEilonwy/monokulo-lws/actions/workflows/openwrt.yml) on main, then on
-the router:
+The packages are in a signed apk repository: **<https://oceaneilonwy.github.io/monokulo-lws/>** says how to
+add it in LuCI. Over SSH on the router:
 
 ```sh
-wget -O /etc/apk/keys/monokulo.pem https://raw.githubusercontent.com/OceanEilonwy/monokulo-lws/main/openwrt/keys/monokulo.pem
-apk add ./monokulo-lws-*.apk
+wget -O /etc/apk/keys/monokulo.pem https://oceaneilonwy.github.io/monokulo-lws/monokulo.pem
+. /etc/openwrt_release
+echo "https://oceaneilonwy.github.io/monokulo-lws/openwrt/${DISTRIB_RELEASE%.*}/$DISTRIB_ARCH/packages.adb" >> /etc/apk/repositories.d/customfeeds.list
+apk update && apk add monokulo-lws
 ```
 
-Then open **Services › Light Wallet Server** in LuCI: the server's status, the wallets it scans and every
-setting. The whole story, from the firewall rule to backups, is in [docs/openwrt.md](docs/openwrt.md).
+Then open **Services › Light Wallet Server** in LuCI: each network's status, the wallets it scans and every
+setting. Mainnet runs at first; stagenet and testnet each run beside it with a tick under Networks. The whole
+story, from the firewall rule to backups, is in [docs/openwrt.md](docs/openwrt.md).
 
 ### On a computer
 

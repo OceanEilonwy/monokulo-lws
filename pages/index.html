@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>monokulo-lws for OpenWrt</title>
+<meta name="description" content="monokulo-lws, a Monero light wallet server you run yourself, as a signed apk repository for OpenWrt routers, with its LuCI page. Mainnet, stagenet and testnet side by side.">
+<link rel="icon" href="assets/lws-mark-small.svg" type="image/svg+xml">
+<style>
+:root{
+  --paper:#F4F1EA;--card:#FFFDF8;--ink:#1A1917;--muted:#5A554D;--line:#DDD6C8;
+  --glass:#E85D00;--glass-deep:#C24E00;--lit:#FFB066;--code:#EFE9DD;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{--paper:#161513;--card:#201F1C;--ink:#F4F1EA;--muted:#B5AEA2;--line:#3A3733;--glass:#FF8A33;--glass-deep:#FF6600;--code:#2A2825}
+}
+*{box-sizing:border-box}
+html{background:var(--paper)}
+body{margin:0;color:var(--ink);background:var(--paper);font:16px/1.6 var(--sans)}
+a{color:var(--glass-deep)}
+@media (prefers-color-scheme:dark){a{color:var(--glass)}}
+code,pre{font-family:var(--mono);font-size:.9em}
+code{overflow-wrap:anywhere}
+main{max-width:860px;margin:0 auto;padding:40px 16px 64px}
+header{display:flex;align-items:center;gap:18px;margin-bottom:28px}
+header img{width:72px;height:72px;flex:none}
+h1{font-size:clamp(28px,5vw,40px);line-height:1.1;margin:0}
+h2{font-size:24px;margin:40px 0 12px}
+h3{font-size:18px;margin:0 0 6px}
+p{margin:0 0 10px}
+.lead{color:var(--muted);font-size:18px;margin:6px 0 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;margin:14px 0}
+.path{font-weight:600;color:var(--muted);font-size:14px;margin-bottom:6px}
+pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:8px 0;overflow-x:auto;white-space:pre}
+ol.steps{list-style:none;padding:0;margin:0;counter-reset:step}
+ol.steps>li{counter-increment:step;position:relative;padding-left:44px;margin:0 0 22px}
+ol.steps>li::before{content:counter(step);position:absolute;left:0;top:0;width:30px;height:30px;border-radius:50%;
+  background:var(--glass);color:#fff;font-weight:700;display:flex;align-items:center;justify-content:center}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+td code{font-size:13px}
+.tablewrap{overflow-x:auto}
+.muted{color:var(--muted)}
+.small{font-size:14px}
+ul.files{padding-left:20px;margin:6px 0 0}
+.nets{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-top:10px}
+.nets div{border:1px solid var(--line);border-radius:10px;padding:12px}
+.nets strong{display:block}
+footer{margin-top:48px;color:var(--muted);font-size:14px}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/lws-mark-on-dark.svg">
+      <img src="assets/lws-mark.svg" alt="">
+    </picture>
+    <div>
+      <h1>monokulo-lws for OpenWrt</h1>
+      <p class="lead">A Monero light wallet server you run yourself, on your router, with its own LuCI page.</p>
+    </div>
+  </header>
+
+  <p>monokulo-lws scans the chain through your own <code>monerod</code> for every wallet registered with it, by the wallet’s private view key, and answers the light wallet REST API, so a wallet catches up in one request. Wallets keep their spend keys and sign on their own. This page is the signed apk repository for OpenWrt 25.12 and up, built from <a href="@REPO_URL@">the source</a> on every push to main.</p>
+
+  <div class="nets">
+    <div><strong>Mainnet</strong><span class="muted small">on by default · node <code>:18081</code> · wallet API <code>:8443</code></span></div>
+    <div><strong>Stagenet</strong><span class="muted small">one switch away · node <code>:38081</code> · wallet API <code>:38443</code></span></div>
+    <div><strong>Testnet</strong><span class="muted small">one switch away · node <code>:28081</code> · wallet API <code>:28443</code></span></div>
+  </div>
+  <p class="muted small" style="margin-top:10px">Each network turned on runs its own server, side by side, with its own node, ports, database and wallets. Turn them on and off in <strong>Services › Light Wallet Server › Networks</strong>.</p>
+
+  <h2 id="repositories">Repositories</h2>
+  <p>One per OpenWrt release and CPU architecture. Your router’s are in <span class="path">Status › Overview</span> (<em>Firmware Version</em> and <em>Architecture</em>), or in a terminal: <code>cat /etc/openwrt_release</code>.</p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>OpenWrt</th><th>Architecture</th><th>Repository</th></tr></thead>
+      <tbody>
+@REPOS@
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="install-luci">Install in LuCI</h2>
+  <div class="card">
+    <ol class="steps">
+      <li>
+        <h3>Trust the signing key</h3>
+        <p class="path">System › Administration › Repo Public Keys</p>
+        <p>Paste the key (or its address, <code>@PAGES_URL@/monokulo.pem</code>) into the box and click <strong>Add key</strong>. It is the same key that signs monokulo’s and Kringle’s packages; if you trust it already, skip this.</p>
+        <pre>@PUBKEY@</pre>
+      </li>
+      <li>
+        <h3>Add the repository</h3>
+        <p class="path">System › Software › Configure apk</p>
+        <p>In the box for <code>/etc/apk/repositories.d/customfeeds.list</code>, add the repository for your release and architecture from the table above on a line of its own, then <strong>Save</strong>.</p>
+      </li>
+      <li>
+        <h3>Install</h3>
+        <p class="path">System › Software</p>
+        <p>Click <strong>Update lists…</strong>, filter for <code>monokulo-lws</code>, and <strong>Install…</strong> it. The mainnet server starts at once, against a node at <code>http://127.0.0.1:18081</code>.</p>
+      </li>
+      <li>
+        <h3>Set it up</h3>
+        <p class="path">Services › Light Wallet Server</p>
+        <p>Reload LuCI for the new menu item. Under <strong>Networks</strong>, point each network at its node and tick <em>On</em> for the ones you want, then <strong>Save &amp; Apply</strong>. Add wallets under <strong>Wallets</strong>, one network at a time.</p>
+      </li>
+    </ol>
+  </div>
+
+  <h2 id="install-ssh">Install over SSH</h2>
+  <div class="card">
+    <p>This picks your router’s release and architecture for you:</p>
+    <pre>wget -O /etc/apk/keys/monokulo.pem @PAGES_URL@/monokulo.pem
+. /etc/openwrt_release
+echo "@PAGES_URL@/openwrt/${DISTRIB_RELEASE%.*}/$DISTRIB_ARCH/packages.adb" &gt;&gt; /etc/apk/repositories.d/customfeeds.list
+apk update
+apk add monokulo-lws</pre>
+    <p>Turn stagenet on beside mainnet, against a stagenet node on this router:</p>
+    <pre>uci set monokulo-lws.stagenet.enabled=1
+uci set monokulo-lws.stagenet.daemon=http://127.0.0.1:38081
+uci commit monokulo-lws
+service monokulo-lws reload</pre>
+  </div>
+
+  <h2 id="upgrade">Upgrade and remove</h2>
+  <div class="card">
+    <pre>apk update &amp;&amp; apk upgrade monokulo-lws</pre>
+    <p class="small muted">Settings, databases and admin keys are kept, and a firmware upgrade keeps them too. Settings from a version with one server move to the matching network’s section at the first start.</p>
+    <pre>apk del monokulo-lws</pre>
+    <p class="small muted">Removal leaves <code>/srv/monokulo-lws*</code> (every wallet’s view key), <code>/etc/monokulo-lws/</code> and <code>/etc/config/monokulo-lws</code> for you to delete.</p>
+  </div>
+
+  <h2 id="files">Package files</h2>
+  <p class="muted small">Not needed if you use a repository. Signed with the same key, so once it is trusted they install directly: <span class="path">System › Software › Upload Package…</span>, or <code>apk add ./file.apk</code>.</p>
+  <ul class="files">
+@FILES@
+    <li><a href="monokulo.pem">monokulo.pem</a>: the signing key</li>
+  </ul>
+
+  <footer>
+    Read <a href="@REPO_URL@/blob/main/docs/openwrt.md">docs/openwrt.md</a> for the page, the settings and how the package is built, and <a href="@REPO_URL@/blob/main/docs/security.md">docs/security.md</a> before letting wallets reach it from the internet. Built from <a href="@REPO_URL@/commit/@COMMIT@"><code>@COMMIT_SHORT@</code></a>.
+  </footer>
+</main>
+</body>
+</html>

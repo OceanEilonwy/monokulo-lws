@@ -28,6 +28,12 @@
 # (scripts/test-openwrt.sh). There is no aarch64_cortex-a53 rootfs image:
 # that build's proof is its static-link check, and the router.
 #
+# On main, once that passes, the pages job puts every signed repository on
+# GitHub Pages (scripts/build-pages.sh), with the install page:
+#   https://oceaneilonwy.github.io/monokulo-lws/
+#   https://oceaneilonwy.github.io/monokulo-lws/openwrt/<release>/<arch>/packages.adb
+# The repository's Pages source must be GitHub Actions (Settings > Pages).
+#
 # Needs the repository secret APK_SIGNING_KEY: the private key matching
 # openwrt/keys/monokulo.pem (the same key signs monokulo and kringle). Pull
 # requests from forks (no secret access) still build, with a throwaway key.
@@ -48,6 +54,8 @@ on:
       - 'Cargo.lock'
       - 'scripts/build-openwrt.sh'
       - 'scripts/test-openwrt.sh'
+      - 'scripts/build-pages.sh'
+      - 'pages/**'
       - '.github/workflows/openwrt.yml'
   workflow_dispatch:
 
@@ -218,3 +226,50 @@ jobs:
           path: dist/repo
       - name: Install, run, drive, upgrade and remove it in OpenWrt
         run: scripts/test-openwrt.sh dist
+
+  pages:
+    # The GitHub Pages site, from main alone, once every package is signed
+    # and the x86_64 one passed its test: each signed repository under
+    # openwrt/<release>/<arch>/, the public key, and the install page
+    # (scripts/build-pages.sh). No secret: the repositories are signed
+    # already.
+    name: build the GitHub Pages site
+    needs: [sign, test]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Each repository in a folder of its own, named as its artifact.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: openwrt-repo-*
+          path: repos
+      - name: Build the site
+        env:
+          COMMIT: ${{ github.sha }}
+        run: scripts/build-pages.sh repos site
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: site/
+
+  deploy:
+    name: deploy the GitHub Pages site
+    needs: pages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # One deployment at a time, in the order they started.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
