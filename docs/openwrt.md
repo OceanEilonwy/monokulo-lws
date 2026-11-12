@@ -102,8 +102,13 @@ proxy's port instead. Read [security.md](security.md) before that.
 the server with cargo for the OpenWrt target, with the C parts (SQLite,
 ring) compiled by the gcc from the official OpenWrt SDK image, checks that
 the result is a static executable, then runs the SDK in Docker to package
-it with [`openwrt/monokulo-lws`](../openwrt/monokulo-lws) and sign the
-package and the repository index. `scripts/test-openwrt.sh` boots the
+it with [`openwrt/monokulo-lws`](../openwrt/monokulo-lws). Signing the
+package and the repository index is a separate step (`build-openwrt.sh
+sign`) in a fresh SDK container that runs nothing but `apk`: the signing
+key is never in the environment while cargo, a dependency's build script
+or the SDK's own build runs. CI builds in one job without the secret and
+signs in another, on a fresh runner. Every Docker image is pinned by
+digest and every action by commit. `scripts/test-openwrt.sh` boots the
 official x86_64 rootfs image in Docker and installs, starts (against a
 stand-in node), drives through the LuCI backend, upgrades and removes the
 package there; CI runs it after the x86_64 build. Both run locally too,
