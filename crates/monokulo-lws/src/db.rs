@@ -693,12 +693,13 @@ impl Db {
             tx.execute("DELETE FROM blocks_kept WHERE height >= ?1", [h])?;
             tx.execute("DELETE FROM txs_kept WHERE height >= ?1", [h])?;
             tx.execute("UPDATE accounts SET scan_height = MIN(scan_height, ?1)", [h])?;
-            tx.execute("UPDATE txs SET total_received = (SELECT COALESCE(SUM(amount), 0) FROM outputs WHERE outputs.tx = txs.id)", [])?;
+            // The totals of the transactions left need no recomputing: an
+            // output or spend is written at its transaction's height, so every
+            // one deleted belonged to a transaction deleted with it.
             tx.execute(
-                "UPDATE txs SET total_sent = (SELECT COALESCE(SUM(o.amount), 0) FROM spends s JOIN outputs o ON o.id = s.output WHERE s.tx = txs.id)",
-                [],
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('scanner_height', ?1)",
+                [height.to_string()],
             )?;
-            tx.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('scanner_height', ?1)", [height.to_string()])?;
             Ok(())
         })
     }
@@ -943,6 +944,13 @@ fn drop_unused_kept(tx: &Transaction, height: u64) -> Result<()> {
     Ok(())
 }
 
+/// A transaction's running total.
+#[derive(Clone, Copy)]
+enum Total {
+    Received,
+    Sent,
+}
+
 /// Writes the scanner makes, inside one transaction per batch of blocks.
 pub struct ScanWriter<'a> {
     tx: &'a Transaction<'a>,
@@ -1071,11 +1079,31 @@ impl<'a> ScanWriter<'a> {
         if changed == 0 {
             return Ok(None);
         }
-        self.tx.execute(
-            "UPDATE txs SET total_received = total_received + ?1 WHERE id = ?2",
-            params![o.amount as i64, tx],
-        )?;
-        Ok(Some(self.tx.last_insert_rowid()))
+        let id = self.tx.last_insert_rowid();
+        self.add_to_total(Total::Received, tx, o.amount)?;
+        Ok(Some(id))
+    }
+
+    /// Adds `amount` to a transaction's total, in Rust: the column holds a
+    /// u64 bit-cast to i64, which SQL's `+` would add as signed (and turn
+    /// into a REAL past i64's range). A sum past u64's range is an error.
+    fn add_to_total(&self, total: Total, tx: i64, amount: u64) -> Result<()> {
+        let (select, update) = match total {
+            Total::Received => (
+                "SELECT total_received FROM txs WHERE id = ?1",
+                "UPDATE txs SET total_received = ?1 WHERE id = ?2",
+            ),
+            Total::Sent => (
+                "SELECT total_sent FROM txs WHERE id = ?1",
+                "UPDATE txs SET total_sent = ?1 WHERE id = ?2",
+            ),
+        };
+        let now: i64 = self.tx.query_row(select, [tx], |r| r.get(0))?;
+        let sum = (now as u64)
+            .checked_add(amount)
+            .ok_or_else(|| Error::Internal("a transaction's total would pass 2^64".into()))?;
+        self.tx.execute(update, params![sum as i64, tx])?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1094,10 +1122,7 @@ impl<'a> ScanWriter<'a> {
             params![account, tx, output, key_image.as_slice(), mixin, height as i64],
         )?;
         if changed > 0 {
-            self.tx.execute(
-                "UPDATE txs SET total_sent = total_sent + ?1 WHERE id = ?2",
-                params![amount as i64, tx],
-            )?;
+            self.add_to_total(Total::Sent, tx, amount)?;
         }
         Ok(())
     }
@@ -1328,6 +1353,95 @@ mod tests {
         db.rescan(&["A".into()], 0).unwrap();
         assert!(db.outputs(a.id).unwrap().is_empty());
         assert_eq!(db.account("A").unwrap().unwrap().scan_height, 0);
+    }
+
+    fn new_tx(hash: u8, height: u64) -> NewTx<'static> {
+        NewTx {
+            hash: [hash; 32],
+            prefix_hash: [0; 32],
+            height,
+            timestamp: 0,
+            unlock_time: 0,
+            coinbase: false,
+            mixin: 15,
+            fee: 0,
+            payment_id: None,
+            tx_pub_key: [0; 32],
+        }
+    }
+
+    fn new_output(key: u8, global_index: u64, amount: u64, height: u64) -> NewOutput {
+        NewOutput {
+            out_index: 0,
+            global_index,
+            amount,
+            public_key: [key; 32],
+            tx_pub_key: [0; 32],
+            mask: Some([1; 32]),
+            height,
+            maj: 0,
+            min: 0,
+            commitment: None,
+        }
+    }
+
+    /// A rewind leaves the totals of the transactions before it as they
+    /// were, received and sent, without recomputing them.
+    #[test]
+    fn totals_stay_right_after_a_rewind() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t1 = w.tx_row(a.id, &new_tx(1, 10))?;
+            let o70 = w.add_output(a.id, t1, &new_output(1, 100, 70, 10))?.unwrap();
+            let o30 = w.add_output(a.id, t1, &new_output(2, 101, 30, 10))?.unwrap();
+            let t2 = w.tx_row(a.id, &new_tx(2, 11))?;
+            w.add_output(a.id, t2, &new_output(3, 102, 5, 11))?;
+            w.add_spend(a.id, t2, o70, 70, &[7; 32], 15, 11)?;
+            let t3 = w.tx_row(a.id, &new_tx(3, 20))?;
+            w.add_output(a.id, t3, &new_output(4, 103, 9, 20))?;
+            w.add_spend(a.id, t3, o30, 30, &[8; 32], 15, 20)?;
+            Ok(())
+        })
+        .unwrap();
+        let totals = |db: &Db| -> Vec<(u64, u64, u64)> {
+            db.txs(a.id)
+                .unwrap()
+                .iter()
+                .map(|t| (t.height, t.total_received, t.total_sent))
+                .collect()
+        };
+        assert_eq!(totals(&db), vec![(10, 100, 0), (11, 5, 70), (20, 9, 30)]);
+        db.rewind(15).unwrap();
+        assert_eq!(totals(&db), vec![(10, 100, 0), (11, 5, 70)]);
+        assert_eq!(db.spends(a.id).unwrap().len(), 1);
+    }
+
+    /// Totals are added as the u64s they are: past 2^63 they read back
+    /// whole, and past 2^64 the write fails rather than wrapping.
+    #[test]
+    fn totals_add_as_u64_and_never_wrap() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        let big = (1u64 << 63) + 5;
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t = w.tx_row(a.id, &new_tx(1, 10))?;
+            w.add_output(a.id, t, &new_output(1, 100, big, 10))?;
+            w.add_output(a.id, t, &new_output(2, 101, 7, 10))?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.txs(a.id).unwrap()[0].total_received, big + 7);
+        let over = db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            let t = w.tx_row(a.id, &new_tx(1, 10))?;
+            w.add_output(a.id, t, &new_output(3, 102, u64::MAX - big, 10))?;
+            Ok(())
+        });
+        assert!(over.is_err());
+        assert_eq!(db.txs(a.id).unwrap()[0].total_received, big + 7, "nothing written");
     }
 
     #[test]
