@@ -8,8 +8,12 @@
 #          macro, and the Rust cache action restores files, here.
 #   sign   a fresh runner that never built anything signs it
 #          (build-openwrt.sh sign): the only job with the signing key, it
-#          runs no third-party action and no build, only openssl and the
-#          SDK image's apk (the image pinned by digest).
+#          runs no third-party action, and its signing step runs only
+#          openssl and apk, on the runner itself: no container sees the
+#          key. That apk is apk-tools built from its upstream source at the
+#          commit pinned in build-openwrt.sh (the release the SDK's own apk
+#          is), in an earlier step without the key, and cached by that
+#          commit.
 #
 # Every push to main builds it; a pull request builds it when it changes
 # the package, the server or the build. Each matrix entry uploads as
@@ -109,8 +113,9 @@ jobs:
 
   sign:
     # The signing key's job: a fresh runner, the build's unsigned package,
-    # and nothing run but this repository's script, openssl and the pinned
-    # SDK image's apk.
+    # and nothing run with the key but this repository's script, openssl
+    # and apk-tools built from a pinned commit. (The SDK image only turns
+    # the signed index into index.json, after the key is gone.)
     name: sign the openwrt package (${{ matrix.release }}, ${{ matrix.arch }})
     needs: build
     runs-on: ubuntu-24.04
@@ -132,6 +137,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # apk-tools, built from the commit pinned in build-openwrt.sh: cached
+      # by that commit (and saved only from main), built when not cached.
+      # None of these steps has the key.
+      - name: The pinned apk-tools commit
+        id: apk-tools
+        run: echo "commit=$(sed -n 's/^APK_TOOLS_COMMIT=//p' scripts/build-openwrt.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: apk-tools-cache
+        with:
+          path: ~/.cache/monokulo-lws/apk-tools/${{ steps.apk-tools.outputs.commit }}
+          key: apk-tools-ubuntu-24.04-${{ runner.arch }}-${{ steps.apk-tools.outputs.commit }}
+      - name: Build apk-tools
+        if: steps.apk-tools-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -qy --no-install-recommends meson ninja-build pkg-config libssl-dev zlib1g-dev libzstd-dev
+          scripts/build-openwrt.sh apk-tools
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.apk-tools-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        with:
+          path: ~/.cache/monokulo-lws/apk-tools/${{ steps.apk-tools.outputs.commit }}
+          key: apk-tools-ubuntu-24.04-${{ runner.arch }}-${{ steps.apk-tools.outputs.commit }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: openwrt-unsigned-${{ matrix.release }}-${{ matrix.arch }}

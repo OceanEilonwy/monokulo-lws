@@ -10,20 +10,32 @@
 # are compiled with the gcc from the official OpenWrt SDK image, so they
 # are built exactly as OpenWrt builds C. The same SDK (in Docker) then
 # packages the binary with its init script, LuCI page and backend. Last,
-# a fresh SDK container signs the package and the repository index.
+# the package and the repository index are signed here on the host, by
+# openssl and apk-tools built from its upstream source at a pinned commit
+# (the release the SDK's own apk is): no container ever sees the key.
 #
-# Usage: scripts/build-openwrt.sh [build|sign|all]   (default all)
+# Usage: scripts/build-openwrt.sh [build|apk-tools|sign|all]   (default all)
 #   build  the binary and the unsigned package, in dist/unsigned/. Never
 #          reads the signing key: cargo runs every dependency's build
 #          script and proc macro, and the SDK runs its own build, so no
 #          signing key may be anywhere they could reach it.
+#   apk-tools  builds apk (apk-tools $APK_TOOLS_VERSION, from the commit
+#          pinned below, checked after the fetch) into its cache directory
+#          (~/.cache/monokulo-lws/apk-tools/<commit>/), unless it is there
+#          already. Never reads the key. CI runs it in a step of its own,
+#          before the step that has the key.
 #   sign   signs dist/unsigned/ into dist/ and dist/repo/, running nothing
-#          but openssl and the SDK image's apk. CI runs it in a job of its
+#          with the key but openssl and that apk (building it first, as
+#          apk-tools does, if it is missing). CI runs it in a job of its
 #          own, on a fresh runner that never built anything.
-#   all    build, then sign: for local use. A key in $APK_SIGNING_KEY is
-#          taken out of the environment before anything is built.
+#   all    apk-tools, build, then sign: for local use. A key in
+#          $APK_SIGNING_KEY is taken out of the environment before anything
+#          is built.
 #
-# Needs: docker, rustup (stable), openssl (build); docker, openssl (sign).
+# Needs: docker, rustup (stable), openssl (build); git, a C compiler, meson,
+# ninja, pkg-config and the openssl, zlib and zstd headers (apk-tools);
+# openssl, and docker to turn the signed index into index.json with the
+# SDK's script, the key long gone (sign).
 #
 # Output:
 #   dist/unsigned/ the unsigned package (build)
@@ -37,6 +49,8 @@
 #   $APK_SIGNING_KEY       the PEM itself (how CI passes the secret)
 #   $MONOKULO_SIGNING_KEY  path to the PEM
 #   ~/.config/kringle/apk-signing-key.pem   (the same key signs monokulo and kringle)
+# $APK_TOOLS, the path of an apk binary, is used instead of building one;
+# it must be apk-tools $APK_TOOLS_VERSION too.
 # Without one the package is signed with a throwaway key, made here: fine
 # for testing, but routers that trust monokulo.pem will refuse it.
 set -eu
@@ -49,9 +63,9 @@ unset APK_SIGNING_KEY
 
 STAGE="${1:-all}"
 case "$STAGE" in
-build | sign | all) ;;
+build | apk-tools | sign | all) ;;
 *)
-	echo "usage: $0 [build|sign|all]" >&2
+	echo "usage: $0 [build|apk-tools|sign|all]" >&2
 	exit 2
 	;;
 esac
@@ -68,6 +82,16 @@ PKG=monokulo-lws
 # The image's tag (without the digest), naming the caches below.
 ref=${SDK_IMAGE%@*}
 tag=${ref##*:}
+
+# The apk that signs: apk-tools built from upstream at this commit, the
+# tag v3.0.5 (the release `apk --version` reports in the SDK images above;
+# a new SDK may mean a new release here, and openwrt.yml's cache key names
+# the commit too). The commit, not the tag, is what is trusted: a tag can
+# be moved, a commit hash names its contents.
+APK_TOOLS_VERSION=3.0.5
+APK_TOOLS_COMMIT=b5a31c0d865342ad80be10d68f1bb3d3ad9b0866
+APK_TOOLS_REPO=https://gitlab.alpinelinux.org/alpine/apk-tools.git
+APK_TOOLS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/monokulo-lws/apk-tools/$APK_TOOLS_COMMIT"
 
 build() {
 	triple=$(printf '%s' "$TARGET" | tr - _)
@@ -158,6 +182,39 @@ build() {
 	}
 }
 
+# Builds apk from apk-tools at the pinned commit into $APK_TOOLS_DIR, once.
+apk_tools() {
+	[ -n "${APK_TOOLS:-}" ] && return
+	[ -x "$APK_TOOLS_DIR/apk" ] && return
+	for tool in git meson ninja pkg-config; do
+		command -v "$tool" >/dev/null || {
+			echo "error: building apk-tools needs $tool (and a C compiler, and the openssl, zlib and zstd headers)" >&2
+			exit 1
+		}
+	done
+	src=$(mktemp -d)
+	trap 'rm -rf "$src"' EXIT
+	git -C "$src" init -q
+	git -C "$src" fetch -q --depth 1 "$APK_TOOLS_REPO" "$APK_TOOLS_COMMIT"
+	git -C "$src" -c advice.detachedHead=false checkout -q FETCH_HEAD
+	if [ "$(git -C "$src" rev-parse HEAD)" != "$APK_TOOLS_COMMIT" ]; then
+		echo "error: $APK_TOOLS_REPO didn't give commit $APK_TOOLS_COMMIT" >&2
+		exit 1
+	fi
+	# A static libapk, so the binary needs no libapk.so installed; no Lua,
+	# Python, docs or tests, which signing doesn't use.
+	(cd "$src" && VERSION=$APK_TOOLS_VERSION meson setup build \
+		--buildtype=release -Ddefault_library=static -Dcrypto_backend=openssl \
+		-Dzstd=enabled -Dlua=disabled -Dhelp=disabled -Ddocs=disabled \
+		-Dpython=disabled -Dtests=disabled >/dev/null)
+	ninja -C "$src/build" src/apk >/dev/null
+	mkdir -p "$APK_TOOLS_DIR"
+	install -m 0755 "$src/build/src/apk" "$APK_TOOLS_DIR/apk.partial"
+	mv "$APK_TOOLS_DIR/apk.partial" "$APK_TOOLS_DIR/apk"
+	rm -rf "$src"
+	trap - EXIT
+}
+
 sign() {
 	ls dist/unsigned/"$PKG"-[0-9]*.apk >/dev/null 2>&1 || {
 		echo "error: no unsigned package in dist/unsigned/: run $0 build first" >&2
@@ -180,39 +237,52 @@ sign() {
 		throwaway=1
 	fi
 
+	apk_tools
+	apk="${APK_TOOLS:-$APK_TOOLS_DIR/apk}"
+	case "$("$apk" --version 2>/dev/null)" in
+	"apk-tools $APK_TOOLS_VERSION,"*) ;;
+	*)
+		echo "error: $apk isn't apk-tools $APK_TOOLS_VERSION" >&2
+		exit 1
+		;;
+	esac
+
 	rm -rf dist/repo dist/*.apk dist/packages.adb dist/monokulo.pem dist/throwaway.pem dist/SHA256SUMS
 	mkdir -p dist/repo
-	chmod 0777 dist/repo # the SDK runs as its own user
 
-	# A fresh container with no volume but dist/: the key is in its
-	# environment and its own /tmp, and goes with it. It runs the SDK
-	# image's apk alone (the image pinned by digest), no build. The key
-	# reaches it through the environment (-e APK_KEY without a value),
-	# never on docker's command line where other local users could see it.
-	APK_KEY="$key" docker run --rm -e APK_KEY -e ARCH="$ARCH" \
-		-v "$PWD/dist:/dist" "$SDK_IMAGE" sh -euc '
-		apk=/builder/staging_dir/host/bin/apk
-		keys=$(mktemp -d)
-		(umask 077 && printf "%s\n" "$APK_KEY" >"$keys/private-key.pem")
-		unset APK_KEY
-		openssl ec -in "$keys/private-key.pem" -pubout -out "$keys/monokulo.pem" 2>/dev/null
-		cp /dist/unsigned/*.apk /dist/repo/
-		cd /dist/repo
+	# Signed here, on the host: no container sees the key. It goes into a
+	# directory only this user can read, for apk (which takes it by path),
+	# and is removed however this ends. Nothing runs with it but openssl
+	# and apk.
+	keys=$(mktemp -d)
+	trap 'rm -rf "$keys"' EXIT
+	trap 'exit 1' INT TERM
+	(umask 077 && printf '%s\n' "$key" >"$keys/private-key.pem")
+	openssl ec -in "$keys/private-key.pem" -pubout -out "$keys/monokulo.pem" 2>/dev/null
+	cp dist/unsigned/*.apk dist/repo/
+	(
+		cd dist/repo
 		# The SDK builds packages unsigned (only the index is signed). Sign
 		# them too, so a downloaded .apk installs directly (apk add, or LuCI
-		# Upload Package) on any router that trusts monokulo.pem.
+		# Upload Package) on any router that trusts monokulo.pem. --root
+		# keeps apk off the host's own /etc/apk.
 		for f in ./*.apk; do
-			"$apk" --allow-untrusted adbsign --sign-key "$keys/private-key.pem" "$f"
-			"$apk" --keys-dir "$keys" verify "$f"
+			"$apk" --root "$keys" --allow-untrusted adbsign --sign-key "$keys/private-key.pem" "$f"
+			"$apk" --root "$keys" --keys-dir "$keys" verify "$f"
 		done
 		# The index, as the SDK make package/index makes it.
 		"$apk" mkndx --root "$keys" --keys-dir "$keys" --allow-untrusted \
 			--sign "$keys/private-key.pem" --output packages.adb ./*.apk
-		"$apk" --keys-dir "$keys" verify packages.adb
-		"$apk" adbdump --format json packages.adb |
-			/builder/scripts/make-index-json.py -f apk -a "$ARCH" - >index.json
-		rm -rf "$keys"
-	'
+		"$apk" --root "$keys" --keys-dir "$keys" verify packages.adb
+	)
+	rm -rf "$keys"
+	trap - EXIT INT TERM
+
+	# index.json, made by the SDK's own script from the signed index: the
+	# container gets the index's dump on its stdin and nothing more, after
+	# the key is gone.
+	"$apk" --root "$PWD/dist/repo" adbdump --format json dist/repo/packages.adb |
+		docker run --rm -i "$SDK_IMAGE" /builder/scripts/make-index-json.py -f apk -a "$ARCH" - >dist/repo/index.json
 
 	cp dist/repo/*.apk dist/repo/packages.adb dist/
 	cp "$PUBKEY" dist/monokulo.pem
@@ -226,8 +296,10 @@ sign() {
 
 case "$STAGE" in
 build) build ;;
+apk-tools) apk_tools ;;
 sign) sign ;;
 all)
+	apk_tools
 	build
 	sign
 	;;
