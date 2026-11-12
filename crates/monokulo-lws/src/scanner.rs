@@ -38,7 +38,7 @@ use tokio::sync::{Notify, Semaphore};
 
 use crate::crypto;
 use crate::daemon::{Daemon, Fetched, RawBlock};
-use crate::db::{Account, Db, NewOutput, NewTx, OutputRow, ScanWriter, Status};
+use crate::db::{Account, CHECKPOINT_EVERY, Db, NewOutput, NewTx, OutputRow, ScanWriter, Status};
 use crate::error::{Error, Result};
 use crate::lanes::{Join, Plan};
 use crate::types::{
@@ -569,8 +569,9 @@ impl Scanner {
         });
         let active = self.db.call(|db| db.accounts(Some(Status::Active))).await?;
         if let Some(lowest) = self.db.call(|db| db.halted()).await? {
-            if !active.iter().all(|a| a.scan_height < lowest) {
-                let message = halt_message(lowest);
+            let due = self.db.call(|db| db.rescans_due()).await?.len();
+            if due > 0 {
+                let message = halt_message(lowest, due);
                 let mut logged = self.halt_logged.lock().unwrap_or_else(|e| e.into_inner());
                 if logged.is_none_or(|at| at.elapsed() >= HALT_LOG_EVERY) {
                     tracing::error!("scan stopped: {message}");
@@ -582,7 +583,8 @@ impl Scanner {
             self.db.call(move |db| db.resume(lowest)).await?;
             *self.halt_logged.lock().unwrap_or_else(|e| e.into_inner()) = None;
             tracing::warn!(
-                "scan resumed after the deep reorg: no active account stands at or above {lowest}; what was kept from there on is dropped"
+                "scan resumed after the deep reorg: every active account was rescanned from below {lowest}; what was kept \
+                 from there on is dropped, and accounts not active then start again from the lowest they held"
             );
         }
         if self.suspect.swap(false, Ordering::SeqCst) {
@@ -866,10 +868,13 @@ impl Scanner {
     /// to it, and the pool is looked at afresh, as the orphaned blocks'
     /// transactions may be back in it.
     ///
-    /// A reorg deeper than every hash kept can't be unwound safely: below
-    /// the lowest kept hash the server can't tell which rows came from the
-    /// orphaned chain. Scanning stops instead, loudly, until the operator
-    /// rescans (`Db::halt`, and `step`); the API goes on serving.
+    /// A reorg deeper than the last `KEEP_HASHES` is unwound from just
+    /// above the highest checkpoint still on the node's chain (`find_fork`),
+    /// catch-up accounts past it included. One deeper than every checkpoint
+    /// too can't be unwound safely: below the lowest known hash the server
+    /// can't tell which rows came from the orphaned chain. Scanning stops
+    /// instead, loudly, until the operator has rescanned every account
+    /// marked for it (`Db::halt`, and `step`); the API goes on serving.
     async fn reorg(&self) -> Result<()> {
         let fork = match self.find_fork().await? {
             Fork::At(fork) => fork,
@@ -879,7 +884,8 @@ impl Scanner {
             }
             Fork::Deeper(lowest) => {
                 self.db.call(move |db| db.halt(lowest)).await?;
-                let message = halt_message(lowest);
+                let due = self.db.call(|db| db.rescans_due()).await?.len();
+                let message = halt_message(lowest, due);
                 tracing::error!("scan stopped: {message}");
                 *self.halt_logged.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
                 self.set_status(|s| s.last_error = Some(message));
@@ -960,36 +966,71 @@ impl Scanner {
     /// requests at most for `KEEP_HASHES`. Should the kept hashes not be one
     /// chain, the block found still matches, and rewinding past a match is
     /// only more work, never wrong.
+    ///
+    /// When even the lowest kept hash isn't the node's (or none is kept),
+    /// the checkpoints below it (`CHECKPOINT_EVERY`) are bisected the same
+    /// way, a dozen requests for all of mainnet, and the scan goes again
+    /// from just above the highest one the node has: the fork is somewhere
+    /// in the next `CHECKPOINT_EVERY` blocks, and as no other hash of the
+    /// orphaned chain is known there, rewinding to the bracket's foot is as
+    /// close as can be safely got. Only when the lowest checkpoint isn't the
+    /// node's either is the fork deeper than anything known (`Deeper`).
     async fn find_fork(&self) -> Result<Fork> {
         /// Kept hashes tried one by one from the top.
         const TOP: usize = 8;
         let mut kept = self.db.call(|db| db.recent_blocks()).await?;
         kept.reverse();
-        let Some(&(lowest, hash)) = kept.first() else {
-            return Ok(Fork::Nothing);
+        let below = match kept.first() {
+            Some(&(lowest, hash)) if self.daemon.block_hash(lowest).await? == hash => {
+                // kept[lo] is on the node's chain; nothing from kept[hi] on is.
+                let (mut lo, mut hi) = (0, kept.len());
+                while hi - lo > 1 {
+                    let at = if kept.len() - hi < TOP {
+                        hi - 1
+                    } else {
+                        lo + (hi - lo) / 2
+                    };
+                    let (height, hash) = kept[at];
+                    if self.daemon.block_hash(height).await? == hash {
+                        lo = at;
+                        if kept.len() - hi < TOP {
+                            break;
+                        }
+                    } else {
+                        hi = at;
+                    }
+                }
+                return Ok(Fork::At(kept[lo].0.next()));
+            }
+            Some(&(lowest, _)) => Some(lowest),
+            None => None,
         };
-        if self.daemon.block_hash(lowest).await? != hash {
-            return Ok(Fork::Deeper(lowest));
+        let mut checkpoints = self.db.call(|db| db.checkpoints()).await?;
+        checkpoints.retain(|(height, _)| below.is_none_or(|lowest| *height < lowest));
+        let Some(&(oldest, hash)) = checkpoints.first() else {
+            return Ok(below.map_or(Fork::Nothing, Fork::Deeper));
+        };
+        if self.daemon.block_hash(oldest).await? != hash {
+            return Ok(Fork::Deeper(oldest));
         }
-        // kept[lo] is on the node's chain; nothing from kept[hi] on is.
-        let (mut lo, mut hi) = (0, kept.len());
+        // checkpoints[lo] is on the node's chain; none from checkpoints[hi]
+        // on, nor the lowest kept hash, is.
+        let (mut lo, mut hi) = (0, checkpoints.len());
         while hi - lo > 1 {
-            let at = if kept.len() - hi < TOP {
-                hi - 1
-            } else {
-                lo + (hi - lo) / 2
-            };
-            let (height, hash) = kept[at];
+            let at = lo + (hi - lo) / 2;
+            let (height, hash) = checkpoints[at];
             if self.daemon.block_hash(height).await? == hash {
                 lo = at;
-                if kept.len() - hi < TOP {
-                    break;
-                }
             } else {
                 hi = at;
             }
         }
-        Ok(Fork::At(kept[lo].0.next()))
+        let foot = checkpoints[lo].0;
+        tracing::warn!(
+            "reorg: deeper than the last {KEEP_HASHES} hashes kept; the checkpoint at {foot} is still the node's, so the \
+             fork is in the {CHECKPOINT_EVERY} blocks above it"
+        );
+        Ok(Fork::At(foot.next()))
     }
 
     /// Scans pool transactions not yet seen, in a stand-in block made of
@@ -1233,42 +1274,44 @@ pub(crate) enum Outcome {
     Diverged,
 }
 
-/// Where a reorg forked, as far as the kept hashes tell.
+/// Where a reorg forked, as far as the kept hashes and checkpoints tell.
 #[derive(Debug, PartialEq, Eq)]
 enum Fork {
     /// Scan again from here.
     At(Height),
-    /// Even the lowest kept hash, at this height, isn't the node's.
+    /// Even the lowest known hash (a checkpoint, or the lowest kept), at
+    /// this height, isn't the node's.
     Deeper(Height),
-    /// No hashes kept.
+    /// No hashes kept, and no checkpoints.
     Nothing,
 }
 
 /// What the log and `/daemon_status` say while the scan is stopped for a
-/// reorg deeper than the hashes kept, the lowest at `lowest`.
-fn halt_message(lowest: Height) -> String {
+/// reorg deeper than every hash known, the lowest at `lowest`, with `due`
+/// active accounts still to be rescanned.
+fn halt_message(lowest: Height, due: usize) -> String {
     format!(
-        "the node's chain differs from every block hash kept (the last {KEEP_HASHES}, from height {lowest} up): \
-         a reorg deeper than that, or a node on another chain. Scanning is stopped; the API goes on serving \
-         what was scanned. Check that the node is the right one and synced, then rescan every active account \
-         (admin `rescan`) from a height below the fork, which is below {lowest}; scanning resumes once no \
-         active account stands at or above {lowest}"
+        "the node's chain differs from every block hash kept (the last {KEEP_HASHES}, and one every \
+         {CHECKPOINT_EVERY} blocks below, from height {lowest} up): a reorg deeper than that, or a node on another \
+         chain. Scanning is stopped; the API goes on serving what was scanned. Check that the node is the right \
+         one and synced, then rescan every active account (admin `rescan`) from a height below the fork, which is \
+         below {lowest}; {due} still to do. Scanning resumes once all are done"
     )
 }
 
-/// Whether `batch` (from `start`) follows the hash kept for the block before
-/// it, and each of its blocks is the one whose hash is kept at its height,
-/// where one is: checked in the batch's own transaction, so it holds for
+/// Whether `blocks` (from `start`) follow the hash known for the block
+/// before them, and each is the one whose hash is known at its height,
+/// where one is (one of the last kept, or a checkpoint): checked in the batch's own transaction, so it holds for
 /// what is written.
 fn follows_kept(w: &ScanWriter, blocks: &[ScannableBlock], start: Height) -> Result<bool> {
     if let (Some(before), Some(first)) = (start.prev(), blocks.first())
-        && w.block_hash(before)?
+        && w.known_hash(before)?
             .is_some_and(|kept| kept != BlockHash(first.block.header.previous))
     {
         return Ok(false);
     }
     for (i, block) in blocks.iter().enumerate() {
-        if w.block_hash(height_at(start, i)?)?
+        if w.known_hash(height_at(start, i)?)?
             .is_some_and(|kept| kept != BlockHash(block.block.hash()))
         {
             return Ok(false);
@@ -1505,7 +1548,11 @@ fn write_chunk(
     // Only these accounts are written to, from here on.
     let mut accounts_now: Vec<&Account> = Vec::with_capacity(accounts.len());
     for account in accounts {
-        let expected = account.scan_height.max(first);
+        // Where it was planned from, or where an earlier chunk moved it.
+        let expected = match chunk.from {
+            0 => account.scan_height,
+            _ => account.scan_height.max(first),
+        };
         if w.standing(account.id)? == Some((expected, Status::Active)) {
             accounts_now.push(account);
         }
@@ -1525,7 +1572,7 @@ fn write_chunk(
     for (i, block) in batch.blocks.iter().enumerate().skip(chunk.from) {
         let height = height_at(start, i)?;
         let hash = BlockHash(block.block.hash());
-        if chunk.check && i > chunk.from && w.block_hash(height)?.is_some_and(|kept| kept != hash) {
+        if chunk.check && i > chunk.from && w.known_hash(height)?.is_some_and(|kept| kept != hash) {
             break;
         }
         let raw = batch.raw.get(i).and_then(Option::as_ref);
@@ -1543,6 +1590,7 @@ fn write_chunk(
         } else if height >= chunk.keep_from {
             w.keep_hash(height, &hash)?;
         }
+        w.checkpoint(height, &hash)?;
         next = i + 1;
         if chunk.budget.is_some_and(|b| began.elapsed() >= b) {
             break;
@@ -2988,6 +3036,205 @@ mod tests {
         let _ = app.scanner.step().await;
         assert_eq!(db.halted().unwrap(), None);
         assert!(db.recent_blocks().unwrap().is_empty());
+    }
+
+    /// Checkpoints of chain 0 every `CHECKPOINT_EVERY` blocks up to `top`.
+    fn keep_checkpoints(db: &Db, top: u64) {
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            for h in (CHECKPOINT_EVERY..=top).step_by(CHECKPOINT_EVERY as usize) {
+                w.checkpoint(Height::new(h), &BlockHash(chain_hash(h, 0)))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// An account of `w` from `start`, paid in block `paid`, and standing at `at`.
+    fn paid_account(db: &Db, w: &crate::testkit::Wallet, start: u64, paid: u64, at: u64) -> Account {
+        use crate::testkit::{self, Tx, tx_key};
+        let account = w.add(db, start);
+        let (_, k) = tx_key(paid);
+        let pays = Tx::new(k, vec![w.pay(&k, 0, 0, 0, 1_000)]).build();
+        let made = testkit::block(
+            paid as usize,
+            [0; 32],
+            testkit::dull_miner(paid as usize),
+            vec![pays],
+            0,
+            0,
+        );
+        testkit::write(db, std::slice::from_ref(&account), vec![made], paid, false, None);
+        assert_eq!(db.outputs(account.id).unwrap().len(), 1);
+        db.write(|tx| ScanWriter::new(tx).set_scan_height(account.id, Height::new(at)))
+            .unwrap();
+        db.account(&account.address).unwrap().unwrap()
+    }
+
+    /// A reorg deeper than the last `KEEP_HASHES` hashes is unwound by
+    /// itself from just above the highest checkpoint the node still has,
+    /// in a handful of requests: a catch-up account already past the fork
+    /// (below every kept hash) moves back with the rest and loses what it
+    /// found on the orphaned chain, one below the bracket keeps its own,
+    /// and a catch-up lane's batch fetched before the rewind writes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reorg_deeper_than_the_kept_hashes_is_unwound_from_a_checkpoint() {
+        use crate::testkit::{self, Wallet};
+        let node = forked_node(15_500, 30_001).await;
+        let db = Arc::new(Db::in_memory());
+        let (wa, wb, wc) = (Wallet::new(20), Wallet::new(21), Wallet::new(22));
+        let live = paid_account(&db, &wa, 29_000, 29_001, 30_001);
+        let catching_up = paid_account(&db, &wb, 16_000, 16_001, 17_000);
+        let low = paid_account(&db, &wc, 11_000, 11_001, 12_000);
+        keep_chain(&db, 20_001..=30_000);
+        keep_checkpoints(&db, 30_000);
+        assert_eq!(db.recent_blocks().unwrap().len(), KEEP_HASHES as usize);
+        let app = testkit::app_with_node(db.clone(), 30_001, &node.url);
+        let before = db.reorg_generation().unwrap();
+
+        app.scanner.reorg().await.unwrap();
+        assert_eq!(db.halted().unwrap(), None, "no stop");
+        let at = |a: &Account| db.account(&a.address).unwrap().unwrap().scan_height;
+        assert_eq!(at(&live), Height::new(15_001));
+        assert_eq!(
+            at(&catching_up),
+            Height::new(15_001),
+            "the catch-up account past the fork moves back"
+        );
+        assert!(
+            db.outputs(catching_up.id).unwrap().is_empty(),
+            "and its orphaned output goes"
+        );
+        assert!(db.outputs(live.id).unwrap().is_empty());
+        assert_eq!(at(&low), Height::new(12_000));
+        assert_eq!(db.outputs(low.id).unwrap().len(), 1);
+        assert!(db.recent_blocks().unwrap().is_empty());
+        let checkpoints: Vec<u64> = db.checkpoints().unwrap().iter().map(|(h, _)| h.get()).collect();
+        assert_eq!(checkpoints.last(), Some(&15_000));
+        let asked = node
+            .routes()
+            .iter()
+            .filter(|r| *r == "get_block_header_by_height")
+            .count();
+        assert!(asked <= 8, "{asked} requests");
+
+        // A catch-up lane's batch from before the rewind is refused.
+        let made = testkit::block(15_001, [0; 32], testkit::dull_miner(15_001), vec![], 0, 0);
+        let batch = Batch {
+            blocks: vec![made.block],
+            first_indexes: vec![made.first_indexes],
+            raw: vec![made.raw],
+        };
+        let window = Window {
+            start: Height::new(15_001),
+            live: false,
+            generation: before,
+            keep_from: Height::ZERO,
+        };
+        let accounts = vec![db.account(&wb.address()).unwrap().unwrap()];
+        let outcome = app
+            .scanner
+            .scan_batch(&mut None, &Arena::new(), &accounts, &batch, &window)
+            .unwrap();
+        assert_eq!(outcome, Outcome::Stale);
+        assert_eq!(at(&catching_up), Height::new(15_001));
+    }
+
+    /// A reorg deeper than every checkpoint stops the scan and marks every
+    /// account to be rescanned, a catch-up account below the lowest
+    /// checkpoint too; the stop lasts until each active one is rescanned
+    /// from below the lowest checkpoint (one made meanwhile isn't asked
+    /// for), and on resuming a hidden account still marked starts again
+    /// from the lowest it held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reorg_deeper_than_every_checkpoint_stops_until_each_account_is_rescanned() {
+        use crate::testkit::{self, Wallet};
+        let node = forked_node(100, 30_001).await;
+        let db = Arc::new(Db::in_memory());
+        let (wa, wb, wc, wd) = (Wallet::new(23), Wallet::new(24), Wallet::new(25), Wallet::new(26));
+        let a = paid_account(&db, &wa, 29_000, 29_001, 30_001);
+        let b = paid_account(&db, &wb, 500, 501, 600);
+        let c = paid_account(&db, &wc, 700, 701, 800);
+        db.set_status(std::slice::from_ref(&c.address), Status::Hidden).unwrap();
+        keep_chain(&db, 20_001..=30_000);
+        keep_checkpoints(&db, 30_000);
+        let app = testkit::app_with_node(db.clone(), 30_001, &node.url);
+
+        app.scanner.reorg().await.unwrap();
+        assert_eq!(db.halted().unwrap(), Some(Height::new(1_000)));
+        assert_eq!(db.rescans_due().unwrap(), [a.address.clone(), b.address.clone()]);
+        assert_eq!(db.outputs(b.id).unwrap().len(), 1, "nothing rewound");
+        let error = app.scanner.status().last_error.unwrap();
+        assert!(error.contains("1000") && error.contains("2 still to do"), "{error}");
+
+        let d = wd.add(&db, 25_000);
+        assert!(!app.scanner.step().await.unwrap());
+        db.rescan(std::slice::from_ref(&a.address), Height::new(50)).unwrap();
+        db.rescan(std::slice::from_ref(&b.address), Height::new(1_500)).unwrap();
+        assert_eq!(
+            db.rescans_due().unwrap(),
+            std::slice::from_ref(&b.address),
+            "not from below 1000"
+        );
+        assert!(!app.scanner.step().await.unwrap());
+        assert!(app.scanner.status().last_error.unwrap().contains("1 still to do"));
+        assert_eq!(db.halted().unwrap(), Some(Height::new(1_000)));
+
+        db.rescan(std::slice::from_ref(&b.address), Height::new(50)).unwrap();
+        assert!(db.rescans_due().unwrap().is_empty());
+        // The step resumes, then fails at fetching blocks from this node.
+        let _ = app.scanner.step().await;
+        assert_eq!(db.halted().unwrap(), None);
+        let at = |a: &Account| db.account(&a.address).unwrap().unwrap().scan_height;
+        assert_eq!(at(&a), Height::new(50));
+        assert_eq!(at(&b), Height::new(50));
+        assert_eq!(at(&c), Height::new(700), "the hidden account starts again");
+        assert!(db.outputs(c.id).unwrap().is_empty());
+        assert_eq!(at(&d), Height::new(1_000));
+        assert!(db.checkpoints().unwrap().is_empty());
+        assert!(db.recent_blocks().unwrap().is_empty());
+    }
+
+    /// A catch-up lane's blocks far below the kept hashes are still checked
+    /// against the checkpoints: one that isn't the checkpoint's block, or
+    /// doesn't follow it, isn't written.
+    #[test]
+    fn a_lane_checks_its_blocks_against_the_checkpoints() {
+        use crate::testkit::{self, Wallet};
+        let db = Arc::new(Db::in_memory());
+        let w = Wallet::new(27);
+        let account = w.add(&db, 1_000);
+        keep_checkpoints(&db, 1_000);
+        let app = testkit::app(db.clone(), 200_000);
+        let window = |start: u64| Window {
+            start: Height::new(start),
+            live: false,
+            generation: db.reorg_generation().unwrap(),
+            keep_from: Height::MAX,
+        };
+        let one = |n: usize, previous: [u8; 32]| {
+            let m = testkit::block(n, previous, testkit::dull_miner(n), vec![], 0, 0);
+            Batch {
+                blocks: vec![m.block],
+                first_indexes: vec![m.first_indexes],
+                raw: vec![m.raw],
+            }
+        };
+        let accounts = vec![again(&db, &account)];
+        let scan = |accounts: &[Account], b: &Batch, at: &Window| {
+            app.scanner
+                .scan_batch(&mut None, &Arena::new(), accounts, b, at)
+                .unwrap()
+        };
+        assert_eq!(scan(&accounts, &one(1_000, [0; 32]), &window(1_000)), Outcome::Diverged);
+        db.write(|tx| ScanWriter::new(tx).set_scan_height(account.id, Height::new(1_001)))
+            .unwrap();
+        let accounts = vec![again(&db, &account)];
+        assert_eq!(scan(&accounts, &one(1_001, [7; 32]), &window(1_001)), Outcome::Diverged);
+        assert_eq!(
+            scan(&accounts, &one(1_001, chain_hash(1_000, 0)), &window(1_001)),
+            Outcome::Written
+        );
     }
 
     /// A catch-up lane's batch is written only if no reorg was unwound

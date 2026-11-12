@@ -266,14 +266,21 @@ cost about sixteen times the storage of proving receives.
   kept, or (once caught up) a top block whose hash isn't the one kept for
   that height, means a reorg. The fork is found by bisecting the kept
   hashes, and outputs, candidate spends and transactions from it on are
-  dropped for every account, accounts past it move back to it, what the
-  pool held is forgotten and looked at again, and the new blocks are
-  scanned with the node's global indices. A batch fetched before a reorg
-  was unwound is not written. A reorg deeper than every kept hash (or a
-  node on another chain) stops scanning with an error in the log and
-  `/daemon_status`, rewinding nothing; the API goes on serving. Rescan
-  every active account (admin `rescan`) from below the fork and scanning
-  resumes by itself. Reorgs that keep ending at the same fork with nothing
+  dropped for every account, accounts past it move back to it (catch-up
+  accounts too), what the pool held is forgotten and looked at again, and
+  the new blocks are scanned with the node's global indices. A batch
+  fetched before a reorg was unwound is not written. Besides the last
+  10,000, every 1,000th block's hash is kept for good (a checkpoint, by
+  whichever lane scanned it, and checked by catch-up lanes far below the
+  tip): a reorg deeper than the last 10,000 is bracketed by bisecting them
+  and unwound from just above the highest checkpoint still on the node's
+  chain, by itself. A reorg deeper than every checkpoint too (or a node on
+  another chain) stops scanning with an error in the log and
+  `/daemon_status`, rewinding nothing, and marks every account there is to
+  be rescanned; the API goes on serving. Rescan every active account
+  (admin `rescan`) from below the lowest checkpoint and scanning resumes
+  by itself once none is left (a hidden or inactive account still marked
+  then starts again from the lowest height it held anything at). Reorgs that keep ending at the same fork with nothing
   scanned between (a node whose blocks and headers disagree) are retried
   after a wait, from a second doubling to a minute, logged at warn.
 - A batch is written in chunks of about 50 ms, each one SQLite transaction

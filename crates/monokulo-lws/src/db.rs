@@ -115,6 +115,8 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 CREATE TABLE IF NOT EXISTS admin_keys (key BLOB PRIMARY KEY, created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS blocks_kept (height INTEGER PRIMARY KEY, hash BLOB NOT NULL, blob BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS checkpoints (height INTEGER PRIMARY KEY, hash BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS rescan_due (account INTEGER PRIMARY KEY REFERENCES accounts(id));
 CREATE TABLE IF NOT EXISTS txs_kept (
     hash BLOB PRIMARY KEY,
     height INTEGER NOT NULL,
@@ -404,6 +406,12 @@ fn account_row(r: &rusqlite::Row) -> rusqlite::Result<Account> {
     })
 }
 
+/// Every this many blocks a block's hash is kept for good (`checkpoints`),
+/// whichever lane scanned it: when a reorg goes deeper than the last
+/// `KEEP_HASHES`, they bracket the fork to within this many blocks. About
+/// 40 bytes each: 150 KB for all of mainnet.
+pub(crate) const CHECKPOINT_EVERY: u64 = 1_000;
+
 /// The public keys are not read back: the address holds them.
 const ACCOUNT_COLS: &str = "id, address, view_key, status, start_height, scan_height, access_time, generated_locally";
 
@@ -416,6 +424,12 @@ const ACCOUNT_COLS: &str = "id, address, view_key, status, start_height, scan_he
 /// is `G + amount·H`, which is what the chain's output set holds for it), so
 /// the commitment worked out again is the on-chain one, without a rescan.
 ///
+/// `checkpoints` came later: an older database's are seeded from the
+/// block hashes it kept, at the heights a checkpoint falls on. So did
+/// `rescan_due`: a database stopped for a deep reorg by a version that
+/// waited until no active account stood at or above the stop's height has
+/// those accounts marked.
+///
 /// `blocks_kept` and `txs_kept` (what proofs of inclusion are made of) came
 /// later still; `SCHEMA` makes them empty in an older database. They can't
 /// be filled from what is stored, so transactions scanned before them are
@@ -425,6 +439,19 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         .prepare("SELECT 1 FROM pragma_table_info('outputs') WHERE name = 'commitment'")?
         .exists([])?;
     let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT OR IGNORE INTO checkpoints (height, hash) SELECT height, hash FROM blocks WHERE height % ?1 = 0",
+        [SqlU64(CHECKPOINT_EVERY)],
+    )?;
+    // Stopped by a version that marked no account: those its rule waited
+    // for (at or above the stop's height) are the ones to rescan.
+    if meta_u64(&tx, "halted_below")?.is_some() && !tx.prepare("SELECT 1 FROM rescan_due")?.exists([])? {
+        tx.execute(
+            "INSERT INTO rescan_due (account) SELECT id FROM accounts
+             WHERE scan_height >= (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'halted_below')",
+            [],
+        )?;
+    }
     if !has_commitment {
         tx.execute("ALTER TABLE outputs ADD COLUMN commitment BLOB", [])?;
     }
@@ -724,6 +751,7 @@ impl Db {
                 tx.execute("DELETE FROM requests WHERE address = ?1", [a])?;
                 let Some(id) = id else { continue };
                 delete_account_from(tx, id, Height::ZERO)?;
+                tx.execute("DELETE FROM rescan_due WHERE account = ?1", [id])?;
                 tx.execute("DELETE FROM subaddrs WHERE account = ?1", [id])?;
                 tx.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
                 done.push(a.clone());
@@ -928,6 +956,17 @@ impl Db {
         })
     }
 
+    /// The checkpoints kept (`CHECKPOINT_EVERY`), lowest first.
+    pub fn checkpoints(&self) -> Result<Vec<(Height, BlockHash)>> {
+        self.read(|c| {
+            let mut st = c.prepare("SELECT height, hash FROM checkpoints ORDER BY height")?;
+            let rows = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
     /// The scanner's own height: the block after the last one it finished.
     #[cfg(test)]
     pub fn scanner_height(&self) -> Result<Option<Height>> {
@@ -955,29 +994,67 @@ impl Db {
         self.read(|c| meta_u64(c, "reorg_generation").map(|g| g.unwrap_or(0)))
     }
 
-    /// The lowest kept height, if scanning is stopped for a reorg deeper
-    /// than the kept hashes (`halt`).
+    /// The lowest known height, if scanning is stopped for a reorg deeper
+    /// than every hash kept, checkpoints too (`halt`).
     pub fn halted(&self) -> Result<Option<Height>> {
         self.read(|c| Ok(meta_u64(c, "halted_below")?.map(Height::new)))
     }
 
-    /// Stops scanning for a reorg deeper than the kept hashes, the lowest of
-    /// which is at `lowest`; kept across restarts until `resume`. Nothing is
-    /// rewound: below `lowest` the server can't tell which rows are from the
-    /// orphaned chain, so the operator rescans.
+    /// Stops scanning for a reorg deeper than every hash kept, the lowest of
+    /// which (a checkpoint, or the lowest of the last hashes) is at
+    /// `lowest`; kept across restarts until `resume`. Nothing is rewound:
+    /// the fork is somewhere below `lowest`, and the server can't tell which
+    /// rows are from the orphaned chain. Every account there is now is
+    /// marked as to be rescanned (`rescans_due`): any may have scanned past
+    /// the fork, a catch-up account below `lowest` as well as one above it.
     pub fn halt(&self, lowest: Height) -> Result<()> {
         self.write(|tx| {
             bump_generation(tx)?;
-            set_meta(tx, "halted_below", lowest.get())
+            set_meta(tx, "halted_below", lowest.get())?;
+            tx.execute("INSERT OR IGNORE INTO rescan_due (account) SELECT id FROM accounts", [])?;
+            Ok(())
         })
     }
 
-    /// Scanning goes on after `halt(lowest)`, the accounts having been
-    /// rescanned from below it: everything from `lowest` on, all of it from
-    /// the orphaned chain (the hashes kept there among it), goes.
+    /// The active accounts still to be rescanned from below the stop's
+    /// height before scanning resumes (`halt`, `rescan`).
+    pub fn rescans_due(&self) -> Result<Vec<Address>> {
+        self.read(|c| {
+            let mut st = c.prepare(
+                "SELECT a.address FROM rescan_due r JOIN accounts a ON a.id = r.account
+                 WHERE a.status = 'active' ORDER BY a.id",
+            )?;
+            let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Scanning goes on after `halt(lowest)`, every active account marked
+    /// having been rescanned from below it: everything from `lowest` on,
+    /// all of it from the orphaned chain (the hashes kept there among it),
+    /// goes. An account still marked (hidden or inactive, so not asked
+    /// for) loses all it holds and starts again from the lowest height it
+    /// held anything at, or its start height: it may have scanned past the
+    /// fork, and is not scanned until made active again.
     pub fn resume(&self, lowest: Height) -> Result<()> {
         self.write(|tx| {
             rewind_in(tx, lowest)?;
+            let left: Vec<(AccountId, Height)> = tx
+                .prepare(
+                    "SELECT a.id, MIN(a.start_height, a.scan_height,
+                         COALESCE((SELECT MIN(height) FROM txs WHERE account = a.id), a.start_height))
+                     FROM rescan_due r JOIN accounts a ON a.id = r.account",
+                )?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (id, from) in &left {
+                delete_account_from(tx, *id, *from)?;
+                tx.execute("UPDATE accounts SET scan_height = ?1 WHERE id = ?2", params![from, id])?;
+            }
+            if !left.is_empty() {
+                drop_unused_kept(tx, Height::ZERO)?;
+            }
+            tx.execute("DELETE FROM rescan_due", [])?;
             tx.execute("DELETE FROM meta WHERE key = 'halted_below'", [])?;
             Ok(())
         })
@@ -1246,6 +1323,8 @@ fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<
 /// [`Db::rescan`] inside `tx`.
 fn rescan_in(tx: &Transaction, addresses: &[Address], height: Height) -> Result<Vec<Address>> {
     let height = sql_height(height)?;
+    // From below a stop's height (`Db::halt`), it is the rescan asked for.
+    let clears = meta_u64(tx, "halted_below")?.is_some_and(|halt| height.get() < halt);
     let mut done = vec![];
     for a in addresses {
         let Some(id) = account_id(tx, a)? else { continue };
@@ -1254,6 +1333,9 @@ fn rescan_in(tx: &Transaction, addresses: &[Address], height: Height) -> Result<
             "UPDATE accounts SET scan_height = MIN(scan_height, ?1) WHERE id = ?2",
             params![height, id],
         )?;
+        if clears {
+            tx.execute("DELETE FROM rescan_due WHERE account = ?1", [id])?;
+        }
         done.push(a.clone());
     }
     drop_unused_kept(tx, height)?;
@@ -1442,6 +1524,7 @@ fn rewind_in(tx: &Transaction, h: Height) -> Result<()> {
     tx.execute("DELETE FROM outputs WHERE height >= ?1", [h])?;
     tx.execute("DELETE FROM txs WHERE height >= ?1", [h])?;
     tx.execute("DELETE FROM blocks WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM checkpoints WHERE height >= ?1", [h])?;
     tx.execute("DELETE FROM blocks_kept WHERE height >= ?1", [h])?;
     tx.execute("DELETE FROM txs_kept WHERE height >= ?1", [h])?;
     tx.execute("UPDATE accounts SET scan_height = MIN(scan_height, ?1)", [h])?;
@@ -1518,6 +1601,28 @@ impl<'a> ScanWriter<'a> {
             .tx
             .query_row("SELECT hash FROM blocks WHERE height = ?1", [height], |r| r.get(0))
             .optional()?)
+    }
+
+    /// The hash known for `height`: one of the last kept, or a checkpoint.
+    pub fn known_hash(&self, height: Height) -> Result<Option<BlockHash>> {
+        match self.block_hash(height)? {
+            Some(hash) => Ok(Some(hash)),
+            None => Ok(self
+                .tx
+                .query_row("SELECT hash FROM checkpoints WHERE height = ?1", [height], |r| r.get(0))
+                .optional()?),
+        }
+    }
+
+    /// Keeps `hash` for good if `height` is a checkpoint's (`CHECKPOINT_EVERY`).
+    pub fn checkpoint(&self, height: Height, hash: &BlockHash) -> Result<()> {
+        if height.get().is_multiple_of(CHECKPOINT_EVERY) {
+            self.tx.execute(
+                "INSERT OR REPLACE INTO checkpoints (height, hash) VALUES (?1, ?2)",
+                params![height, hash],
+            )?;
+        }
+        Ok(())
     }
 
     /// `Db::reorg_generation`, as this transaction sees it.
@@ -1963,7 +2068,8 @@ mod tests {
     }
 
     /// A rewind and a stop for a reorg too deep each count a reorg; a stop
-    /// lasts until `resume`, which drops everything from the lowest kept
+    /// marks the accounts to be rescanned, a rescan from below its height
+    /// clears the mark, and `resume` drops everything from the stop's
     /// height on.
     #[test]
     fn reorgs_are_counted_and_a_stop_lasts_until_resumed() {
@@ -1989,11 +2095,63 @@ mod tests {
         assert_eq!(db.reorg_generation().unwrap(), 2);
         assert_eq!(db.halted().unwrap(), Some(Height::new(15)));
         assert_eq!(db.outputs(a.id).unwrap().len(), 1, "a stop rewinds nothing");
+        assert_eq!(db.rescans_due().unwrap(), [addr("A")]);
+        db.rescan(&[addr("A")], Height::new(15)).unwrap();
+        assert_eq!(
+            db.rescans_due().unwrap(),
+            [addr("A")],
+            "a rescan from the stop's height isn't enough"
+        );
+        db.rescan(&[addr("A")], Height::new(14)).unwrap();
+        assert!(db.rescans_due().unwrap().is_empty());
         db.resume(Height::new(15)).unwrap();
         assert_eq!(db.halted().unwrap(), None);
         assert!(db.recent_blocks().unwrap().is_empty());
         assert!(db.outputs(a.id).unwrap().is_empty());
-        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, Height::new(15));
+        assert_eq!(db.account(&addr("A")).unwrap().unwrap().scan_height, Height::new(14));
+    }
+
+    /// A database from before checkpoints gets them from the block hashes
+    /// it kept, at the heights a checkpoint falls on, and if it was stopped
+    /// for a deep reorg, the accounts at or above the stop marked to be
+    /// rescanned; a rewind drops checkpoints from its height on.
+    #[test]
+    fn checkpoints_are_seeded_from_the_kept_hashes_and_rewound() {
+        let path = std::env::temp_dir().join(format!("lws-checkpoints-{}-{}.sqlite", std::process::id(), now()));
+        {
+            let db = Db::open(&path).unwrap();
+            db.write(|tx| {
+                let w = ScanWriter::new(tx);
+                for h in 999..=3_001u64 {
+                    w.set_block(Height::new(h), &BlockHash([(h % 251) as u8; 32]), 10_000)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert!(db.checkpoints().unwrap().is_empty(), "set_block keeps none itself");
+            // Stopped by a version that marked no account to rescan.
+            let a = acct(&db);
+            db.write(|tx| {
+                ScanWriter::new(tx).set_scan_height(a.id, Height::new(3_002))?;
+                set_meta(tx, "halted_below", 1_000)
+            })
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let heights = |db: &Db| -> Vec<u64> { db.checkpoints().unwrap().iter().map(|(h, _)| h.get()).collect() };
+        assert_eq!(heights(&db), [1_000, 2_000, 3_000]);
+        assert_eq!(
+            db.rescans_due().unwrap(),
+            [addr("A")],
+            "the account the old rule waited for"
+        );
+        assert_eq!(db.checkpoints().unwrap()[1].1, BlockHash([(2_000 % 251) as u8; 32]));
+        db.rewind(Height::new(2_000)).unwrap();
+        assert_eq!(heights(&db), [1_000]);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     /// A rewind leaves the totals of the transactions before it as they

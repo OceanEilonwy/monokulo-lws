@@ -125,6 +125,24 @@ has caught up. The design is lanes:
   fetched; within 10,000 blocks of the tip it keeps its blocks' hashes, so
   the live lane can check what it merges, and blocks that don't follow the
   kept hashes make the live lane look for a reorg, accounts or not.
+  Every lane also keeps every 1,000th block's hash for good (`checkpoints`,
+  about 150 KB for all of mainnet) and checks its blocks against those
+  below the last 10,000. A reorg deeper than the last 10,000 hashes
+  (`find_fork`: the lowest kept hash isn't the node's) is bracketed by
+  bisecting the checkpoints below them, a dozen header requests, and
+  unwound like any other from just above the highest one still on the
+  node's chain: up to 1,000 blocks more than the real fork, as no other
+  hash of the orphaned chain is known there, so nothing orphaned is left
+  for any account, catch-up accounts already past the fork included. Every
+  write checks the reorg generation in its own transaction, so a catch-up
+  lane's batch fetched before the rewind is never written, and a lane that
+  merges later brings in only what it scanned after it. Only when even the
+  lowest checkpoint isn't the node's does scanning stop (`halted_below`),
+  with every account there is marked in `rescan_due`; an admin `rescan`
+  from below the lowest checkpoint clears an account's mark, and scanning
+  resumes once no active account is marked, dropping everything from that
+  height on (and wiping, back to the lowest height it held, a hidden or
+  inactive account still marked).
 - **Shared**: one daemon connection, the live lane's requests first. One
   GPU device, but an *arena* per lane. Today `fob-scanner` keeps one device
   and one arena (the 39 MB state buffer, the output buffer, a command buffer

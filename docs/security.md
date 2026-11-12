@@ -161,7 +161,9 @@ shown to clients are wrong (a fake incoming payment, a missing spend); lie
 about the output distribution or ring members, which weakens the privacy of
 transactions built with `/get_random_outs` (decoys the node chose); refuse
 or drop submitted transactions; reorganise the chain at will, forcing
-rescans; observe the server's requests (which blocks, which outputs, which
+rescans (done by the server itself down to the oldest checkpoint, one kept
+every 1,000 blocks; a reorg deeper than that, or a node on another chain,
+stops scanning until the operator rescans every account); observe the server's requests (which blocks, which outputs, which
 transactions are submitted, from which server). With `/submit_raw_tx`, the
 node sees the transaction come from the server's address, not the client's.
 
