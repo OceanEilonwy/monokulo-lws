@@ -690,34 +690,25 @@ impl Db {
 
     // ---- what an account holds ----
 
+    #[cfg(test)]
     pub fn txs(&self, account: i64) -> Result<Vec<TxRow>> {
+        self.read(|c| txs_in(c, account))
+    }
+
+    /// The account's transactions, outputs and candidate spends, read under
+    /// one lock, so a scanner commit can't fall between them (an output
+    /// whose transaction isn't in the list).
+    pub fn holdings(&self, account: i64) -> Result<Holdings> {
         self.read(|c| {
-            let mut st = c.prepare(
-                "SELECT id, hash, prefix_hash, height, timestamp, unlock_time, coinbase, mixin, fee, payment_id, tx_pub_key, total_received, total_sent FROM txs WHERE account = ?1 ORDER BY height, id",
-            )?;
-            let rows = st
-                .query_map([account], |r| {
-                    Ok(TxRow {
-                        id: r.get(0)?,
-                        hash: blob32(r.get(1)?)?,
-                        prefix_hash: blob32(r.get(2)?)?,
-                        height: r.get::<_, i64>(3)? as u64,
-                        timestamp: r.get::<_, i64>(4)? as u64,
-                        unlock_time: r.get::<_, i64>(5)? as u64,
-                        coinbase: r.get::<_, i64>(6)? != 0,
-                        mixin: r.get::<_, i64>(7)? as u32,
-                        fee: r.get::<_, i64>(8)? as u64,
-                        payment_id: r.get(9)?,
-                        tx_pub_key: blob32(r.get(10)?)?,
-                        total_received: r.get::<_, i64>(11)? as u64,
-                        total_sent: r.get::<_, i64>(12)? as u64,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+            Ok(Holdings {
+                txs: txs_in(c, account)?,
+                outputs: outputs_in(c, account)?,
+                spends: spends_in(c, account)?,
+            })
         })
     }
 
+    #[cfg(test)]
     pub fn outputs(&self, account: i64) -> Result<Vec<OutputRow>> {
         self.read(|c| outputs_in(c, account))
     }
@@ -817,25 +808,60 @@ impl Db {
         })
     }
 
+    #[cfg(test)]
     pub fn spends(&self, account: i64) -> Result<Vec<SpendRow>> {
-        self.read(|c| {
-            let mut st = c.prepare(
-                "SELECT tx, output, key_image, mixin, height FROM spends WHERE account = ?1 ORDER BY height, id",
-            )?;
-            let rows = st
-                .query_map([account], |r| {
-                    Ok(SpendRow {
-                        tx: r.get(0)?,
-                        output: r.get(1)?,
-                        key_image: blob32(r.get(2)?)?,
-                        mixin: r.get::<_, i64>(3)? as u32,
-                        height: r.get::<_, i64>(4)? as u64,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+        self.read(|c| spends_in(c, account))
     }
+}
+
+/// What [`Db::holdings`] reads: one snapshot of an account.
+pub struct Holdings {
+    pub txs: Vec<TxRow>,
+    pub outputs: Vec<OutputRow>,
+    pub spends: Vec<SpendRow>,
+}
+
+fn txs_in(c: &Connection, account: i64) -> Result<Vec<TxRow>> {
+    let mut st = c.prepare(
+        "SELECT id, hash, prefix_hash, height, timestamp, unlock_time, coinbase, mixin, fee, payment_id, tx_pub_key, total_received, total_sent FROM txs WHERE account = ?1 ORDER BY height, id",
+    )?;
+    let rows = st
+        .query_map([account], |r| {
+            Ok(TxRow {
+                id: r.get(0)?,
+                hash: blob32(r.get(1)?)?,
+                prefix_hash: blob32(r.get(2)?)?,
+                height: r.get::<_, i64>(3)? as u64,
+                timestamp: r.get::<_, i64>(4)? as u64,
+                unlock_time: r.get::<_, i64>(5)? as u64,
+                coinbase: r.get::<_, i64>(6)? != 0,
+                mixin: r.get::<_, i64>(7)? as u32,
+                fee: r.get::<_, i64>(8)? as u64,
+                payment_id: r.get(9)?,
+                tx_pub_key: blob32(r.get(10)?)?,
+                total_received: r.get::<_, i64>(11)? as u64,
+                total_sent: r.get::<_, i64>(12)? as u64,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn spends_in(c: &Connection, account: i64) -> Result<Vec<SpendRow>> {
+    let mut st =
+        c.prepare("SELECT tx, output, key_image, mixin, height FROM spends WHERE account = ?1 ORDER BY height, id")?;
+    let rows = st
+        .query_map([account], |r| {
+            Ok(SpendRow {
+                tx: r.get(0)?,
+                output: r.get(1)?,
+                key_image: blob32(r.get(2)?)?,
+                mixin: r.get::<_, i64>(3)? as u32,
+                height: r.get::<_, i64>(4)? as u64,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// What [`Db::add_request`] did.

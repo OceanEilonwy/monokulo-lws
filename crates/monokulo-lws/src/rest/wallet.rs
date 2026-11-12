@@ -16,7 +16,7 @@ use subtle::ConstantTimeEq;
 
 use super::{ApiError, ApiJson, App, MAX_TX_BYTES, Policy};
 use crate::crypto;
-use crate::db::{Account, NewAccount, OutputRow, Queued, Status, TxRow};
+use crate::db::{Account, Holdings, NewAccount, OutputRow, Queued, SpendRow, Status, TxRow};
 use crate::error::{Error, Result, bad};
 use crate::limits::ClientIp;
 use crate::scanner::{PoolReceipt, PoolSpend, unlocked};
@@ -132,13 +132,13 @@ fn spend_of(o: &OutputRow, key_image: [u8; 32], mixin: u32) -> Spend {
 }
 
 /// Candidate spends of an account's outputs, by the spending transaction.
-fn spends_by_tx(app: &App, account: &Account, outputs: &HashMap<i64, OutputRow>) -> Result<HashMap<i64, Vec<Spend>>> {
+fn spends_by_tx(spends: &[SpendRow], outputs: &HashMap<i64, OutputRow>) -> HashMap<i64, Vec<Spend>> {
     let mut by_tx: HashMap<i64, Vec<Spend>> = HashMap::new();
-    for s in app.db.spends(account.id)? {
+    for s in spends {
         let Some(o) = outputs.get(&s.output) else { continue };
         by_tx.entry(s.tx).or_default().push(spend_of(o, s.key_image, s.mixin));
     }
-    Ok(by_tx)
+    by_tx
 }
 
 /// `/login`. The view key must fit the address (`check_login`) before
@@ -209,21 +209,23 @@ pub async fn get_address_info(State(app): State<Arc<App>>, ApiJson(login): ApiJs
     let account = authorize(&app, &login).await?;
     let chain = chain_height(&app);
     let now = crate::db::now();
-    let txs: HashMap<i64, TxRow> = app.db.txs(account.id)?.into_iter().map(|t| (t.id, t)).collect();
-    let outputs: HashMap<i64, OutputRow> = app.db.outputs(account.id)?.into_iter().map(|o| (o.id, o)).collect();
+    let Holdings { txs, outputs, spends } = app.db.holdings(account.id)?;
+    let txs: HashMap<i64, TxRow> = txs.into_iter().map(|t| (t.id, t)).collect();
+    let outputs: HashMap<i64, OutputRow> = outputs.into_iter().map(|o| (o.id, o)).collect();
     let mut total_received = 0u64;
     let mut locked = 0u64;
     for o in outputs.values() {
         total_received = total_received.saturating_add(o.amount);
-        let tx = &txs[&o.tx];
-        if !unlocked(o.height, tx.coinbase, tx.unlock_time, chain, now) {
+        // The schema ties every output to its transaction; one missing is
+        // counted as locked rather than taking the request down.
+        let unlocked = txs
+            .get(&o.tx)
+            .is_some_and(|tx| unlocked(o.height, tx.coinbase, tx.unlock_time, chain, now));
+        if !unlocked {
             locked = locked.saturating_add(o.amount);
         }
     }
-    let spent_outputs: Vec<Spend> = spends_by_tx(&app, &account, &outputs)?
-        .into_values()
-        .flatten()
-        .collect();
+    let spent_outputs: Vec<Spend> = spends_by_tx(&spends, &outputs).into_values().flatten().collect();
     let total_sent = spent_outputs.iter().map(|s| s.amount.0).fold(0u64, u64::saturating_add);
     Ok(Json(AddressInfo {
         locked_funds: Amount(locked),
@@ -262,8 +264,12 @@ fn proof_of(row: crate::db::ProofRow) -> Proof {
 pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<AddressTxs> {
     let account = authorize(&app, &login).await?;
     let chain = chain_height(&app);
-    let rows = app.db.txs(account.id)?;
-    let outputs: HashMap<i64, OutputRow> = app.db.outputs(account.id)?.into_iter().map(|o| (o.id, o)).collect();
+    let Holdings {
+        txs: rows,
+        outputs,
+        spends,
+    } = app.db.holdings(account.id)?;
+    let outputs: HashMap<i64, OutputRow> = outputs.into_iter().map(|o| (o.id, o)).collect();
     let mut receives_by_tx: HashMap<i64, Vec<ReceivedOutput>> = HashMap::new();
     for o in outputs.values() {
         receives_by_tx.entry(o.tx).or_default().push(ReceivedOutput {
@@ -277,7 +283,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
             recipient: meta(o.maj, o.min),
         });
     }
-    let mut spends = spends_by_tx(&app, &account, &outputs)?;
+    let mut spends = spends_by_tx(&spends, &outputs);
     let mut proofs = app.db.proofs(account.id)?;
     let mut total_received = outputs.values().map(|o| o.amount).fold(0u64, u64::saturating_add);
     let mined: std::collections::HashSet<[u8; 32]> = rows.iter().map(|t| t.hash).collect();
@@ -340,7 +346,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
         total_received = total_received.saturating_add(received);
         let spent_outputs: Vec<Spend> = spent
             .iter()
-            .map(|s| spend_of(&outputs[&s.output], s.key_image, s.mixin))
+            .filter_map(|s| Some(spend_of(outputs.get(&s.output)?, s.key_image, s.mixin)))
             .collect();
         let (unlock_time, mixin, fee, payment_id) = match (receipts.first(), spent.first()) {
             (Some(r), _) => (r.unlock_time, r.mixin, r.fee, r.payment_id.clone()),
@@ -395,10 +401,10 @@ pub async fn get_unspent_outs(
 ) -> Reply<UnspentOuts> {
     let account = authorize(&app, &req.login).await?;
     let fee = app.fee().await?;
-    let txs: HashMap<i64, TxRow> = app.db.txs(account.id)?.into_iter().map(|t| (t.id, t)).collect();
-    let outputs = app.db.outputs(account.id)?;
+    let Holdings { txs, outputs, spends } = app.db.holdings(account.id)?;
+    let txs: HashMap<i64, TxRow> = txs.into_iter().map(|t| (t.id, t)).collect();
     let mut images: HashMap<i64, Vec<Hex32>> = HashMap::new();
-    for s in app.db.spends(account.id)? {
+    for s in spends {
         images.entry(s.output).or_default().push(Hex(s.key_image));
     }
     let dust = if req.use_dust {
@@ -409,7 +415,12 @@ pub async fn get_unspent_outs(
     let mut total = 0u64;
     let mut listed = vec![];
     for o in outputs {
-        let tx = &txs[&o.tx];
+        // The schema ties every output to its transaction; skip one that
+        // isn't rather than panic.
+        let Some(tx) = txs.get(&o.tx) else {
+            tracing::warn!("output #{} without its transaction row", o.id);
+            continue;
+        };
         // As monero-lws: an output is left out when its transaction's mixin
         // is below the one asked for (a coinbase transaction's is 0, so any
         // mixin leaves coinbase outputs out) or its amount is below the

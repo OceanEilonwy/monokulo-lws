@@ -821,6 +821,31 @@ async fn remove_accounts_forgets_the_accounts_whole() {
     assert_eq!(r.status, StatusCode::FORBIDDEN);
 }
 
+/// An output whose transaction row isn't there (what a scanner commit
+/// between two reads used to look like) is answered around, not a panic.
+#[tokio::test]
+async fn an_output_without_its_transaction_is_no_panic() {
+    let app = app(Setup::default());
+    let router = wallet_router(app.clone());
+    let (address, key) = add(&app, 95, Status::Active);
+    let id = app.db.account(&address).unwrap().unwrap().id;
+    app.db
+        .read(|c| {
+            c.execute_batch("PRAGMA foreign_keys=OFF;")?;
+            c.execute(
+                "INSERT INTO outputs (account, tx, out_index, global_index, amount, public_key, tx_pub_key, height, maj, min) VALUES (?1, 999, 0, 5, 7, ?2, ?2, 20, 0, 0)",
+                rusqlite::params![id, [3u8; 32].as_slice()],
+            )?;
+            c.execute_batch("PRAGMA foreign_keys=ON;")?;
+            Ok(())
+        })
+        .unwrap();
+    for path in ["/get_address_info", "/get_address_txs"] {
+        let r = call(&router, path, &login_body(&address, &key)).await;
+        assert_eq!(r.status, StatusCode::OK, "{path}: {}", r.body);
+    }
+}
+
 /// A repeated create request is refused before it takes a token from the
 /// global bucket, so it can't drain it for everyone.
 #[tokio::test]
