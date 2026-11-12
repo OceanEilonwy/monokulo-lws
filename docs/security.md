@@ -47,7 +47,8 @@ malformed JSON; spoof `X-Forwarded-For`.
   per account (`--max-subaddresses`).
 - *Exhaust connections or memory.* Per listener: at most
   `--max-connections` open connections (1,024) and `--max-connections-per-ip`
-  from one address (64); request headers must arrive within 10 s (this also
+  from one client (64; a client is an IPv4 address or an IPv6 /64, as for
+  the rate limits, so a host can't take a slot per address of its /64); request headers must arrive within 10 s (this also
   closes idle keep-alive connections) in at most 16 KiB; the TLS handshake
   within 10 s; a whole request, body included, within `--request-timeout`
   (30 s). Bodies are capped per endpoint: 4 KiB for login-shaped calls,

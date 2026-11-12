@@ -60,7 +60,7 @@ Options that matter:
 | `--max-new-accounts-per-hour N` | 1000 | New accounts and import requests an hour, across all clients; 0 is no limit. |
 | `--max-pending-requests N` | 10000 | Pending create and import requests at most (monero-lws's `--create-queue-max`). |
 | `--max-connections N` | 1024 | Open connections at most, per listener. |
-| `--max-connections-per-ip N` | 64 | Open connections from one address at most (a trusted proxy is exempt); 0 is no limit. |
+| `--max-connections-per-ip N` | 64 | Open connections from one client (an IPv4 address or IPv6 /64) at most (a trusted proxy is exempt); 0 is no limit. |
 | `--request-timeout SECS` | 30 | Time a request may take, body and answer included. Headers must arrive within 10 s. |
 | `--access-control-origin ORIGIN` | | A browser origin allowed to call the API; repeat, or `*`. |
 | `--network main\|stage\|test` | | Refuse to start if the node is on another network. |

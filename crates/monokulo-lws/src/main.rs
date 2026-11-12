@@ -138,8 +138,8 @@ struct ServeArgs {
     /// Open connections at most, per listener.
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,
-    /// Open connections from one address at most (a trusted proxy is
-    /// exempt); 0 is no limit.
+    /// Open connections from one client (an IPv4 address or IPv6 /64) at
+    /// most (a trusted proxy is exempt); 0 is no limit.
     #[arg(long, default_value_t = 64)]
     max_connections_per_ip: usize,
     /// Seconds a request may take, reading its body and answering included.
