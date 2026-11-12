@@ -1,19 +1,37 @@
 #!/bin/sh
 # shellcheck shell=ash
-# A traffic rule that lets the internet reach the wallet API's port, made
-# off: turn it on in Network > Firewall > Traffic Rules once the server
-# listens off loopback with TLS (every request carries a view key). Behind
-# a TLS proxy on this router, open the proxy's 443 instead.
+# A traffic rule per network that lets the internet reach that network's
+# wallet API, made off: turn one on in Network > Firewall > Traffic Rules
+# once its server listens off loopback with TLS (every request carries a
+# view key). Behind a TLS proxy on this router, open the proxy's 443
+# instead. Mainnet's keeps the name the one rule of older versions had.
+# Each rule's port follows its network's port setting: the init script
+# sets it on every start. Run on install and on every upgrade, this makes
+# only the rules missing, so one deleted stays deleted until then.
 [ -f /etc/config/firewall ] || exit 0
-uci -q get firewall.monokulo_lws >/dev/null && exit 0
-uci -q batch <<-'UCI'
-	set firewall.monokulo_lws=rule
-	set firewall.monokulo_lws.name='Allow-monokulo-lws'
-	set firewall.monokulo_lws.src='wan'
-	set firewall.monokulo_lws.proto='tcp'
-	set firewall.monokulo_lws.dest_port='8443'
-	set firewall.monokulo_lws.target='ACCEPT'
-	set firewall.monokulo_lws.enabled='0'
-	commit firewall
-UCI
+changed=0
+for net in mainnet stagenet testnet; do
+	case "$net" in
+	mainnet) rule=monokulo_lws name=Allow-monokulo-lws port=8443 ;;
+	stagenet) rule=monokulo_lws_stagenet name=Allow-monokulo-lws-stagenet port=38443 ;;
+	testnet) rule=monokulo_lws_testnet name=Allow-monokulo-lws-testnet port=28443 ;;
+	esac
+	uci -q get "firewall.$rule" >/dev/null && continue
+	configured=$(uci -q get "monokulo-lws.$net.port")
+	case "$configured" in
+	'' | *[!0-9]*) ;;
+	*) port=$configured ;;
+	esac
+	uci -q batch <<-UCI
+		set firewall.$rule=rule
+		set firewall.$rule.name='$name'
+		set firewall.$rule.src='wan'
+		set firewall.$rule.proto='tcp'
+		set firewall.$rule.dest_port='$port'
+		set firewall.$rule.target='ACCEPT'
+		set firewall.$rule.enabled='0'
+	UCI
+	changed=1
+done
+[ "$changed" = 1 ] && uci -q commit firewall
 exit 0

@@ -528,6 +528,38 @@ prepare_net() {
 	return 0
 }
 
+# The firewall rule for a network's wallet API (made off on install, by the
+# package's uci-defaults script).
+fw_rule() {
+	case "$1" in
+	mainnet) echo monokulo_lws ;;
+	*) echo "monokulo_lws_$1" ;;
+	esac
+}
+
+# sync_firewall <network>...: each network's firewall rule set to the port
+# its server listens on, so a rule turned on opens the port in use. Only
+# rules that are there are changed (one the operator deleted stays
+# deleted), and only their port: on or off is the operator's. The firewall
+# is reloaded only when a rule that is on changed.
+sync_firewall() {
+	local net rule port changed=0 reload=0
+	[ -f /etc/config/firewall ] || return 0
+	for net in "$@"; do
+		rule=$(fw_rule "$net")
+		uci -q get "firewall.$rule" >/dev/null || continue
+		net_get port "$net" port
+		[ "$(uci -q get "firewall.$rule.dest_port")" = "$port" ] && continue
+		uci -q set "firewall.$rule.dest_port=$port" || continue
+		changed=1
+		[ "$(uci -q get "firewall.$rule.enabled")" = 0 ] || reload=1
+		log "the firewall rule $(uci -q get "firewall.$rule.name") follows $net's port, $port"
+	done
+	[ "$changed" = 1 ] && uci -q commit firewall
+	[ "$reload" = 1 ] && /etc/init.d/firewall reload >/dev/null 2>&1
+	return 0
+}
+
 # open_instance <network>: its server, from what prepare_shared and
 # prepare_net read.
 open_instance() {
@@ -567,7 +599,7 @@ open_instance() {
 }
 
 start_service() {
-	local enabled net failed=0
+	local enabled net synced failed=0
 
 	# Each start says afresh what refuses it.
 	rm -f "$CHECK_FILE" "$CHECK_FILE".*
@@ -585,15 +617,23 @@ start_service() {
 	fi
 
 	# Each network on its own: one refused doesn't keep the others from
-	# starting.
-	for net in $(enabled_networks); do
-		if prepare_net "$net"; then
+	# starting. The firewall rules follow the ports of the servers started,
+	# and of the networks off (nothing listens there, but a rule turned on
+	# is ready when one is turned on); a refused network's keeps its last.
+	synced=
+	for net in $NETWORKS; do
+		if ! net_enabled "$net"; then
+			synced="$synced $net"
+		elif prepare_net "$net"; then
 			open_instance "$net"
+			synced="$synced $net"
 		else
 			refuse_net "$net" "$REASON"
 			failed=1
 		fi
 	done
+	# shellcheck disable=SC2086
+	sync_firewall $synced
 	return $failed
 }
 
