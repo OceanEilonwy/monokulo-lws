@@ -175,8 +175,8 @@ check "the server's user exists" "id -u $PKG"
 check "the LuCI page is installed: its view, menu, ACL and backend" \
 	"[ -s /www/luci-static/resources/view/$PKG.js ] && jsonfilter -i /usr/share/luci/menu.d/luci-app-$PKG.json -e '@[\"admin/services/$PKG\"].action.path' | grep -qx $PKG && jsonfilter -i /usr/share/rpcd/acl.d/luci-app-$PKG.json -e '@[\"luci-app-$PKG\"].read.ubus[\"$PKG\"]' | grep -q status && [ -s /usr/share/$PKG/http.uc ]"
 check "rpcd serves the page's ubus object" "ubus -S list $PKG"
-check "the firewall rule is made, off" \
-	"[ \"\$(uci get firewall.monokulo_lws.enabled)\" = 0 ] && [ \"\$(uci get firewall.monokulo_lws.dest_port)\" = 8443 ]"
+check "a firewall rule is made for each network, off, on its port" \
+	"for r in monokulo_lws:8443 monokulo_lws_stagenet:38443 monokulo_lws_testnet:28443; do [ \"\$(uci get firewall.\${r%:*}.enabled)\" = 0 ] && [ \"\$(uci get firewall.\${r%:*}.dest_port)\" = \${r#*:} ] || exit 1; done"
 eventually "mainnet's server runs, as its own user, and it alone" \
 	". /tmp/t.sh; running $PKG mainnet && ! running $PKG stagenet && ! running $PKG testnet && [ \"\$(awk '/^Uid:/ { print \$2 }' /proc/\$(pid $PKG mainnet)/status)\" = \"\$(id -u $PKG)\" ]"
 check "its admin key was made at the first start, 64 hex characters, root's alone" \
@@ -252,6 +252,8 @@ check "a saved port is taken: stagenet's server listens where UCI says after a r
 eventually "its wallet API answers on the new port, on this router alone, and mainnet's still on its own" \
 	"uclient-fetch -q -O - http://127.0.0.1:8450/daemon_status | jsonfilter -e '@.network' | grep -qx stage && ! uclient-fetch -q -O - -T 2 http://127.0.0.1:38443/daemon_status >/dev/null 2>&1 && uclient-fetch -q -O - http://127.0.0.1:8443/daemon_status | jsonfilter -e '@.network' | grep -qx main"
 check "LuCI's status knows the new address" ". /tmp/t.sh; rpc status | jsonfilter -e '@.networks.stagenet.wallet_url' | grep -qx http://127.0.0.1:8450"
+check "stagenet's firewall rule follows its port, and stays off; mainnet's is untouched" \
+	"[ \"\$(uci get firewall.monokulo_lws_stagenet.dest_port)\" = 8450 ] && [ \"\$(uci get firewall.monokulo_lws_stagenet.enabled)\" = 0 ] && [ \"\$(uci get firewall.monokulo_lws.dest_port)\" = 8443 ]"
 x ". /tmp/t.sh; $pids >/tmp/$PKG.pids; uci set $PKG.stagenet.admin_port=8450; uci commit $PKG"
 check "a reload with stagenet's admin port set to its wallet port leaves both servers running on their earlier settings, and LuCI says why" \
 	"/etc/init.d/$PKG reload; sleep 2; $same_pids && rpc status | jsonfilter -e '@.check_error' | grep -q 'port of its own'"
@@ -262,6 +264,7 @@ eventually "both servers run again with the admin port restored, and the refusal
 x ". /tmp/t.sh; $pids >/tmp/$PKG.pids; uci set $PKG.stagenet.port=8443; uci commit $PKG"
 check "stagenet's port set to mainnet's is refused on a reload, both servers kept running, and LuCI says why" \
 	"/etc/init.d/$PKG reload; sleep 2; $same_pids && rpc status | jsonfilter -e '@.check_error' | grep -q 'both use the port 8443'"
+check "the refused port isn't given to stagenet's firewall rule" "[ \"\$(uci get firewall.monokulo_lws_stagenet.dest_port)\" = 8450 ]"
 x "uci set $PKG.stagenet.port=8450; uci set $PKG.stagenet.data_dir=/srv/$PKG/stagenet; uci commit $PKG"
 check "a stagenet data folder inside mainnet's is refused on a reload, both servers kept running" \
 	"/etc/init.d/$PKG reload; sleep 2; $same_pids && rpc status | jsonfilter -e '@.check_error' | grep -q 'inside the other' && [ ! -e /srv/$PKG/stagenet ]"
@@ -289,9 +292,17 @@ check "a reload doesn't follow links in the data folder: /etc and /etc/shadow st
 	". /tmp/t.sh; /etc/init.d/$PKG reload; sleep 2; running $PKG stagenet && [ \"\$(ls -ldn /etc /etc/shadow | awk '{ print \$3 }' | sort -u)\" = 0 ]"
 x "rm -f /srv/$PKG-stagenet/shadow /srv/$PKG-stagenet/etc"
 
+x "uci set firewall.monokulo_lws_stagenet.enabled=1; uci commit firewall; uci set $PKG.stagenet.port=8451; uci commit $PKG"
+check "a rule turned on follows a new port, stays on, and the firewall is reloaded onto it" \
+	". /tmp/t.sh; /etc/init.d/$PKG reload; sleep 2; running $PKG stagenet && [ \"\$(uci get firewall.monokulo_lws_stagenet.dest_port)\" = 8451 ] && [ \"\$(uci get firewall.monokulo_lws_stagenet.enabled)\" = 1 ] && logread -e $PKG | grep -q 'Allow-monokulo-lws-stagenet follows stagenet.s port, 8451'"
+x "uci delete firewall.monokulo_lws_testnet; uci commit firewall; uci set $PKG.testnet.port=28450; uci commit $PKG; /etc/init.d/$PKG reload; uci set firewall.monokulo_lws_stagenet.enabled=0; uci commit firewall; uci set $PKG.stagenet.port=8450; uci commit $PKG; /etc/init.d/$PKG reload"
+check "a rule the operator deleted stays deleted" "sleep 2; ! uci -q get firewall.monokulo_lws_testnet"
+
 x "sha256sum $KEY_FILE $MAIN_KEY_FILE >/tmp/$PKG.sum"
 check "an upgrade keeps the settings and the admin keys" \
 	"apk fix --reinstall $PKG && [ \"\$(uci get $PKG.stagenet.port)\" = 8450 ] && [ \"\$(uci get $PKG.stagenet.enabled)\" = 1 ] && sha256sum -c /tmp/$PKG.sum"
+check "an upgrade makes the deleted rule again, off, on its network's port" \
+	"[ \"\$(uci get firewall.monokulo_lws_testnet.enabled)\" = 0 ] && [ \"\$(uci get firewall.monokulo_lws_testnet.dest_port)\" = 28450 ]"
 eventually "both servers run after the upgrade, and the page still reaches their admin APIs" \
 	". /tmp/t.sh; running $PKG mainnet && running $PKG stagenet && [ \"\$(rpc accounts | jsonfilter -e '@.ok')\" = true ] && [ \"\$(NET=mainnet rpc accounts | jsonfilter -e '@.ok')\" = true ]"
 
@@ -331,8 +342,8 @@ eventually "stagenet's server runs on the old settings, alone, with its wallets,
 
 check "the package is removed" "apk del $PKG"
 eventually "its removal stops the server" ". /tmp/t.sh; ! running $PKG"
-check "its removal takes the program, the LuCI page, the backend and the firewall rule" \
-	"[ ! -e /usr/bin/$PKG ] && [ ! -e /www/luci-static/resources/view/$PKG.js ] && [ ! -e /usr/share/rpcd/ucode/$PKG ] && ! uci -q get firewall.monokulo_lws && ! ubus -S list $PKG"
+check "its removal takes the program, the LuCI page, the backend and the firewall rules" \
+	"[ ! -e /usr/bin/$PKG ] && [ ! -e /www/luci-static/resources/view/$PKG.js ] && [ ! -e /usr/share/rpcd/ucode/$PKG ] && ! uci -q get firewall.monokulo_lws && ! uci -q get firewall.monokulo_lws_stagenet && ! uci -q get firewall.monokulo_lws_testnet && ! ubus -S list $PKG"
 check "its removal keeps the databases, the admin keys and the settings, the operator's" \
 	"[ -s $DB ] && [ -s $MAIN_DB ] && [ -s $KEY_FILE ] && [ -s $MAIN_KEY_FILE ] && [ -s /etc/config/$PKG ]"
 
