@@ -608,7 +608,7 @@ impl Scanner {
         if start >= chain_height {
             // Caught up: a reorg that replaced the top block without making the
             // chain longer shows only in the top block's hash.
-            let top = crate::daemon::hex32(&info.top_block_hash).map(BlockHash);
+            let top = info.top_block_hash;
             if start == chain_height
                 && let Some(top) = top
                 && let Some(kept) = kept_top

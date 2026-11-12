@@ -545,7 +545,7 @@ pub async fn get_random_outs(
                         rct.resize(96, 0);
                         RandomOutput {
                             global_index: Amount(m.global_index),
-                            public_key: Hex(m.public_key),
+                            public_key: m.public_key.into(),
                             rct: HexBytes(rct),
                         }
                     })

@@ -21,7 +21,7 @@ use rand_distr::{Distribution as _, Gamma};
 use crate::daemon::{Daemon, Distribution};
 use crate::error::{Error, Result};
 use crate::scanner::SPENDABLE_AGE;
-use crate::types::Height;
+use crate::types::{Height, PublicKey};
 
 const GAMMA_SHAPE: f64 = 19.28;
 const GAMMA_SCALE: f64 = 1.0 / 1.61;
@@ -57,7 +57,7 @@ pub struct Picker {
 #[derive(Clone, Debug)]
 pub struct Member {
     pub global_index: u64,
-    pub public_key: [u8; 32],
+    pub public_key: PublicKey,
     pub commitment: [u8; 32],
 }
 
@@ -145,14 +145,10 @@ impl Picker {
                     if out[ring].len() >= count || !o.unlocked {
                         continue;
                     }
-                    let (Some(key), Some(commitment)) = (crate::daemon::hex32(&o.key), crate::daemon::hex32(&o.mask))
-                    else {
-                        return Err(Error::Daemon("get_outs: a key that isn't hex".into()));
-                    };
                     out[ring].push(Member {
                         global_index: index,
-                        public_key: key,
-                        commitment,
+                        public_key: o.key,
+                        commitment: o.mask.0,
                     });
                 }
             }

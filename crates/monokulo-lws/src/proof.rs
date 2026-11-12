@@ -97,9 +97,12 @@ pub fn raw_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::hex32;
     use monero_wallet::transaction::{NotPruned, Transaction};
     use std::collections::HashMap;
+
+    fn hex32(s: &str) -> Option<[u8; 32]> {
+        crate::types::TxHash::from_hex(s).map(|h| h.0)
+    }
 
     /// `get_blocks.bin` from a mainnet node for blocks 3,300,000 to 3,300,002.
     const BLOCKS: &[u8] = include_bytes!("../fixtures/get_blocks-mainnet-3300000-3.bin");

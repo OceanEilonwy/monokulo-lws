@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
-use crate::types::{BlockHash, Height, TxHash};
+use crate::types::{BlockHash, Height, PublicKey, TxHash};
 
 /// The most one `get_blocks.bin` response may be; the body is read in
 /// chunks and given up on as soon as it passes this, whatever
@@ -77,8 +77,10 @@ pub struct Info {
     pub nettype: String,
     #[serde(default)]
     pub version: String,
-    #[serde(default)]
-    pub top_block_hash: String,
+    /// `None` from a node that leaves it out or sends it empty; anything
+    /// else that isn't 64 hex characters is a malformed answer.
+    #[serde(default, deserialize_with = "empty_or")]
+    pub top_block_hash: Option<BlockHash>,
     #[serde(default)]
     pub synchronized: bool,
 }
@@ -108,8 +110,9 @@ pub struct Distribution {
 #[derive(Clone, Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct OutInfo {
-    pub key: String,
-    pub mask: String,
+    pub key: PublicKey,
+    /// The output's commitment (monerod's name for it).
+    pub mask: lws_api::Hex32,
     pub unlocked: bool,
     pub height: u64,
 }
@@ -133,6 +136,45 @@ pub struct SendResult {
     pub too_few_outputs: bool,
     pub tx_extra_too_big: bool,
     pub nonzero_unlock_time: bool,
+}
+
+/// A request to the node, as far as sending it goes: JSON (sent as such,
+/// with `JSON_TIMEOUT`) or `get_blocks.bin`'s binary (`BLOCKS_TIMEOUT`),
+/// each with the most bytes its answer may be.
+#[derive(Clone, Copy, Debug)]
+enum Call {
+    Json(usize),
+    Binary(usize),
+}
+
+impl Call {
+    fn timeout(self) -> Duration {
+        match self {
+            Call::Json(_) => JSON_TIMEOUT,
+            Call::Binary(_) => BLOCKS_TIMEOUT,
+        }
+    }
+
+    fn limit(self) -> usize {
+        match self {
+            Call::Json(limit) | Call::Binary(limit) => limit,
+        }
+    }
+}
+
+/// A hex field a node may leave out or send empty: `None` then; anything
+/// else must decode as `T` (64 hex characters for a hash), or the answer
+/// is malformed.
+fn empty_or<'de, D, T>(d: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let s = std::borrow::Cow::<'de, str>::deserialize(d)?;
+    if s.is_empty() {
+        return Ok(None);
+    }
+    T::deserialize(serde::de::value::StrDeserializer::<D::Error>::new(&s)).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -175,14 +217,14 @@ impl Daemon {
         redact_userinfo(&self.base)
     }
 
-    async fn post(&self, route: &str, body: Vec<u8>, json: bool, limit: usize) -> Result<Vec<u8>> {
-        let timeout = if json { JSON_TIMEOUT } else { BLOCKS_TIMEOUT };
+    async fn post(&self, route: &str, body: Vec<u8>, call: Call) -> Result<Vec<u8>> {
+        let limit = call.limit();
         let mut request = self
             .client
             .post(format!("{}/{route}", self.base))
-            .timeout(timeout)
+            .timeout(call.timeout())
             .body(body);
-        if json {
+        if let Call::Json(_) = call {
             request = request.header("Content-Type", "application/json");
         }
         let mut response = request.send().await?;
@@ -192,12 +234,13 @@ impl Daemon {
         }
         let too_large = || Error::Daemon(format!("{route}: the response is over {limit} bytes"));
         let declared = response.content_length().unwrap_or(0);
-        if declared > limit as u64 {
+        let declared = usize::try_from(declared).map_err(|_| too_large())?;
+        if declared > limit {
             return Err(too_large());
         }
         // Read in chunks so a node that sends more than it declared (or
         // declares nothing) is cut off at the limit, not buffered whole.
-        let mut body = Vec::with_capacity((declared as usize).min(limit).min(INITIAL_BODY_CAPACITY));
+        let mut body = Vec::with_capacity(declared.min(INITIAL_BODY_CAPACITY));
         while let Some(chunk) = response.chunk().await? {
             if body.len() + chunk.len() > limit {
                 return Err(too_large());
@@ -209,7 +252,7 @@ impl Daemon {
 
     async fn rpc<T: for<'de> Deserialize<'de>>(&self, route: &str, params: Value, limit: usize) -> Result<T> {
         let body = self
-            .post(route, serde_json::to_vec(&params).expect("json"), true, limit)
+            .post(route, serde_json::to_vec(&params).expect("json"), Call::Json(limit))
             .await?;
         serde_json::from_slice(&body).map_err(|e| Error::Daemon(format!("{route}: {e}")))
     }
@@ -217,7 +260,11 @@ impl Daemon {
     async fn json_rpc<T: for<'de> Deserialize<'de>>(&self, method: &str, params: Value, limit: usize) -> Result<T> {
         let request = json!({ "jsonrpc": "2.0", "id": "0", "method": method, "params": params });
         let body = self
-            .post("json_rpc", serde_json::to_vec(&request).expect("json"), true, limit)
+            .post(
+                "json_rpc",
+                serde_json::to_vec(&request).expect("json"),
+                Call::Json(limit),
+            )
             .await?;
         let response: JsonRpcResponse<T> =
             serde_json::from_slice(&body).map_err(|e| Error::Daemon(format!("{method}: {e}")))?;
@@ -238,7 +285,7 @@ impl Daemon {
     pub async fn block_hash(&self, height: Height) -> Result<BlockHash> {
         #[derive(Deserialize)]
         struct Header {
-            hash: String,
+            hash: BlockHash,
         }
         #[derive(Deserialize)]
         struct R {
@@ -251,8 +298,7 @@ impl Daemon {
                 SMALL_JSON_RESPONSE,
             )
             .await?;
-        BlockHash::from_hex(&r.block_header.hash)
-            .ok_or_else(|| Error::Daemon("get_block_header_by_height: bad hash".into()))
+        Ok(r.block_header.hash)
     }
 
     pub async fn fee_estimate(&self) -> Result<FeeEstimate> {
@@ -362,13 +408,13 @@ impl Daemon {
     pub async fn transactions(&self, hashes: &[TxHash]) -> Result<Transactions> {
         #[derive(Deserialize)]
         struct Tx {
-            tx_hash: String,
+            tx_hash: TxHash,
             #[serde(default)]
             pruned_as_hex: String,
             #[serde(default)]
             as_hex: String,
-            #[serde(default)]
-            prunable_hash: String,
+            #[serde(default, deserialize_with = "empty_or")]
+            prunable_hash: Option<lws_api::Hex32>,
         }
         #[derive(Deserialize)]
         struct R {
@@ -395,14 +441,15 @@ impl Daemon {
                 )));
             }
             for tx in r.txs {
-                let Some(hash) = TxHash::from_hex(&tx.tx_hash).filter(|h| chunk.contains(h)) else {
+                let hash = tx.tx_hash;
+                if !chunk.contains(&hash) {
                     tracing::warn!("get_transactions: the node sent a transaction not asked for");
                     continue;
-                };
+                }
                 if !seen.insert(hash) {
                     continue;
                 }
-                match read_transaction(&tx.pruned_as_hex, &tx.as_hex, &tx.prunable_hash, &hash) {
+                match read_transaction(&tx.pruned_as_hex, &tx.as_hex, tx.prunable_hash.map(|p| p.0), &hash) {
                     Ok(parsed) => out.txs.push((hash, parsed)),
                     Err(e) => {
                         tracing::warn!("get_transactions: skipping {hash}: {e}");
@@ -420,9 +467,9 @@ impl Daemon {
     pub async fn prunable_hashes(&self, hashes: &[TxHash]) -> Result<std::collections::HashMap<TxHash, [u8; 32]>> {
         #[derive(Deserialize)]
         struct Tx {
-            tx_hash: String,
-            #[serde(default)]
-            prunable_hash: String,
+            tx_hash: TxHash,
+            #[serde(default, deserialize_with = "empty_or")]
+            prunable_hash: Option<lws_api::Hex32>,
         }
         #[derive(Deserialize)]
         struct R {
@@ -447,7 +494,7 @@ impl Daemon {
         }
         Ok(r.txs
             .iter()
-            .filter_map(|t| Some((TxHash::from_hex(&t.tx_hash)?, hex32(&t.prunable_hash)?)))
+            .filter_map(|t| Some((t.tx_hash, t.prunable_hash?.0)))
             .filter(|(_, p)| *p != [0; 32])
             .collect())
     }
@@ -462,8 +509,7 @@ impl Daemon {
             .post(
                 "get_blocks.bin",
                 request(start.get(), count),
-                false,
-                MAX_BLOCKS_RESPONSE,
+                Call::Binary(MAX_BLOCKS_RESPONSE),
             )
             .await?;
         let blocks = parse(&response, count as usize)?;
@@ -510,7 +556,7 @@ const TXS_PER_REQUEST: usize = 100;
 fn read_transaction(
     pruned_hex: &str,
     full_hex: &str,
-    prunable_hex: &str,
+    prunable_hash: Option<[u8; 32]>,
     hash: &TxHash,
 ) -> Result<Transaction<Pruned>> {
     let pruned = !pruned_hex.is_empty();
@@ -523,7 +569,7 @@ fn read_transaction(
         Transaction::V1 { .. } => None,
         Transaction::V2 { proofs: None, .. } => tx.hash_with_prunable_hash([0; 32]),
         Transaction::V2 { proofs: Some(_), .. } if !pruned => tx.hash_with_prunable_hash(keccak256(rest)),
-        Transaction::V2 { proofs: Some(_), .. } => hex32(prunable_hex)
+        Transaction::V2 { proofs: Some(_), .. } => prunable_hash
             .filter(|p| *p != [0; 32])
             .and_then(|p| tx.hash_with_prunable_hash(p)),
     };
@@ -655,11 +701,6 @@ pub struct RawTx {
     pub prunable_hash: [u8; 32],
 }
 
-pub fn hex32(s: &str) -> Option<[u8; 32]> {
-    let mut out = [0u8; 32];
-    (s.len() == 64 && hex::decode_to_slice(s, &mut out).is_ok()).then_some(out)
-}
-
 fn invalid(what: impl Into<String>) -> Error {
     Error::Daemon(what.into())
 }
@@ -669,7 +710,8 @@ fn epee_err(e: monero_epee::EpeeError) -> Error {
 }
 
 fn key(request: &mut Vec<u8>, name: &str, kind: Type) {
-    request.push(name.len() as u8);
+    // The names are the few literals in `request`, all far under 256 bytes.
+    request.push(u8::try_from(name.len()).expect("a field name under 256 bytes"));
     request.extend(name.as_bytes());
     request.push(kind as u8);
 }
@@ -1012,7 +1054,10 @@ mod tests {
             }
         });
         let d = Daemon::new(&format!("http://{addr}")).unwrap();
-        let e = d.post("get_blocks.bin", vec![], false, 100 * 1024).await.unwrap_err();
+        let e = d
+            .post("get_blocks.bin", vec![], Call::Binary(100 * 1024))
+            .await
+            .unwrap_err();
         assert!(e.to_string().contains("over"), "{e}");
     }
 
@@ -1081,6 +1126,67 @@ mod tests {
         );
         let hashes = answering(body).await.pool_hashes().await.unwrap();
         assert_eq!(hashes, vec![TxHash([0xab; 32])]);
+    }
+
+    /// Hashes and keys from the node decode at the boundary: 64 hex
+    /// characters into their types, an empty optional one as `None`, and
+    /// anything else fails the answer rather than reaching a consumer.
+    #[tokio::test]
+    async fn hashes_and_keys_from_the_node_are_checked_as_they_are_read() {
+        let good = "ab".repeat(32);
+        let info = |top: &str| format!(r#"{{"result":{{"height":5{top}}}}}"#);
+        let read = answering(info(&format!(r#","top_block_hash":"{good}""#)))
+            .await
+            .info()
+            .await;
+        assert_eq!(read.unwrap().top_block_hash, Some(BlockHash([0xab; 32])));
+        for absent in ["", r#","top_block_hash":"""#] {
+            let read = answering(info(absent)).await.info().await.unwrap();
+            assert_eq!(read.top_block_hash, None, "{absent}");
+        }
+        for bad in ["a".repeat(63), "zz".repeat(32), "ab".repeat(33)] {
+            let body = info(&format!(r#","top_block_hash":"{bad}""#));
+            assert!(answering(body).await.info().await.is_err(), "{bad}");
+        }
+
+        let header = |hash: &str| format!(r#"{{"result":{{"block_header":{{"hash":"{hash}"}}}}}}"#);
+        let d = answering(header(&good)).await;
+        assert_eq!(d.block_hash(Height::new(1)).await.unwrap(), BlockHash([0xab; 32]));
+        assert!(answering(header("ab")).await.block_hash(Height::new(1)).await.is_err());
+
+        let outs = |key: &str| {
+            format!(r#"{{"status":"OK","outs":[{{"key":"{key}","mask":"{good}","unlocked":true,"height":1}}]}}"#)
+        };
+        let read = answering(outs(&"cd".repeat(32))).await.outs(&[7]).await.unwrap();
+        assert_eq!(read[0].key, PublicKey([0xcd; 32]));
+        assert_eq!(read[0].mask.0, [0xab; 32]);
+        for bad in [
+            "",
+            "cd",
+            "not hex at all, but sixty-four characters long, give or take a few",
+        ] {
+            assert!(answering(outs(bad)).await.outs(&[7]).await.is_err(), "{bad}");
+        }
+
+        let asked = TxHash([0xab; 32]);
+        let txs = |hash: &str, prunable: &str| {
+            format!(r#"{{"status":"OK","txs":[{{"tx_hash":"{hash}","prunable_hash":"{prunable}"}}]}}"#)
+        };
+        let found = answering(txs(&good, &"01".repeat(32)))
+            .await
+            .prunable_hashes(&[asked])
+            .await;
+        assert_eq!(found.unwrap().get(&asked), Some(&[1; 32]));
+        let none = answering(txs(&good, "")).await.prunable_hashes(&[asked]).await;
+        assert!(none.unwrap().is_empty(), "an empty prunable hash is none");
+        assert!(answering(txs("ab", "")).await.prunable_hashes(&[asked]).await.is_err());
+        assert!(
+            answering(txs(&good, "0102"))
+                .await
+                .prunable_hashes(&[asked])
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
