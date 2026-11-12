@@ -257,12 +257,19 @@ cost about sixteen times the storage of proving receives.
   height says where it is.
 - Candidate spends: every RingCT input's ring, resolved to global indices,
   looked up once per ring member in one map of every account's outputs.
-- 200 block hashes are kept; a batch whose first block doesn't follow the
-  last kept one, or (once caught up) a top block whose hash isn't the one
-  kept for that height, means a reorg: outputs, candidate spends and
-  transactions from the fork on are dropped for every account, accounts
-  past it move back to it, what the pool held is forgotten and looked at
-  again, and the new blocks are scanned with the node's global indices.
+- 10,000 block hashes are kept (catch-up lanes keep theirs too once within
+  that of the tip); a batch whose blocks don't follow, or aren't, the ones
+  kept, or (once caught up) a top block whose hash isn't the one kept for
+  that height, means a reorg. The fork is found by bisecting the kept
+  hashes, and outputs, candidate spends and transactions from it on are
+  dropped for every account, accounts past it move back to it, what the
+  pool held is forgotten and looked at again, and the new blocks are
+  scanned with the node's global indices. A batch fetched before a reorg
+  was unwound is not written. A reorg deeper than every kept hash (or a
+  node on another chain) stops scanning with an error in the log and
+  `/daemon_status`, rewinding nothing; the API goes on serving. Rescan
+  every active account (admin `rescan`) from below the fork and scanning
+  resumes by itself.
 - One SQLite transaction per batch: outputs, spends, block hashes and scan
   heights land together or not at all, so a kill mid-batch leaves every
   account at a height it really scanned to. A batch writes only for the

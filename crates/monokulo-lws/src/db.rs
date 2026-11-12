@@ -684,22 +684,40 @@ impl Db {
 
     /// Forget everything from `height` on: a reorg went deeper than it.
     pub fn rewind(&self, height: u64) -> Result<()> {
+        self.write(|tx| rewind_in(tx, height))
+    }
+
+    /// How many reorgs (rewinds, and stops for one too deep) there have
+    /// been. A batch fetched before it changed may hold blocks of an
+    /// orphaned chain, and is not written (`ScanWriter::reorg_generation`).
+    pub fn reorg_generation(&self) -> Result<u64> {
+        self.read(|c| meta_u64(c, "reorg_generation").map(|g| g.unwrap_or(0)))
+    }
+
+    /// The lowest kept height, if scanning is stopped for a reorg deeper
+    /// than the kept hashes (`halt`).
+    pub fn halted(&self) -> Result<Option<u64>> {
+        self.read(|c| meta_u64(c, "halted_below"))
+    }
+
+    /// Stops scanning for a reorg deeper than the kept hashes, the lowest of
+    /// which is at `lowest`; kept across restarts until `resume`. Nothing is
+    /// rewound: below `lowest` the server can't tell which rows are from the
+    /// orphaned chain, so the operator rescans.
+    pub fn halt(&self, lowest: u64) -> Result<()> {
         self.write(|tx| {
-            let h = height as i64;
-            tx.execute("DELETE FROM spends WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM outputs WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM txs WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM blocks WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM blocks_kept WHERE height >= ?1", [h])?;
-            tx.execute("DELETE FROM txs_kept WHERE height >= ?1", [h])?;
-            tx.execute("UPDATE accounts SET scan_height = MIN(scan_height, ?1)", [h])?;
-            // The totals of the transactions left need no recomputing: an
-            // output or spend is written at its transaction's height, so every
-            // one deleted belonged to a transaction deleted with it.
-            tx.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('scanner_height', ?1)",
-                [height.to_string()],
-            )?;
+            bump_generation(tx)?;
+            set_meta(tx, "halted_below", lowest)
+        })
+    }
+
+    /// Scanning goes on after `halt(lowest)`, the accounts having been
+    /// rescanned from below it: everything from `lowest` on, all of it from
+    /// the orphaned chain (the hashes kept there among it), goes.
+    pub fn resume(&self, lowest: u64) -> Result<()> {
+        self.write(|tx| {
+            rewind_in(tx, lowest)?;
+            tx.execute("DELETE FROM meta WHERE key = 'halted_below'", [])?;
             Ok(())
         })
     }
@@ -944,6 +962,44 @@ fn drop_unused_kept(tx: &Transaction, height: u64) -> Result<()> {
     Ok(())
 }
 
+/// Forgets everything from `height` on, for every account, and counts a
+/// reorg. The totals of the transactions left need no recomputing: an
+/// output or spend is written at its transaction's height, so every one
+/// deleted belonged to a transaction deleted with it.
+fn rewind_in(tx: &Transaction, height: u64) -> Result<()> {
+    let h = height as i64;
+    tx.execute("DELETE FROM spends WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM outputs WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM txs WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM blocks WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM blocks_kept WHERE height >= ?1", [h])?;
+    tx.execute("DELETE FROM txs_kept WHERE height >= ?1", [h])?;
+    tx.execute("UPDATE accounts SET scan_height = MIN(scan_height, ?1)", [h])?;
+    set_meta(tx, "scanner_height", height)?;
+    bump_generation(tx)
+}
+
+fn meta_u64(c: &Connection, key: &str) -> Result<Option<u64>> {
+    Ok(c.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+        r.get::<_, String>(0)
+    })
+    .optional()?
+    .and_then(|s| s.parse().ok()))
+}
+
+fn set_meta(tx: &Transaction, key: &str, value: u64) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![key, value.to_string()],
+    )?;
+    Ok(())
+}
+
+fn bump_generation(tx: &Transaction) -> Result<()> {
+    let generation = meta_u64(tx, "reorg_generation")?.unwrap_or(0);
+    set_meta(tx, "reorg_generation", generation.wrapping_add(1))
+}
+
 /// A transaction's running total.
 #[derive(Clone, Copy)]
 enum Total {
@@ -975,6 +1031,34 @@ impl<'a> ScanWriter<'a> {
             [(height + 1).to_string()],
         )?;
         Ok(())
+    }
+
+    /// Keeps a block's hash, as a catch-up lane does near the tip: no older
+    /// hashes are dropped and the scanner's own height doesn't move, as
+    /// both are the live lane's.
+    pub fn keep_hash(&self, height: u64, hash: &[u8; 32]) -> Result<()> {
+        self.tx.execute(
+            "INSERT OR REPLACE INTO blocks (height, hash) VALUES (?1, ?2)",
+            params![height as i64, hash.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// The hash kept for `height`, as this transaction sees it.
+    pub fn block_hash(&self, height: u64) -> Result<Option<[u8; 32]>> {
+        Ok(self
+            .tx
+            .query_row("SELECT hash FROM blocks WHERE height = ?1", [height as i64], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .optional()?
+            .map(blob32)
+            .transpose()?)
+    }
+
+    /// `Db::reorg_generation`, as this transaction sees it.
+    pub fn reorg_generation(&self) -> Result<u64> {
+        Ok(meta_u64(self.tx, "reorg_generation")?.unwrap_or(0))
     }
 
     /// Keeps a block that pays an account, for proofs: its hash and its blob
@@ -1383,6 +1467,56 @@ mod tests {
             min: 0,
             commitment: None,
         }
+    }
+
+    #[test]
+    fn set_block_keeps_only_the_last_hashes() {
+        let db = Db::in_memory();
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            for h in 1..=30 {
+                w.set_block(h, &[h as u8; 32], 10)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let kept = db.recent_blocks().unwrap();
+        assert_eq!(kept.len(), 11);
+        assert_eq!((kept[0].0, kept[10].0), (30, 20));
+    }
+
+    /// A rewind and a stop for a reorg too deep each count a reorg; a stop
+    /// lasts until `resume`, which drops everything from the lowest kept
+    /// height on.
+    #[test]
+    fn reorgs_are_counted_and_a_stop_lasts_until_resumed() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            assert_eq!(w.reorg_generation()?, 0);
+            let t = w.tx_row(a.id, &new_tx(1, 20))?;
+            w.add_output(a.id, t, &new_output(1, 100, 5, 20))?;
+            for h in 15..=25 {
+                w.set_block(h, &[h as u8; 32], 100)?;
+            }
+            w.set_scan_height(a.id, 26)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.reorg_generation().unwrap(), 0);
+        db.rewind(24).unwrap();
+        assert_eq!(db.reorg_generation().unwrap(), 1);
+        assert_eq!(db.halted().unwrap(), None);
+        db.halt(15).unwrap();
+        assert_eq!(db.reorg_generation().unwrap(), 2);
+        assert_eq!(db.halted().unwrap(), Some(15));
+        assert_eq!(db.outputs(a.id).unwrap().len(), 1, "a stop rewinds nothing");
+        db.resume(15).unwrap();
+        assert_eq!(db.halted().unwrap(), None);
+        assert!(db.recent_blocks().unwrap().is_empty());
+        assert!(db.outputs(a.id).unwrap().is_empty());
+        assert_eq!(db.account("A").unwrap().unwrap().scan_height, 15);
     }
 
     /// A rewind leaves the totals of the transactions before it as they
