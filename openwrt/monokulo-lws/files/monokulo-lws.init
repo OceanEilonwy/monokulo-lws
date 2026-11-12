@@ -7,43 +7,54 @@
 # turns the settings into one (`monokulo-lws serve --help` names them all);
 # only what is set is passed, and the server's own defaults rule the rest.
 #
-# The admin API is always on, on this router alone (127.0.0.1), for the
-# LuCI page: its key is made with the database at the first start and kept
-# in /etc/monokulo-lws/secrets/, root's alone (the server keeps only its
-# hash). A bad setting never stops a running server: a reload (a save in
-# LuCI, `uci commit`) whose settings this script refuses leaves it running
-# on its earlier ones, and the reason is in /var/run/monokulo-lws/check
-# for LuCI to show. What the server itself refuses is in its log (logread).
+# One server runs per network turned on (the network sections mainnet,
+# stagenet and testnet), each a procd instance named after its network,
+# with its own node, ports, data folder and admin key, and --network set
+# so it refuses a node of another network. The settings in the main section
+# are shared by all of them.
+#
+# Each server's admin API is always on, on this router alone (127.0.0.1),
+# for the LuCI page: its key is made with the database at the first start
+# and kept in /etc/monokulo-lws/secrets/<network>/, root's alone (the
+# server keeps only its hash). A bad setting never stops a running server: a
+# reload (a save in LuCI, `uci commit`) whose settings this script refuses
+# for a network that runs leaves every server running on its earlier ones,
+# and the reason is in /var/run/monokulo-lws/check (for every network) or
+# check.<network> for LuCI to show. What a server itself refuses is in its
+# log (logread).
 
 START=99
 STOP=10
 USE_PROCD=1
-EXTRA_COMMANDS="admin_key"
-EXTRA_HELP="	admin_key	Make a new admin key for the LuCI page (stops and starts the server)"
+EXTRA_COMMANDS="admin_key migrate"
+EXTRA_HELP="	admin_key [network]	Make a new admin key for the LuCI page (stops and starts that network's server; mainnet by default)
+	migrate	Turn settings from before networks had sections of their own into the network sections"
 
 NAME=monokulo-lws
 BIN=/usr/bin/monokulo-lws
 RUN_AS=monokulo-lws
 PAGE="Services > Light Wallet Server"
+NETWORKS="mainnet stagenet testnet"
 SECRETS_DIR=/etc/monokulo-lws/secrets
-KEY_FILE=$SECRETS_DIR/MONOKULO_LWS_ADMIN_KEY
+KEY_NAME=MONOKULO_LWS_ADMIN_KEY
+# Where the one server's key was before each network had a server.
+LEGACY_KEY_FILE=$SECRETS_DIR/$KEY_NAME
 DEFAULT_DATA_DIR=/srv/monokulo-lws
 DB_FILE=lws.sqlite
 # Root's alone, in memory (rpcd.uc keeps its request bodies here too).
 RUN_DIR=/var/run/monokulo-lws
-# What the last start refused, for LuCI.
+# What the last start refused, for LuCI: for every network (check), or
+# for one (check.<network>).
 CHECK_FILE=$RUN_DIR/check
 # Which build the package installed (its Makefile writes it).
 VERSION_FILE=/usr/share/monokulo-lws/version
 
-# The settings passed through as they are: "<option> <UCI option> <kind>".
-# value: --option VALUE. list: a UCI list, comma separated. repeat: the
-# option once per entry of a UCI list. The wallet listener, the admin
-# listener, the database and the shader cache are set apart, from port,
-# listen, admin_port and data_dir.
+# The settings every network shares, passed through as they are:
+# "<option> <UCI option> <kind>". value: --option VALUE. list: a UCI list,
+# comma separated. repeat: the option once per entry of a UCI list. The
+# node, the listeners, the database and the shader cache are each
+# network's own, set apart.
 OPTIONS='
---daemon daemon value
---network network value
 --create create value
 --import import value
 --max-subaddresses max_subaddresses value
@@ -73,23 +84,171 @@ log() {
 	logger -t "$NAME" "$*"
 }
 
-# refuse <why>: logged, and kept for LuCI.
-refuse() {
-	log "$1"
-	run_dir && printf '%s\n' "$1" >"$CHECK_FILE"
-}
-
 # run_dir: RUN_DIR made, root's alone.
 run_dir() {
 	mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
 }
 
-# Whether procd runs the server now. Not procd_running, which would reset
-# the service description start_service is in the middle of.
-running_now() {
-	ubus call service list "{\"name\":\"$NAME\"}" 2>/dev/null |
-		jsonfilter -q -e "@['$NAME'].instances.*.running" | grep -q true
+# refuse <why>: a refusal for every network, logged, and kept for LuCI.
+refuse() {
+	log "$1"
+	run_dir && printf '%s\n' "$1" >"$CHECK_FILE"
 }
+
+# refuse_net <network> <why>: a refusal for one network.
+refuse_net() {
+	log "$1: $2"
+	run_dir && printf '%s\n' "$2" >"$CHECK_FILE.$1"
+}
+
+# is_network <name>: one of NETWORKS.
+is_network() {
+	case " $NETWORKS " in
+	*" $1 "*) [ -n "$1" ] ;;
+	*) return 1 ;;
+	esac
+}
+
+# The --network option's name for a network section.
+net_flag() {
+	case "$1" in
+	mainnet) echo main ;;
+	stagenet) echo stage ;;
+	testnet) echo test ;;
+	esac
+}
+
+# net_default <network> <option>: a network's setting when its section
+# leaves it out: its node's usual RPC port, and ports and a data folder
+# apart from the other networks'.
+net_default() {
+	case "$1:$2" in
+	mainnet:daemon) echo http://127.0.0.1:18081 ;;
+	mainnet:port) echo 8443 ;;
+	mainnet:admin_port) echo 8444 ;;
+	mainnet:data_dir) echo "$DEFAULT_DATA_DIR" ;;
+	stagenet:daemon) echo http://127.0.0.1:38081 ;;
+	stagenet:port) echo 38443 ;;
+	stagenet:admin_port) echo 38444 ;;
+	stagenet:data_dir) echo "$DEFAULT_DATA_DIR-stagenet" ;;
+	testnet:daemon) echo http://127.0.0.1:28081 ;;
+	testnet:port) echo 28443 ;;
+	testnet:admin_port) echo 28444 ;;
+	testnet:data_dir) echo "$DEFAULT_DATA_DIR-testnet" ;;
+	*:enabled) echo 0 ;;
+	esac
+}
+
+# net_get <var> <network> <option>: the setting, or the network's default.
+net_get() {
+	config_get "$1" "$2" "$3" "$(net_default "$2" "$3")"
+}
+
+# Whether a network's server is on: the service's switch and its own.
+net_enabled() {
+	local on
+	config_get_bool on "$1" enabled "$(net_default "$1" enabled)"
+	[ "$on" = 1 ]
+}
+
+key_file() {
+	echo "$SECRETS_DIR/$1/$KEY_NAME"
+}
+
+# Whether procd runs a network's server now (any network's, without one).
+# Not procd_running, which would reset the service description
+# start_service is in the middle of.
+running_now() {
+	local which='.*'
+	[ -n "${1:-}" ] && which="['$1']"
+	ubus call service list "{\"name\":\"$NAME\"}" 2>/dev/null |
+		jsonfilter -q -e "@['$NAME'].instances$which.running" | grep -q true
+}
+
+# ---- settings from before each network had a section ------------------------
+
+# legacy_network <network option> <node>: which network the one server of
+# an older version served: its network guard if it had one, otherwise what
+# its node says it is on, otherwise its node's port (monerod's defaults:
+# 38081 stagenet, 28081 testnet), otherwise mainnet.
+legacy_network() {
+	local nettype
+	case "$1" in
+	main | mainnet) echo mainnet; return ;;
+	stage | stagenet) echo stagenet; return ;;
+	test | testnet) echo testnet; return ;;
+	esac
+	nettype=$(uclient-fetch -q -T 3 -O - \
+		--post-data '{"jsonrpc":"2.0","id":"0","method":"get_info"}' "${2%/}/json_rpc" 2>/dev/null |
+		jsonfilter -q -e '@.result.nettype')
+	case "$nettype" in
+	mainnet | stagenet | testnet) echo "$nettype"; return ;;
+	esac
+	case "$2" in
+	*:38081 | *:38081/* | *:38089 | *:38089/*) echo stagenet ;;
+	*:28081 | *:28081/* | *:28089 | *:28089/*) echo testnet ;;
+	*) echo mainnet ;;
+	esac
+}
+
+# migrate: settings an older version left (the node, ports and data folder
+# in the main section, no network sections) turned into network sections,
+# the old server's settings in its network's, which is on, the others off;
+# and its admin key moved to that network's folder. Does nothing to
+# settings that have network sections already, but for the key.
+migrate() {
+	local found=0 net=mainnet daemon port admin_port data_dir network n o
+	config_load "$NAME"
+	note_network() { found=1; }
+	config_foreach note_network network
+	if [ "$found" = 0 ]; then
+		config_get daemon main daemon
+		config_get port main port
+		config_get admin_port main admin_port
+		config_get data_dir main data_dir
+		config_get network main network
+		net=$(legacy_network "$network" "${daemon:-$(net_default mainnet daemon)}")
+		for n in $NETWORKS; do
+			uci -q set "$NAME.$n=network"
+			uci -q set "$NAME.$n.enabled=0"
+			for o in daemon port admin_port data_dir; do
+				uci -q set "$NAME.$n.$o=$(net_default "$n" "$o")"
+			done
+		done
+		uci -q set "$NAME.$net.enabled=1"
+		# The old server's settings go to its network: its data folder too,
+		# so the database it made stays its own.
+		[ -n "$daemon" ] && uci -q set "$NAME.$net.daemon=$daemon"
+		[ -n "$port" ] && uci -q set "$NAME.$net.port=$port"
+		[ -n "$admin_port" ] && uci -q set "$NAME.$net.admin_port=$admin_port"
+		uci -q set "$NAME.$net.data_dir=${data_dir:-$DEFAULT_DATA_DIR}"
+		for o in daemon port admin_port data_dir network; do
+			uci -q delete "$NAME.main.$o"
+		done
+		uci -q commit "$NAME"
+		log "moved the settings to the network section $net (the node is on $net), and made the other networks' sections, off: turn them on in $PAGE"
+		config_load "$NAME"
+	else
+		# Settings that had network sections already (a new package's
+		# settings over an old install, say): the old key belongs to the
+		# network whose data folder holds the database it was made with.
+		for n in $NETWORKS; do
+			net_get data_dir "$n" data_dir
+			if [ "${data_dir%/}" = "$DEFAULT_DATA_DIR" ]; then
+				net=$n
+				break
+			fi
+		done
+	fi
+	if [ -s "$LEGACY_KEY_FILE" ] && [ ! -e "$(key_file "$net")" ]; then
+		mkdir -p "$SECRETS_DIR/$net" && chmod 700 "$SECRETS_DIR/$net" &&
+			mv "$LEGACY_KEY_FILE" "$(key_file "$net")" &&
+			log "moved the admin key to $(key_file "$net")"
+	fi
+	return 0
+}
+
+# ---- the checks --------------------------------------------------------------
 
 # The address to listen on: this router's, the LAN's or every interface's.
 listen_addr() {
@@ -106,7 +265,7 @@ listen_addr() {
 	echo "$addr"
 }
 
-# dir_refusal <dir>: why the folder can't be the data folder, if it is a
+# dir_refusal <dir>: why the folder can't be a data folder, if it is a
 # system folder or in one, a top-level folder, or in memory; fails if it
 # can be. Root makes the data folder the server's user's, so it must never
 # be one the system or root relies on. LuCI's page checks the same.
@@ -169,7 +328,7 @@ prepare_data_dir() {
 	chmod 700 "$dir"
 }
 
-# give_file <file>: a file root put in the data folder (a TLS certificate
+# give_file <file>: a file root put in a data folder (a TLS certificate
 # or key, as the page suggests) made the server's, so it can read it. Only
 # a plain file, not a link (symbolic or hard), and only if root's: never
 # hand over a file reached through something the server's user controls.
@@ -180,20 +339,21 @@ give_file() {
 	chown -h "$RUN_AS:$RUN_AS" "$1"
 }
 
-# The admin key for the LuCI page, made with the database (the server
-# keeps its hash there) and kept root's alone. Made again when the
-# database is new: a key the database doesn't know is no use. The server
-# must not be running (the database is written).
+# ensure_admin_key <db> <key file>: the admin key for the LuCI page, made
+# with the database (the server keeps its hash there) and kept root's
+# alone. Made again when the database is new: a key the database doesn't
+# know is no use. The server must not be running (the database is written).
 ensure_admin_key() {
-	local db="$1" key
-	mkdir -p "$SECRETS_DIR" || return 1
-	chown root:root "${SECRETS_DIR%/*}" "$SECRETS_DIR"
-	chmod 700 "${SECRETS_DIR%/*}" "$SECRETS_DIR"
+	local db="$1" key_file="$2" key_dir key
+	key_dir=${key_file%/*}
+	mkdir -p "$key_dir" || return 1
+	chown root:root "${SECRETS_DIR%/*}" "$SECRETS_DIR" "$key_dir"
+	chmod 700 "${SECRETS_DIR%/*}" "$SECRETS_DIR" "$key_dir"
 	if [ -L "$db" ]; then
 		echo "not using the database $db: it is a symbolic link"
 		return 1
 	fi
-	if [ ! -s "$db" ] || [ ! -s "$KEY_FILE" ]; then
+	if [ ! -s "$db" ] || [ ! -s "$key_file" ]; then
 		# Made as the server's user, who owns the data folder and so what
 		# the path leads to; only the printed key comes back to root. The
 		# pid file is never written: it keeps start-stop-daemon from
@@ -209,15 +369,15 @@ ensure_admin_key() {
 		esac
 		(
 			umask 077
-			printf '%s\n' "$key" >"$KEY_FILE.new"
-		) && mv "$KEY_FILE.new" "$KEY_FILE" || return 1
-		log "made the admin key for $PAGE, $KEY_FILE"
+			printf '%s\n' "$key" >"$key_file.new"
+		) && mv "$key_file.new" "$key_file" || return 1
+		log "made the admin key for $PAGE, $key_file"
 	fi
-	chown root:root "$KEY_FILE"
-	chmod 600 "$KEY_FILE"
+	chown root:root "$key_file"
+	chmod 600 "$key_file"
 }
 
-# append_options: the settings of OPTIONS that are set, onto the command.
+# append_options: the shared settings of OPTIONS that are set, onto the command.
 append_option() {
 	procd_append_param command "$2" "$1"
 }
@@ -243,24 +403,30 @@ append_options() {
 	EOF
 }
 
-# prepare: reads the settings (config_load first) into the variables the
-# instance is made from, readies the data folder and the admin key, and
-# succeeds; or sets REASON and fails. WAITING=1 marks a LAN address not
-# there yet, which isn't a refusal: the interface trigger starts it.
-prepare() {
-	local tls_cert tls_key f
+# The networks turned on, in NETWORKS' order.
+enabled_networks() {
+	local n
+	for n in $NETWORKS; do
+		net_enabled "$n" && echo "$n"
+	done
+}
+
+# prepare_shared: reads the shared settings (config_load first) into the
+# variables every instance is made from, and checks that the networks
+# turned on don't share a port or a data folder; succeeds, or sets REASON
+# and fails. WAITING=1 marks a LAN address not there yet, which isn't a
+# refusal: the interface trigger starts it.
+prepare_shared() {
+	local tls_cert tls_key n p other port admin_port dir seen_ports seen_dirs
 	REASON=
 	WAITING=0
-	config_get PORT main port 8443
 	config_get LISTEN main listen loopback
-	config_get ADMIN_PORT main admin_port 8444
-	config_get DATA_DIR main data_dir "$DEFAULT_DATA_DIR"
 	config_get LOG_LEVEL main log_level info
 	config_get NICE main nice 10
 	config_get CPUS main cpus
 	config_get tls_cert main tls_cert
 	config_get tls_key main tls_key
-	DB=$DATA_DIR/$DB_FILE
+	TLS_FILES="$tls_cert $tls_key"
 
 	case "$LISTEN" in
 	all | loopback | lan) ;;
@@ -269,38 +435,60 @@ prepare() {
 		return 1
 		;;
 	esac
+	if [ -n "$tls_cert$tls_key" ]; then
+		if [ ! -s "$tls_cert" ] || [ ! -s "$tls_key" ]; then
+			REASON="TLS needs both files on this router, the certificate chain '$tls_cert' and the key '$tls_key'; a data folder is a good place for them"
+			return 1
+		fi
+	fi
+
+	# Every port and data folder of the networks turned on, once.
+	seen_ports=
+	seen_dirs=
+	for n in $(enabled_networks); do
+		net_get port "$n" port
+		net_get admin_port "$n" admin_port
+		for p in "$port" "$admin_port"; do
+			case "$p" in
+			*[!0-9]* | '')
+				REASON="$n's ports must be numbers: port '$port', admin_port '$admin_port'"
+				return 1
+				;;
+			esac
+			other=$(printf '%s\n' "$seen_ports" | awk -v p="$p" '$1 == p { print $2; exit }')
+			if [ -n "$other" ]; then
+				if [ "$other" = "$n" ]; then
+					REASON="$n's admin API needs a port of its own, not its wallet API's $p"
+				else
+					REASON="$n and $other both use the port $p: each network needs ports of its own"
+				fi
+				return 1
+			fi
+			seen_ports="$seen_ports
+$p $n"
+		done
+		net_get dir "$n" data_dir
+		dir=$(printf '%s' "$dir" | sed 's:/*$::')
+		other=$(printf '%s\n' "$seen_dirs" | awk -v d="$dir" '
+			$1 != "" && ($1 == d || index(d, $1 "/") == 1 || index($1, d "/") == 1) { print $2; exit }')
+		if [ -n "$other" ]; then
+			REASON="$n and $other share the data folder $dir, or one is inside the other: each network needs a folder of its own"
+			return 1
+		fi
+		seen_dirs="$seen_dirs
+$dir $n"
+	done
+
 	if ! ADDR=$(listen_addr "$LISTEN"); then
 		WAITING=1
 		REASON="waiting for the lan interface's address: it starts once the LAN is up"
 		return 1
 	fi
-	case "$PORT$ADMIN_PORT" in
-	*[!0-9]* | '')
-		REASON="the ports must be numbers: port '$PORT', admin_port '$ADMIN_PORT'"
-		return 1
-		;;
-	esac
-	if [ "$PORT" = "$ADMIN_PORT" ]; then
-		REASON="the admin API needs a port of its own, not the wallet API's $PORT"
-		return 1
-	fi
-	if [ -n "$tls_cert$tls_key" ]; then
-		if [ ! -s "$tls_cert" ] || [ ! -s "$tls_key" ]; then
-			REASON="TLS needs both files on this router, the certificate chain '$tls_cert' and the key '$tls_key'; the data folder is a good place for them"
-			return 1
-		fi
-	fi
-	REASON=$(prepare_data_dir "$DATA_DIR" 2>&1) || return 1
-	REASON=$(ensure_admin_key "$DB" 2>&1) || return 1
-	# TLS files root put in the data folder, for the server to read.
-	for f in "$tls_cert" "$tls_key"; do
-		[ -n "$f" ] && [ "${f%/*}" = "$DATA_DIR" ] && give_file "$f"
-	done
 
 	# The scanner's CPUs, as taskset takes them; a list this router can't
 	# honour is dropped. Its niceness, 0 to 19.
 	if [ -n "$CPUS" ] && ! taskset -c "$CPUS" true 2>/dev/null; then
-		log "can't keep the server to CPUs '$CPUS' (no such CPUs here); it may use all of them"
+		log "can't keep the servers to CPUs '$CPUS' (no such CPUs here); they may use all of them"
 		CPUS=
 	fi
 	case "$NICE" in
@@ -310,31 +498,49 @@ prepare() {
 	return 0
 }
 
-start_service() {
-	local enabled
+# prepare_net <network>: reads a network's settings into the variables its
+# instance is made from, readies its data folder and admin key, and
+# succeeds; or sets REASON and fails. After prepare_shared.
+prepare_net() {
+	local net="$1" f
+	REASON=
+	net_get DAEMON "$net" daemon
+	net_get PORT "$net" port
+	net_get ADMIN_PORT "$net" admin_port
+	net_get DATA_DIR "$net" data_dir
+	DATA_DIR=$(printf '%s' "$DATA_DIR" | sed 's:/*$::')
+	DB=$DATA_DIR/$DB_FILE
+	KEY_FILE=$(key_file "$net")
 
-	# Each start says afresh what refuses it.
-	rm -f "$CHECK_FILE"
-	config_load "$NAME"
-	config_get_bool enabled main enabled 1
-	[ "$enabled" = 1 ] || return 0
-
-	if ! prepare; then
-		if [ "$WAITING" = 1 ]; then
-			log "$REASON"
-			return 0
-		fi
-		refuse "$REASON"
+	case "$DAEMON" in
+	http://?* | https://?*) ;;
+	*)
+		REASON="the node must be an address such as $(net_default "$net" daemon), not '$DAEMON'"
 		return 1
-	fi
+		;;
+	esac
+	REASON=$(prepare_data_dir "$DATA_DIR" 2>&1) || return 1
+	REASON=$(ensure_admin_key "$DB" "$KEY_FILE" 2>&1) || return 1
+	# TLS files root put in this data folder, for the server to read.
+	for f in $TLS_FILES; do
+		[ "${f%/*}" = "$DATA_DIR" ] && give_file "$f"
+	done
+	return 0
+}
 
-	procd_open_instance "$NAME"
+# open_instance <network>: its server, from what prepare_shared and
+# prepare_net read.
+open_instance() {
+	local net="$1"
+	procd_open_instance "$net"
 	if [ -n "$CPUS" ]; then
 		procd_set_param command taskset -c "$CPUS" "$BIN"
 	else
 		procd_set_param command "$BIN"
 	fi
 	procd_append_param command serve \
+		--daemon "$DAEMON" \
+		--network "$(net_flag "$net")" \
 		--db "$DB" \
 		--cache-dir "$DATA_DIR/cache" \
 		--listen "$ADDR:$PORT" \
@@ -360,17 +566,63 @@ start_service() {
 	procd_close_instance
 }
 
-# A reload (a save in LuCI, `uci commit`, the LAN coming up) of a running
-# server keeps it on its last good settings if the new ones are refused
-# here; a start (a restart's included) doesn't start it.
-reload_service() {
-	local enabled
-	config_load "$NAME"
+start_service() {
+	local enabled net failed=0
+
+	# Each start says afresh what refuses it.
+	rm -f "$CHECK_FILE" "$CHECK_FILE".*
+	migrate
 	config_get_bool enabled main enabled 1
-	if [ "$enabled" = 1 ] && ! prepare && [ "$WAITING" = 0 ] && running_now; then
+	[ "$enabled" = 1 ] || return 0
+
+	if ! prepare_shared; then
+		if [ "$WAITING" = 1 ]; then
+			log "$REASON"
+			return 0
+		fi
 		refuse "$REASON"
-		log "keeps running on its earlier settings"
-		return 0
+		return 1
+	fi
+
+	# Each network on its own: one refused doesn't keep the others from
+	# starting.
+	for net in $(enabled_networks); do
+		if prepare_net "$net"; then
+			open_instance "$net"
+		else
+			refuse_net "$net" "$REASON"
+			failed=1
+		fi
+	done
+	return $failed
+}
+
+# A reload (a save in LuCI, `uci commit`, the LAN coming up) keeps every
+# server on its last good settings if the new ones are refused here for a
+# network whose server runs; a start (a restart's included) doesn't start
+# the networks refused.
+reload_service() {
+	local enabled net keep=0
+	migrate
+	config_get_bool enabled main enabled 1
+	if [ "$enabled" = 1 ] && running_now; then
+		if ! prepare_shared; then
+			if [ "$WAITING" = 0 ]; then
+				refuse "$REASON"
+				keep=1
+			fi
+		else
+			for net in $(enabled_networks); do
+				if ! prepare_net "$net" && running_now "$net"; then
+					refuse_net "$net" "$REASON"
+					keep=1
+				fi
+			done
+		fi
+		if [ "$keep" = 1 ]; then
+			log "keeps running on its earlier settings"
+			return 0
+		fi
 	fi
 	start
 }
@@ -381,25 +633,30 @@ service_triggers() {
 	procd_add_interface_trigger "interface.*.up" lan "/etc/init.d/$NAME" reload
 }
 
-# A new admin key for the LuCI page, for a database that doesn't know the
-# key in the secrets folder any more (restored from a backup, say): the
-# server is stopped while the key is made, and started again.
+# admin_key [network]: a new admin key for the LuCI page, for a database
+# that doesn't know the key in the secrets folder any more (restored from a
+# backup, say): that network's server is stopped while the key is made, and
+# started again.
 admin_key() {
-	local data_dir i=0
-	config_load "$NAME"
-	config_get data_dir main data_dir "$DEFAULT_DATA_DIR"
+	local net="${1:-mainnet}" data_dir i=0
+	if ! is_network "$net"; then
+		echo "the network is one of $NETWORKS, not '$net'" >&2
+		return 1
+	fi
+	migrate
+	net_get data_dir "$net" data_dir
 	if ! REASON=$(prepare_data_dir "$data_dir" 2>&1); then
 		log "$REASON"
 		echo "$REASON" >&2
 		return 1
 	fi
-	stop
-	while running_now && [ $i -lt 15 ]; do
+	stop "$net"
+	while running_now "$net" && [ $i -lt 15 ]; do
 		sleep 1
 		i=$((i + 1))
 	done
-	rm -f "$KEY_FILE"
-	if ! REASON=$(ensure_admin_key "$data_dir/$DB_FILE" 2>&1); then
+	rm -f "$(key_file "$net")"
+	if ! REASON=$(ensure_admin_key "${data_dir%/}/$DB_FILE" "$(key_file "$net")" 2>&1); then
 		log "$REASON"
 		echo "$REASON" >&2
 		start

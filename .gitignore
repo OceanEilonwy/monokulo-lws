@@ -7,3 +7,7 @@ target/
 # package and the repository.
 /openwrt/monokulo-lws/files/monokulo-lws
 /dist/
+
+# scripts/build-pages.sh: the GitHub Pages site, as CI builds it.
+/site/
+/repos/

@@ -1,3 +1,5 @@
 /etc/config/monokulo-lws
 /etc/monokulo-lws/
 /srv/monokulo-lws/
+/srv/monokulo-lws-stagenet/
+/srv/monokulo-lws-testnet/
