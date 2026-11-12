@@ -877,6 +877,108 @@ async fn provisioning_a_full_major_is_a_conflict() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
 }
 
+/// `upsert_subaddrs` against a plain set of minors, over random requests,
+/// and fast on a large account: 10,000 stored singletons and 1,000
+/// requested ones used to take ~1e8 comparisons under the database lock.
+#[test]
+fn subaddress_upserts_match_a_set_and_scale() {
+    use lws_api::SubaddrRanges;
+    use std::collections::BTreeSet;
+    let db = Db::in_memory();
+    let (address, key) = wallet(97);
+    let checked = crate::crypto::check_login(Network::Stagenet, &address, &key).unwrap();
+    let account = db
+        .add_account(
+            &NewAccount {
+                address: checked.address.clone(),
+                view_key: checked.view_key,
+                spend_pub: checked.spend_pub,
+                view_pub: checked.view_pub,
+                start_height: 0,
+                generated_locally: false,
+            },
+            Status::Active,
+        )
+        .unwrap()
+        .id;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |n: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    let mut model: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let ranges_of = |minors: Vec<(u32, u32)>| -> Vec<SubaddrRanges> {
+        let mut out: Vec<SubaddrRanges> = vec![];
+        for (maj, min) in minors {
+            match out.last_mut() {
+                Some(r) if r.key == maj && r.value.last().unwrap()[1] + 1 == min => {
+                    r.value.last_mut().unwrap()[1] = min
+                }
+                Some(r) if r.key == maj => r.value.push([min, min]),
+                _ => out.push(SubaddrRanges {
+                    key: maj,
+                    value: vec![[min, min]],
+                }),
+            }
+        }
+        out
+    };
+    for _ in 0..200 {
+        let mut wanted: Vec<SubaddrRanges> = vec![];
+        for _ in 0..1 + next(4) {
+            let lo = next(60) as u32;
+            let hi = lo + next(8) as u32;
+            wanted.push(SubaddrRanges {
+                key: next(3) as u32,
+                value: vec![[lo, hi]],
+            });
+        }
+        let mut fresh = BTreeSet::new();
+        for w in &wanted {
+            for &[lo, hi] in &w.value {
+                for m in lo..=hi {
+                    if !model.contains(&(w.key, m)) {
+                        fresh.insert((w.key, m));
+                    }
+                }
+            }
+        }
+        let added = db.upsert_subaddrs(account, &wanted, 1_000).unwrap();
+        assert_eq!(added, ranges_of(fresh.iter().copied().collect()), "{wanted:?}");
+        model.extend(fresh);
+        assert_eq!(
+            db.subaddrs(account).unwrap(),
+            ranges_of(model.iter().copied().collect())
+        );
+    }
+
+    // Large: every other minor of major 5 stored, then 1,000 more asked for.
+    let stored: Vec<[u32; 2]> = (0..10_000u32).map(|i| [i * 2, i * 2]).collect();
+    db.upsert_subaddrs(account, &[SubaddrRanges { key: 5, value: stored }], 100_000)
+        .unwrap();
+    let asked: Vec<[u32; 2]> = (0..1_000u32).map(|i| [i * 20 + 1, i * 20 + 1]).collect();
+    let started = std::time::Instant::now();
+    let added = db
+        .upsert_subaddrs(
+            account,
+            &[SubaddrRanges {
+                key: 5,
+                value: asked.clone(),
+            }],
+            100_000,
+        )
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    assert_eq!(added, vec![SubaddrRanges { key: 5, value: asked }]);
+    // A minor at the very top is new once and covered after.
+    let top = [SubaddrRanges {
+        key: 9,
+        value: vec![[u32::MAX - 1, u32::MAX]],
+    }];
+    assert_eq!(db.upsert_subaddrs(account, &top, 100_000).unwrap().len(), 1);
+    assert!(db.upsert_subaddrs(account, &top, 100_000).unwrap().is_empty());
+}
+
 /// A repeated create request is refused before it takes a token from the
 /// global bucket, so it can't drain it for everyone.
 #[tokio::test]

@@ -557,54 +557,51 @@ impl Db {
 
     /// Adds ranges, merging with what is there; returns only what was new,
     /// as ranges, and refuses to pass `max` minors in all.
+    ///
+    /// Each major is sorted and merged once: what is wanted, what is held,
+    /// and the two together, with the new minors found by one sweep of the
+    /// sorted lists, so the work is O((S + R) log(S + R)) for S stored and
+    /// R requested ranges. Only the majors asked about are written again.
     pub fn upsert_subaddrs(
         &self,
         account: i64,
         wanted: &[lws_api::SubaddrRanges],
         max: u64,
     ) -> Result<Vec<lws_api::SubaddrRanges>> {
+        let mut wanted_by_major: std::collections::BTreeMap<u32, Vec<[u32; 2]>> = Default::default();
+        for want in wanted {
+            for &[lo, hi] in &want.value {
+                if lo > hi {
+                    return Err(bad("a subaddress range runs backwards"));
+                }
+            }
+            wanted_by_major
+                .entry(want.key)
+                .or_default()
+                .extend_from_slice(&want.value);
+        }
         self.write(|tx| {
-            let existing = subaddrs_in(tx, account)?;
-            let mut by_major: HashMap<u32, Vec<[u32; 2]>> = existing.into_iter().map(|r| (r.key, r.value)).collect();
+            let mut by_major: HashMap<u32, Vec<[u32; 2]>> = subaddrs_in(tx, account)?
+                .into_iter()
+                .map(|r| (r.key, r.value))
+                .collect();
             let mut added = vec![];
-            for want in wanted {
-                let have = by_major.entry(want.key).or_default();
-                let mut new_here = vec![];
-                for &[lo, hi] in &want.value {
-                    if lo > hi {
-                        return Err(bad("a subaddress range runs backwards"));
-                    }
-                    // Only the minors not already covered are new.
-                    let mut cursor = lo;
-                    let mut covered: Vec<[u32; 2]> = have.clone();
-                    covered.sort();
-                    for [clo, chi] in covered {
-                        if chi < cursor {
-                            continue;
-                        }
-                        if clo > hi {
-                            break;
-                        }
-                        if clo > cursor {
-                            new_here.push([cursor, clo - 1]);
-                        }
-                        cursor = cursor.max(chi.saturating_add(1));
-                        if cursor > hi {
-                            break;
-                        }
-                    }
-                    if cursor <= hi {
-                        new_here.push([cursor, hi]);
-                    }
-                    have.push([lo, hi]);
-                }
+            let mut touched = vec![];
+            for (maj, want) in wanted_by_major {
+                let want = merge(want);
+                let have = by_major.entry(maj).or_default();
                 *have = merge(std::mem::take(have));
-                if !new_here.is_empty() {
-                    added.push(lws_api::SubaddrRanges {
-                        key: want.key,
-                        value: merge(new_here),
-                    });
+                let new_here = uncovered(&want, have);
+                if new_here.is_empty() {
+                    continue;
                 }
+                have.extend_from_slice(&new_here);
+                *have = merge(std::mem::take(have));
+                added.push(lws_api::SubaddrRanges {
+                    key: maj,
+                    value: new_here,
+                });
+                touched.push(maj);
             }
             let total: u64 = by_major.values().flatten().map(|[lo, hi]| u64::from(hi - lo) + 1).sum();
             if total > max {
@@ -612,18 +609,17 @@ impl Db {
                     "subaddress limit of {max} would be passed ({total})"
                 )));
             }
-            tx.execute("DELETE FROM subaddrs WHERE account = ?1", [account])?;
-            let mut majors: Vec<_> = by_major.into_iter().collect();
-            majors.sort_by_key(|(m, _)| *m);
-            for (maj, ranges) in majors {
-                for [lo, hi] in ranges {
-                    tx.execute(
-                        "INSERT INTO subaddrs (account, maj, min_lo, min_hi) VALUES (?1, ?2, ?3, ?4)",
-                        params![account, maj, lo, hi],
-                    )?;
+            let mut insert =
+                tx.prepare("INSERT INTO subaddrs (account, maj, min_lo, min_hi) VALUES (?1, ?2, ?3, ?4)")?;
+            for maj in touched {
+                tx.execute(
+                    "DELETE FROM subaddrs WHERE account = ?1 AND maj = ?2",
+                    params![account, maj],
+                )?;
+                for [lo, hi] in &by_major[&maj] {
+                    insert.execute(params![account, maj, lo, hi])?;
                 }
             }
-            added.sort_by_key(|r| r.key);
             Ok(added)
         })
     }
@@ -999,6 +995,35 @@ fn merge(mut ranges: Vec<[u32; 2]>) -> Vec<[u32; 2]> {
         match out.last_mut() {
             Some(last) if lo <= last[1].saturating_add(1) => last[1] = last[1].max(hi),
             _ => out.push([lo, hi]),
+        }
+    }
+    out
+}
+
+/// The minors of `want` that `have` doesn't cover, as ranges; both sorted,
+/// disjoint and merged (as `merge` leaves them). One sweep of each.
+fn uncovered(want: &[[u32; 2]], have: &[[u32; 2]]) -> Vec<[u32; 2]> {
+    let mut out = vec![];
+    let mut j = 0;
+    for &[lo, hi] in want {
+        // u64, so the minor after u32::MAX doesn't wrap.
+        let (mut cursor, hi) = (u64::from(lo), u64::from(hi));
+        // Held ranges wholly below this one are below every later one too.
+        while j < have.len() && u64::from(have[j][1]) < cursor {
+            j += 1;
+        }
+        for &[clo, chi] in &have[j..] {
+            let (clo, chi) = (u64::from(clo), u64::from(chi));
+            if clo > hi || cursor > hi {
+                break;
+            }
+            if clo > cursor {
+                out.push([cursor as u32, (clo - 1) as u32]);
+            }
+            cursor = cursor.max(chi + 1);
+        }
+        if cursor <= hi {
+            out.push([cursor as u32, hi as u32]);
         }
     }
     out
