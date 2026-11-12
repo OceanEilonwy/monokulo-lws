@@ -27,6 +27,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use crate::address::Address;
 use crate::error::{Error, Result, bad};
+use crate::types::{AccountId, OutputId, SqlU64, TxId};
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -144,7 +145,7 @@ fn status_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Status> {
 /// `Debug` leaves out the view key and the address (`crate::redact`). Not
 /// `Clone`: the view key isn't, so an account is passed by reference.
 pub struct Account {
-    pub id: i64,
+    pub id: AccountId,
     /// Its public keys too (stored in their own columns as well).
     pub address: Address,
     pub view_key: PrivateViewKey,
@@ -168,7 +169,7 @@ pub struct NewAccount {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct TxRow {
-    pub id: i64,
+    pub id: TxId,
     pub hash: [u8; 32],
     pub prefix_hash: [u8; 32],
     pub height: u64,
@@ -185,8 +186,8 @@ pub struct TxRow {
 
 #[derive(Clone, Debug)]
 pub struct OutputRow {
-    pub id: i64,
-    pub tx: i64,
+    pub id: OutputId,
+    pub tx: TxId,
     pub out_index: u16,
     pub global_index: u64,
     pub amount: u64,
@@ -208,8 +209,8 @@ pub struct OutputRow {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct SpendRow {
-    pub tx: i64,
-    pub output: i64,
+    pub tx: TxId,
+    pub output: OutputId,
     pub key_image: [u8; 32],
     pub mixin: u32,
     pub height: u64,
@@ -265,7 +266,7 @@ pub struct Db {
     reader_count: usize,
     /// Accounts whose access time is to be set (`touch`) and when, for the
     /// next write: a login doesn't wait for the scanner's batch to commit.
-    touched: Mutex<HashMap<i64, u64>>,
+    touched: Mutex<HashMap<AccountId, u64>>,
     /// A test database's file, removed with it (`Db::scratch`).
     #[cfg(test)]
     scratch: Option<std::path::PathBuf>,
@@ -560,7 +561,7 @@ impl Db {
         for (id, at) in touched {
             tx.execute(
                 "UPDATE accounts SET access_time = MAX(access_time, ?1) WHERE id = ?2",
-                params![at as i64, id],
+                params![SqlU64(at), id],
             )?;
         }
         Ok(())
@@ -618,7 +619,7 @@ impl Db {
     /// Sets the account's access time to now: at once if the writer is
     /// free, else with the next write (the scanner's batch commit, most
     /// likely), so a login never waits for a batch to commit.
-    pub fn touch(&self, id: i64) -> Result<()> {
+    pub fn touch(&self, id: AccountId) -> Result<()> {
         {
             let mut touched = lock(&self.touched);
             let at = touched.entry(id).or_insert(0);
@@ -657,7 +658,7 @@ impl Db {
         self.write(|tx| {
             let mut done = vec![];
             for a in addresses {
-                let id: Option<i64> = tx
+                let id: Option<AccountId> = tx
                     .query_row("SELECT id FROM accounts WHERE address = ?1", [a], |r| r.get(0))
                     .optional()?;
                 tx.execute("DELETE FROM requests WHERE address = ?1", [a])?;
@@ -774,7 +775,7 @@ impl Db {
 
     // ---- subaddresses ----
 
-    pub fn subaddrs(&self, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
+    pub fn subaddrs(&self, account: AccountId) -> Result<Vec<lws_api::SubaddrRanges>> {
         self.read(|c| subaddrs_in(c, account))
     }
 
@@ -787,7 +788,7 @@ impl Db {
     /// R requested ranges. Only the majors asked about are written again.
     pub fn upsert_subaddrs(
         &self,
-        account: i64,
+        account: AccountId,
         wanted: &[lws_api::SubaddrRanges],
         max: u64,
     ) -> Result<Vec<lws_api::SubaddrRanges>> {
@@ -928,14 +929,14 @@ impl Db {
     // ---- what an account holds ----
 
     #[cfg(test)]
-    pub fn txs(&self, account: i64) -> Result<Vec<TxRow>> {
+    pub fn txs(&self, account: AccountId) -> Result<Vec<TxRow>> {
         self.read(|c| txs_in(c, account))
     }
 
     /// The account's transactions, outputs and candidate spends, read in
     /// one read transaction, so a scanner commit can't fall between them
     /// (an output whose transaction isn't in the list).
-    pub fn holdings(&self, account: i64) -> Result<Holdings> {
+    pub fn holdings(&self, account: AccountId) -> Result<Holdings> {
         self.read(|c| holdings_in(c, account))
     }
 
@@ -943,12 +944,12 @@ impl Db {
     /// id) from one snapshot: a rescan
     /// between two reads could give a row id to another transaction (SQLite
     /// reuses the highest ids once they are deleted), and its proof to it.
-    pub fn holdings_and_proofs(&self, account: i64) -> Result<(Holdings, HashMap<i64, ProofRow>)> {
+    pub fn holdings_and_proofs(&self, account: AccountId) -> Result<(Holdings, HashMap<TxId, ProofRow>)> {
         self.read(|c| Ok((holdings_in(c, account)?, proofs_in(c, account)?)))
     }
 
     #[cfg(test)]
-    pub fn outputs(&self, account: i64) -> Result<Vec<OutputRow>> {
+    pub fn outputs(&self, account: AccountId) -> Result<Vec<OutputRow>> {
         self.read(|c| outputs_in(c, account))
     }
 
@@ -1011,7 +1012,7 @@ impl Db {
     }
 
     #[cfg(test)]
-    pub fn spends(&self, account: i64) -> Result<Vec<SpendRow>> {
+    pub fn spends(&self, account: AccountId) -> Result<Vec<SpendRow>> {
         self.read(|c| spends_in(c, account))
     }
 }
@@ -1023,7 +1024,7 @@ pub struct Holdings {
     pub spends: Vec<SpendRow>,
 }
 
-fn holdings_in(c: &Connection, account: i64) -> Result<Holdings> {
+fn holdings_in(c: &Connection, account: AccountId) -> Result<Holdings> {
     Ok(Holdings {
         txs: txs_in(c, account)?,
         outputs: outputs_in(c, account)?,
@@ -1036,7 +1037,7 @@ fn holdings_in(c: &Connection, account: i64) -> Result<Holdings> {
 /// pruned parts are, its prunable hash included. Transactions scanned
 /// before these were kept, those whose prunable hash is still pending,
 /// and those the account only (maybe) spent in, have none.
-fn proofs_in(c: &Connection, account: i64) -> Result<HashMap<i64, ProofRow>> {
+fn proofs_in(c: &Connection, account: AccountId) -> Result<HashMap<TxId, ProofRow>> {
     let mut st = c.prepare(
         "SELECT t.id, b.blob, k.prefix, k.rct_base, k.prunable_hash FROM txs t
          JOIN blocks_kept b ON b.height = t.height
@@ -1055,7 +1056,7 @@ fn proofs_in(c: &Connection, account: i64) -> Result<HashMap<i64, ProofRow>> {
                 None => None,
             };
             Ok((
-                r.get::<_, i64>(0)?,
+                r.get::<_, TxId>(0)?,
                 ProofRow {
                     block: r.get(1)?,
                     parts,
@@ -1066,7 +1067,7 @@ fn proofs_in(c: &Connection, account: i64) -> Result<HashMap<i64, ProofRow>> {
     Ok(rows)
 }
 
-fn txs_in(c: &Connection, account: i64) -> Result<Vec<TxRow>> {
+fn txs_in(c: &Connection, account: AccountId) -> Result<Vec<TxRow>> {
     let mut st = c.prepare(
         "SELECT id, hash, prefix_hash, height, timestamp, unlock_time, coinbase, mixin, fee, payment_id, tx_pub_key, total_received, total_sent FROM txs WHERE account = ?1 ORDER BY height, id",
     )?;
@@ -1092,7 +1093,7 @@ fn txs_in(c: &Connection, account: i64) -> Result<Vec<TxRow>> {
     Ok(rows)
 }
 
-fn spends_in(c: &Connection, account: i64) -> Result<Vec<SpendRow>> {
+fn spends_in(c: &Connection, account: AccountId) -> Result<Vec<SpendRow>> {
     let mut st =
         c.prepare("SELECT tx, output, key_image, mixin, height FROM spends WHERE account = ?1 ORDER BY height, id")?;
     let rows = st
@@ -1136,7 +1137,7 @@ pub enum Accepted {
     Exists(Vec<Address>),
 }
 
-fn account_id(c: &Connection, address: &Address) -> Result<Option<i64>> {
+fn account_id(c: &Connection, address: &Address) -> Result<Option<AccountId>> {
     Ok(
         c.query_row("SELECT id FROM accounts WHERE address = ?1", [address], |r| r.get(0))
             .optional()?,
@@ -1285,7 +1286,7 @@ fn uncovered(want: &[[u32; 2]], have: &[[u32; 2]]) -> Vec<[u32; 2]> {
     out
 }
 
-pub(crate) fn subaddrs_in(c: &Connection, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
+pub(crate) fn subaddrs_in(c: &Connection, account: AccountId) -> Result<Vec<lws_api::SubaddrRanges>> {
     let mut st = c.prepare("SELECT maj, min_lo, min_hi FROM subaddrs WHERE account = ?1 ORDER BY maj, min_lo")?;
     let mut out: Vec<lws_api::SubaddrRanges> = vec![];
     for row in st.query_map([account], |r| {
@@ -1305,7 +1306,7 @@ pub(crate) fn subaddrs_in(c: &Connection, account: i64) -> Result<Vec<lws_api::S
     Ok(out)
 }
 
-fn outputs_in(c: &Connection, account: i64) -> Result<Vec<OutputRow>> {
+fn outputs_in(c: &Connection, account: AccountId) -> Result<Vec<OutputRow>> {
     let mut st = c.prepare(
         "SELECT id, tx, out_index, global_index, amount, public_key, tx_pub_key, mask, height, maj, min, commitment FROM outputs WHERE account = ?1 ORDER BY height, id",
     )?;
@@ -1330,7 +1331,7 @@ fn outputs_in(c: &Connection, account: i64) -> Result<Vec<OutputRow>> {
     Ok(rows)
 }
 
-fn delete_account_from(tx: &Transaction, account: i64, height: u64) -> Result<()> {
+fn delete_account_from(tx: &Transaction, account: AccountId, height: u64) -> Result<()> {
     let h = height as i64;
     tx.execute(
         "DELETE FROM spends WHERE account = ?1 AND height >= ?2",
@@ -1497,7 +1498,7 @@ impl<'a> ScanWriter<'a> {
     /// Where `account` stands now, and whether it is still scanned: what a
     /// batch checks before writing, as the account may have been rescanned,
     /// rewound or hidden while the batch was fetched.
-    pub fn standing(&self, account: i64) -> Result<Option<(u64, Status)>> {
+    pub fn standing(&self, account: AccountId) -> Result<Option<(u64, Status)>> {
         Ok(self
             .tx
             .query_row(
@@ -1508,7 +1509,7 @@ impl<'a> ScanWriter<'a> {
             .optional()?)
     }
 
-    pub fn set_scan_height(&self, account: i64, height: u64) -> Result<()> {
+    pub fn set_scan_height(&self, account: AccountId, height: u64) -> Result<()> {
         self.tx.execute(
             "UPDATE accounts SET scan_height = ?1 WHERE id = ?2",
             params![height as i64, account],
@@ -1517,7 +1518,7 @@ impl<'a> ScanWriter<'a> {
     }
 
     /// The transaction's row id, made if it wasn't there.
-    pub fn tx_row(&self, account: i64, new: &NewTx) -> Result<i64> {
+    pub fn tx_row(&self, account: AccountId, new: &NewTx) -> Result<TxId> {
         self.tx.execute(
             "INSERT OR IGNORE INTO txs (account, hash, prefix_hash, height, timestamp, unlock_time, coinbase, mixin, fee, payment_id, tx_pub_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
@@ -1544,7 +1545,7 @@ impl<'a> ScanWriter<'a> {
 
     /// Adds an output and gives its row id; `None` if one with that key was
     /// already here (the burning bug: only the first counts).
-    pub fn add_output(&self, account: i64, tx: i64, o: &NewOutput) -> Result<Option<i64>> {
+    pub fn add_output(&self, account: AccountId, tx: TxId, o: &NewOutput) -> Result<Option<OutputId>> {
         let changed = self.tx.execute(
             "INSERT OR IGNORE INTO outputs (account, tx, out_index, global_index, amount, public_key, tx_pub_key, mask, height, maj, min, commitment) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
@@ -1565,7 +1566,7 @@ impl<'a> ScanWriter<'a> {
         if changed == 0 {
             return Ok(None);
         }
-        let id = self.tx.last_insert_rowid();
+        let id = OutputId::from_rowid(self.tx.last_insert_rowid())?;
         self.add_to_total(Total::Received, tx, o.amount)?;
         Ok(Some(id))
     }
@@ -1573,7 +1574,7 @@ impl<'a> ScanWriter<'a> {
     /// Adds `amount` to a transaction's total, in Rust: the column holds a
     /// u64 bit-cast to i64, which SQL's `+` would add as signed (and turn
     /// into a REAL past i64's range). A sum past u64's range is an error.
-    fn add_to_total(&self, total: Total, tx: i64, amount: u64) -> Result<()> {
+    fn add_to_total(&self, total: Total, tx: TxId, amount: u64) -> Result<()> {
         let (select, update) = match total {
             Total::Received => (
                 "SELECT total_received FROM txs WHERE id = ?1",
@@ -1595,9 +1596,9 @@ impl<'a> ScanWriter<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn add_spend(
         &self,
-        account: i64,
-        tx: i64,
-        output: i64,
+        account: AccountId,
+        tx: TxId,
+        output: OutputId,
         amount: u64,
         key_image: &[u8; 32],
         mixin: u32,
@@ -1614,7 +1615,7 @@ impl<'a> ScanWriter<'a> {
     }
 
     /// Owned outputs by global index, for matching rings against.
-    pub fn owned_indexes(&self, account: i64) -> Result<HashMap<u64, OutputRow>> {
+    pub fn owned_indexes(&self, account: AccountId) -> Result<HashMap<u64, OutputRow>> {
         Ok(outputs_in(self.tx, account)?
             .into_iter()
             .filter(|o| o.mask.is_some())
@@ -2020,14 +2021,14 @@ mod tests {
         .unwrap();
         migrate(&mut conn).unwrap();
         migrate(&mut conn).unwrap();
-        let outputs = outputs_in(&conn, 1).unwrap();
+        let outputs = outputs_in(&conn, AccountId::new(1)).unwrap();
         assert_eq!(outputs[0].commitment, Some(crate::crypto::commit(&mask, 1234)));
         assert_eq!(outputs[1].commitment, None, "a pre-RingCT output has none");
     }
 
     /// Holds a write transaction open on another thread until told to go
     /// on, having written one transaction row for `account` in it.
-    fn hold_writer(db: &Arc<Db>, account: i64) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+    fn hold_writer(db: &Arc<Db>, account: AccountId) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
         let (held_tx, held) = std::sync::mpsc::channel();
         let (go, go_rx) = std::sync::mpsc::channel::<()>();
         let writer = db.clone();

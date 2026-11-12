@@ -27,6 +27,7 @@ mod sending;
 mod server;
 #[cfg(test)]
 mod testkit;
+mod types;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

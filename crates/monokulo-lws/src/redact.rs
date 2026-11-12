@@ -56,7 +56,7 @@ mod tests {
         let key = [0xab; 32];
         let address = crate::testkit::Wallet::new(1).address();
         let account = Account {
-            id: 7,
+            id: crate::types::AccountId::new(7),
             address: address.clone(),
             view_key: PrivateViewKey::from_bytes(&key),
             status: Status::Active,

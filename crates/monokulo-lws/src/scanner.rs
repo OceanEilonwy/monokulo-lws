@@ -33,7 +33,7 @@ use monero_wallet::{
     primitives::keccak256,
     transaction::{Input, Pruned, Timelock, Transaction, TransactionPrefix},
 };
-use monokulo_8ar::{AccountId, Arena, Hit, Keyring};
+use monokulo_8ar::{AccountId as KeyringId, Arena, Hit, Keyring};
 use tokio::sync::{Notify, Semaphore};
 
 use crate::crypto;
@@ -41,6 +41,7 @@ use crate::daemon::{Daemon, Fetched, RawBlock};
 use crate::db::{Account, Db, NewOutput, NewTx, OutputRow, ScanWriter, Status};
 use crate::error::{Error, Result};
 use crate::lanes::{Join, Plan};
+use crate::types::{AccountId, OutputId};
 
 /// Blocks the live lane asks for in one request.
 const BATCH: u64 = 100;
@@ -104,7 +105,7 @@ pub struct PoolReceipt {
 pub struct PoolSpend {
     pub tx_hash: [u8; 32],
     /// The output's row id.
-    pub output: i64,
+    pub output: OutputId,
     pub key_image: [u8; 32],
     pub mixin: u32,
     pub unlock_time: u64,
@@ -116,27 +117,27 @@ pub struct PoolSpend {
 #[derive(Default)]
 pub struct Mempool {
     /// The accounts the pool was scanned for; another set scans it again.
-    accounts: Vec<i64>,
+    accounts: Vec<AccountId>,
     /// Pool transactions already looked at, so each is scanned once.
     seen: HashSet<[u8; 32]>,
     /// What each account received, by account id.
-    received: HashMap<i64, Vec<PoolReceipt>>,
+    received: HashMap<AccountId, Vec<PoolReceipt>>,
     /// Each account's candidate spends, by account id.
-    spent: HashMap<i64, Vec<PoolSpend>>,
+    spent: HashMap<AccountId, Vec<PoolSpend>>,
 }
 
 impl Mempool {
-    pub fn for_account(&self, account: i64) -> Vec<PoolReceipt> {
+    pub fn for_account(&self, account: AccountId) -> Vec<PoolReceipt> {
         self.received.get(&account).cloned().unwrap_or_default()
     }
 
-    pub fn spends_for(&self, account: i64) -> Vec<PoolSpend> {
+    pub fn spends_for(&self, account: AccountId) -> Vec<PoolSpend> {
         self.spent.get(&account).cloned().unwrap_or_default()
     }
 
     /// Forgets everything: after a reorg (transactions of orphaned blocks
     /// come back to the pool) or when the accounts change.
-    pub(crate) fn reset(&mut self, accounts: Vec<i64>) {
+    pub(crate) fn reset(&mut self, accounts: Vec<AccountId>) {
         *self = Mempool {
             accounts,
             ..Mempool::default()
@@ -183,13 +184,13 @@ pub struct ScanConfig {
 /// A lane's keyring of its accounts, and their `Scanner`s, made as hits need
 /// them: kept until an account or a subaddress range changes.
 pub struct Ring {
-    key: Vec<(i64, Vec<SubaddrRanges>)>,
+    key: Vec<(AccountId, Vec<SubaddrRanges>)>,
     keyring: Keyring,
     /// Each keyring account's account id, and its id in the keyring.
-    ids: Vec<i64>,
+    ids: Vec<AccountId>,
     #[cfg_attr(not(test), allow(dead_code))]
-    in_keyring: Vec<AccountId>,
-    scanners: HashMap<i64, OxideScanner>,
+    in_keyring: Vec<KeyringId>,
+    scanners: HashMap<AccountId, OxideScanner>,
 }
 
 /// The subaddresses watched for an account besides its primary address: the
@@ -265,13 +266,13 @@ impl Ring {
         Ok(slot.as_mut().expect("just made"))
     }
 
-    fn account(&self, hit: &Hit) -> i64 {
+    fn account(&self, hit: &Hit) -> AccountId {
         self.ids[hit.account.index()]
     }
 
     /// Each account's id in the keyring, in account id order.
     #[cfg(test)]
-    pub fn keyring_ids(&self) -> Vec<AccountId> {
+    pub fn keyring_ids(&self) -> Vec<KeyringId> {
         self.in_keyring.clone()
     }
 
@@ -354,7 +355,7 @@ pub fn stand_in(block: &ScannableBlock, first_indexes: &[Option<u64>], tx: usize
 /// Every lane account's RingCT outputs by global index, for candidate spends:
 /// one lookup per ring member, whoever's it is.
 #[derive(Default)]
-pub struct SpendMap(HashMap<u64, Vec<(i64, OutputRow)>>);
+pub struct SpendMap(HashMap<u64, Vec<(AccountId, OutputRow)>>);
 
 impl SpendMap {
     fn of<'a>(w: &ScanWriter, accounts: impl IntoIterator<Item = &'a Account>) -> Result<SpendMap> {
@@ -367,11 +368,11 @@ impl SpendMap {
         Ok(map)
     }
 
-    fn add(&mut self, account: i64, row: OutputRow) {
+    fn add(&mut self, account: AccountId, row: OutputRow) {
         self.0.entry(row.global_index).or_default().push((account, row));
     }
 
-    fn get(&self, global_index: u64) -> &[(i64, OutputRow)] {
+    fn get(&self, global_index: u64) -> &[(AccountId, OutputRow)] {
         self.0.get(&global_index).map_or(&[], Vec::as_slice)
     }
 
@@ -682,7 +683,7 @@ impl Scanner {
                 tracing::info!("{} accounts caught up: into the live lane at {live}", merged.len());
             }
             plan.keep_only(&active.iter().map(|a| a.id).collect::<BTreeSet<_>>());
-            let behind: Vec<(i64, u64)> = active
+            let behind: Vec<(AccountId, u64)> = active
                 .iter()
                 .filter(|a| a.scan_height < live && plan.owner(a.id).is_none())
                 .map(|a| (a.id, a.scan_height))
@@ -1008,7 +1009,7 @@ impl Scanner {
     async fn scan_pool(&self, accounts: &[Account]) -> Result<()> {
         let hashes = self.daemon.pool_hashes().await?;
         let in_pool: HashSet<[u8; 32]> = hashes.iter().copied().collect();
-        let mut ids: Vec<i64> = accounts.iter().map(|a| a.id).collect();
+        let mut ids: Vec<AccountId> = accounts.iter().map(|a| a.id).collect();
         ids.sort_unstable();
         let new: Vec<[u8; 32]> = {
             let mut pool = self.mempool.lock().unwrap_or_else(|e| e.into_inner());
@@ -1088,7 +1089,7 @@ impl Scanner {
         self.db
             .read(|c| Ring::get(&mut slot, c, accounts, self.config.lookahead, &self.arenas[0]).map(|_| ()))
             .unwrap();
-        let mut ids: Vec<i64> = accounts.iter().map(|a| a.id).collect();
+        let mut ids: Vec<AccountId> = accounts.iter().map(|a| a.id).collect();
         ids.sort_unstable();
         self.mempool.lock().unwrap().reset(ids);
     }
@@ -1314,7 +1315,7 @@ pub fn record_batch(
 /// What [`scan_blocks`] found, before anything is written: per block, the
 /// outputs each account received, in the order they were found.
 pub struct Scanned {
-    per_block: Vec<Vec<(i64, Vec<WalletOutput>)>>,
+    per_block: Vec<Vec<(AccountId, Vec<WalletOutput>)>>,
 }
 
 /// Scans `batch` (from `start`) for `accounts`, touching no database: with
@@ -1331,7 +1332,7 @@ pub fn scan_blocks(
     start: u64,
     hits: Option<&[Hit]>,
 ) -> Result<Scanned> {
-    let by_id: HashMap<i64, &Account> = accounts.iter().map(|a| (a.id, a)).collect();
+    let by_id: HashMap<AccountId, &Account> = accounts.iter().map(|a| (a.id, a)).collect();
     let mut by_block: Vec<Vec<Hit>> = vec![vec![]; batch.blocks.len()];
     for hit in hits.unwrap_or_default() {
         if let Some(list) = by_block.get_mut(hit.block) {
@@ -1349,7 +1350,7 @@ pub fn scan_blocks(
             // whose block is read whole.
             list.sort_by_key(|h| (h.tx, h.account));
             list.dedup();
-            let whole: HashSet<AccountId> = list
+            let whole: HashSet<KeyringId> = list
                 .iter()
                 .filter(|h| h.tx == Hit::WHOLE_BLOCK)
                 .map(|h| h.account)
@@ -1404,7 +1405,7 @@ pub fn write_scanned(
         }
     }
     let accounts = accounts_now;
-    let by_id: HashMap<i64, &Account> = accounts.iter().map(|a| (a.id, *a)).collect();
+    let by_id: HashMap<AccountId, &Account> = accounts.iter().map(|a| (a.id, *a)).collect();
     let mut spends = SpendMap::of(w, accounts.iter().copied())?;
     let mut per_block = scanned.per_block.into_iter();
     for (i, block) in batch.blocks.iter().enumerate() {
@@ -1602,8 +1603,8 @@ fn record_received(
 /// What a look at the pool found, by account id.
 #[derive(Default)]
 pub struct PoolFound {
-    pub received: HashMap<i64, Vec<PoolReceipt>>,
-    pub spent: HashMap<i64, Vec<PoolSpend>>,
+    pub received: HashMap<AccountId, Vec<PoolReceipt>>,
+    pub spent: HashMap<AccountId, Vec<PoolSpend>>,
 }
 
 impl Mempool {
@@ -1654,7 +1655,7 @@ pub fn scan_pool_block(
     let mut found = PoolFound::default();
     let paid: Vec<&Account> = match hits {
         Some(hits) => {
-            let ids: BTreeSet<i64> = hits.iter().map(|h| ring.account(h)).collect();
+            let ids: BTreeSet<AccountId> = hits.iter().map(|h| ring.account(h)).collect();
             accounts.iter().filter(|a| ids.contains(&a.id)).collect()
         }
         None => accounts.iter().collect(),
@@ -1752,7 +1753,7 @@ pub fn scan_pool_block(
 /// (each only from its scan height on), looked up once per ring member.
 fn record_spends(
     w: &ScanWriter,
-    accounts: &HashMap<i64, &Account>,
+    accounts: &HashMap<AccountId, &Account>,
     block: &ScannableBlock,
     height: u64,
     spends: &SpendMap,
@@ -2387,8 +2388,8 @@ mod tests {
     fn spends_are_looked_up_once_whoever_owns_the_output() {
         let mut map = SpendMap::default();
         let row = |global_index: u64| OutputRow {
-            id: global_index as i64,
-            tx: 1,
+            id: OutputId::new(global_index),
+            tx: crate::types::TxId::new(1),
             out_index: 0,
             global_index,
             amount: 5,
@@ -2400,10 +2401,14 @@ mod tests {
             min: 0,
             commitment: None,
         };
-        map.add(1, row(10));
-        map.add(2, row(11));
-        map.add(3, row(10));
-        assert_eq!(map.get(10).iter().map(|(a, _)| *a).collect::<Vec<_>>(), vec![1, 3]);
+        let a = AccountId::new;
+        map.add(a(1), row(10));
+        map.add(a(2), row(11));
+        map.add(a(3), row(10));
+        assert_eq!(
+            map.get(10).iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            vec![a(1), a(3)]
+        );
         assert_eq!(map.get(11).len(), 1);
         assert!(map.get(12).is_empty());
     }

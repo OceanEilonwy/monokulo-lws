@@ -60,7 +60,7 @@ async fn unspent(app: &Arc<App>, w: &Wallet) -> UnspentOuts {
 
 /// What each way of scanning writes for these accounts: (account, global
 /// index, out index, amount, height), sorted.
-fn outputs_of(db: &Db, accounts: &[Account]) -> Vec<(i64, u64, u16, u64, u64)> {
+fn outputs_of(db: &Db, accounts: &[Account]) -> Vec<(crate::types::AccountId, u64, u16, u64, u64)> {
     let mut all: Vec<_> = accounts
         .iter()
         .flat_map(|a| {

@@ -20,6 +20,7 @@ use crate::db::{Account, Holdings, NewAccount, OutputRow, Queued, SpendRow, Stat
 use crate::error::{Error, Result, bad};
 use crate::limits::ClientIp;
 use crate::scanner::{PoolReceipt, PoolSpend, unlocked};
+use crate::types::{AccountId, OutputId, TxId};
 
 type Reply<T> = std::result::Result<Json<T>, ApiError>;
 
@@ -136,8 +137,8 @@ fn spend_of(o: &OutputRow, key_image: [u8; 32], mixin: u32) -> Spend {
 }
 
 /// Candidate spends of an account's outputs, by the spending transaction.
-fn spends_by_tx(spends: &[SpendRow], outputs: &HashMap<i64, OutputRow>) -> HashMap<i64, Vec<Spend>> {
-    let mut by_tx: HashMap<i64, Vec<Spend>> = HashMap::new();
+fn spends_by_tx(spends: &[SpendRow], outputs: &HashMap<OutputId, OutputRow>) -> HashMap<TxId, Vec<Spend>> {
+    let mut by_tx: HashMap<TxId, Vec<Spend>> = HashMap::new();
     for s in spends {
         let Some(o) = outputs.get(&s.output) else { continue };
         by_tx.entry(s.tx).or_default().push(spend_of(o, s.key_image, s.mixin));
@@ -217,8 +218,8 @@ pub async fn get_address_info(State(app): State<Arc<App>>, ApiJson(login): ApiJs
     let now = crate::db::now();
     let id = account.id;
     let Holdings { txs, outputs, spends } = app.db.call(move |db| db.holdings(id)).await?;
-    let txs: HashMap<i64, TxRow> = txs.into_iter().map(|t| (t.id, t)).collect();
-    let outputs: HashMap<i64, OutputRow> = outputs.into_iter().map(|o| (o.id, o)).collect();
+    let txs: HashMap<TxId, TxRow> = txs.into_iter().map(|t| (t.id, t)).collect();
+    let outputs: HashMap<OutputId, OutputRow> = outputs.into_iter().map(|o| (o.id, o)).collect();
     let mut total_received = 0u64;
     let mut locked = 0u64;
     for o in outputs.values() {
@@ -280,8 +281,8 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
         },
         mut proofs,
     ) = app.db.call(move |db| db.holdings_and_proofs(id)).await?;
-    let outputs: HashMap<i64, OutputRow> = outputs.into_iter().map(|o| (o.id, o)).collect();
-    let mut receives_by_tx: HashMap<i64, Vec<ReceivedOutput>> = HashMap::new();
+    let outputs: HashMap<OutputId, OutputRow> = outputs.into_iter().map(|o| (o.id, o)).collect();
+    let mut receives_by_tx: HashMap<TxId, Vec<ReceivedOutput>> = HashMap::new();
     for o in outputs.values() {
         receives_by_tx.entry(o.tx).or_default().push(ReceivedOutput {
             commitment: o.commitment.map(Hex),
@@ -305,7 +306,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
             Transaction {
                 proof: proofs.remove(&t.id).map(proof_of),
                 fee: fee_of(t.fee),
-                id: t.id as u64,
+                id: t.id.get(),
                 hash: Hex(t.hash),
                 timestamp: Some(Timestamp::from_unix(t.timestamp)),
                 total_received: Amount(t.total_received),
@@ -413,8 +414,8 @@ pub async fn get_unspent_outs(
     let fee = app.fee().await?;
     let id = account.id;
     let Holdings { txs, outputs, spends } = app.db.call(move |db| db.holdings(id)).await?;
-    let txs: HashMap<i64, TxRow> = txs.into_iter().map(|t| (t.id, t)).collect();
-    let mut images: HashMap<i64, Vec<Hex32>> = HashMap::new();
+    let txs: HashMap<TxId, TxRow> = txs.into_iter().map(|t| (t.id, t)).collect();
+    let mut images: HashMap<OutputId, Vec<Hex32>> = HashMap::new();
     for s in spends {
         images.entry(s.output).or_default().push(Hex(s.key_image));
     }
@@ -733,7 +734,7 @@ fn check_ranges(ranges: &[SubaddrRanges], max: u64) -> Result<()> {
 /// back: what is new, and everything.
 async fn upsert(
     app: &App,
-    account: i64,
+    account: AccountId,
     wanted: Vec<SubaddrRanges>,
     max: u64,
     get_all: bool,
