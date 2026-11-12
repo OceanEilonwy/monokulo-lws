@@ -25,7 +25,27 @@ use crate::error::{Error, Result};
 /// chunks and given up on as soon as it passes this, whatever
 /// `Content-Length` said.
 const MAX_BLOCKS_RESPONSE: usize = 200 * 1024 * 1024;
-const MAX_JSON_RESPONSE: usize = 64 * 1024 * 1024;
+/// Per JSON method, the most its answer may be, sized to what the method
+/// legitimately sends: a small object (`get_info`, a fee estimate, a block
+/// header, `send_raw_transaction`'s flags); 1,000 outputs' keys (`get_outs`,
+/// asked in chunks of 1,000, about 200 bytes each); the pool's hashes (67
+/// bytes each: 16 MB is a quarter of a million transactions); 100 pruned
+/// transactions (`get_transactions`, asked 100 at a time); the RingCT output
+/// distribution (about ten bytes a block, so 64 MB is decades of mainnet).
+const SMALL_JSON_RESPONSE: usize = 64 * 1024;
+const OUTS_RESPONSE: usize = 8 * 1024 * 1024;
+const POOL_HASHES_RESPONSE: usize = 16 * 1024 * 1024;
+const TRANSACTIONS_RESPONSE: usize = 64 * 1024 * 1024;
+const DISTRIBUTION_RESPONSE: usize = 64 * 1024 * 1024;
+/// The most a body buffer is reserved for up front, whatever
+/// `Content-Length` says; past it, it grows as bytes actually arrive.
+const INITIAL_BODY_CAPACITY: usize = 1024 * 1024;
+/// Entries in the output distribution, at most: one per block, so this is
+/// some 60 years of mainnet. Holds the decoded `Vec<u64>` to 128 MB however
+/// the node packs its answer.
+const MAX_DISTRIBUTION_ENTRIES: usize = 16 * 1024 * 1024;
+/// monerod's `CRYPTONOTE_MAX_BLOCK_NUMBER`: no height reaches it.
+const MAX_BLOCK_NUMBER: u64 = 500_000_000;
 /// Time a JSON call may take in all, and a `get_blocks.bin` call (up to
 /// 200 MB from a node that may be across the world).
 const JSON_TIMEOUT: Duration = Duration::from_secs(60);
@@ -116,7 +136,18 @@ pub struct SendResult {
 #[derive(Deserialize)]
 struct JsonRpcResponse<T> {
     result: Option<T>,
-    error: Option<Value>,
+    error: Option<RpcError>,
+}
+
+/// A JSON-RPC error as monerod sends it. Decoded into these two fields only
+/// (anything else in it is skipped without being kept), so a node can't make
+/// an error the size of the response limit cost many times that in memory.
+#[derive(Deserialize)]
+struct RpcError {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
 }
 
 impl Daemon {
@@ -164,7 +195,7 @@ impl Daemon {
         }
         // Read in chunks so a node that sends more than it declared (or
         // declares nothing) is cut off at the limit, not buffered whole.
-        let mut body = Vec::with_capacity((declared as usize).min(limit));
+        let mut body = Vec::with_capacity((declared as usize).min(limit).min(INITIAL_BODY_CAPACITY));
         while let Some(chunk) = response.chunk().await? {
             if body.len() + chunk.len() > limit {
                 return Err(too_large());
@@ -174,32 +205,23 @@ impl Daemon {
         Ok(body)
     }
 
-    async fn rpc<T: for<'de> Deserialize<'de>>(&self, route: &str, params: Value) -> Result<T> {
+    async fn rpc<T: for<'de> Deserialize<'de>>(&self, route: &str, params: Value, limit: usize) -> Result<T> {
         let body = self
-            .post(
-                route,
-                serde_json::to_vec(&params).expect("json"),
-                true,
-                MAX_JSON_RESPONSE,
-            )
+            .post(route, serde_json::to_vec(&params).expect("json"), true, limit)
             .await?;
         serde_json::from_slice(&body).map_err(|e| Error::Daemon(format!("{route}: {e}")))
     }
 
-    async fn json_rpc<T: for<'de> Deserialize<'de>>(&self, method: &str, params: Value) -> Result<T> {
+    async fn json_rpc<T: for<'de> Deserialize<'de>>(&self, method: &str, params: Value, limit: usize) -> Result<T> {
         let request = json!({ "jsonrpc": "2.0", "id": "0", "method": method, "params": params });
         let body = self
-            .post(
-                "json_rpc",
-                serde_json::to_vec(&request).expect("json"),
-                true,
-                MAX_JSON_RESPONSE,
-            )
+            .post("json_rpc", serde_json::to_vec(&request).expect("json"), true, limit)
             .await?;
         let response: JsonRpcResponse<T> =
             serde_json::from_slice(&body).map_err(|e| Error::Daemon(format!("{method}: {e}")))?;
         if let Some(error) = response.error {
-            return Err(Error::Daemon(format!("{method}: {error}")));
+            let message: String = error.message.chars().take(200).collect();
+            return Err(Error::Daemon(format!("{method}: error {}: {message}", error.code)));
         }
         response
             .result
@@ -207,7 +229,7 @@ impl Daemon {
     }
 
     pub async fn info(&self) -> Result<Info> {
-        self.json_rpc("get_info", json!({})).await
+        self.json_rpc("get_info", json!({}), SMALL_JSON_RESPONSE).await
     }
 
     /// The hash of the block at `height`.
@@ -221,13 +243,18 @@ impl Daemon {
             block_header: Header,
         }
         let r: R = self
-            .json_rpc("get_block_header_by_height", json!({ "height": height }))
+            .json_rpc(
+                "get_block_header_by_height",
+                json!({ "height": height }),
+                SMALL_JSON_RESPONSE,
+            )
             .await?;
         hex32(&r.block_header.hash).ok_or_else(|| Error::Daemon("get_block_header_by_height: bad hash".into()))
     }
 
     pub async fn fee_estimate(&self) -> Result<FeeEstimate> {
-        self.json_rpc("get_fee_estimate", json!({ "grace_blocks": 10 })).await
+        self.json_rpc("get_fee_estimate", json!({ "grace_blocks": 10 }), SMALL_JSON_RESPONSE)
+            .await
     }
 
     /// The RingCT output distribution, cumulative, from the first block
@@ -236,6 +263,7 @@ impl Daemon {
         #[derive(Deserialize)]
         struct Entry {
             start_height: u64,
+            #[serde(deserialize_with = "capped_u64s")]
             distribution: Vec<u64>,
             #[serde(default)]
             base: u64,
@@ -248,6 +276,7 @@ impl Daemon {
             .json_rpc(
                 "get_output_distribution",
                 json!({ "amounts": [0], "cumulative": true, "from_height": 0, "binary": false, "compress": false }),
+                DISTRIBUTION_RESPONSE,
             )
             .await?;
         let e = r
@@ -255,6 +284,18 @@ impl Daemon {
             .into_iter()
             .next()
             .ok_or_else(|| Error::Daemon("get_output_distribution: empty".into()))?;
+        // The picker counts heights from `start_height` on: one that puts
+        // the distribution's end past any height the chain can reach is a
+        // node making things up.
+        let top = e
+            .start_height
+            .checked_add(e.distribution.len() as u64)
+            .filter(|top| *top <= MAX_BLOCK_NUMBER);
+        if top.is_none() {
+            return Err(Error::Daemon(
+                "get_output_distribution: start height out of range".into(),
+            ));
+        }
         Ok(Distribution {
             start_height: e.start_height,
             cumulative: checked_cumulative(e.distribution, e.base)?,
@@ -272,7 +313,11 @@ impl Daemon {
         }
         let outputs: Vec<Value> = indexes.iter().map(|i| json!({ "amount": 0, "index": i })).collect();
         let r: R = self
-            .rpc("get_outs", json!({ "outputs": outputs, "get_txid": false }))
+            .rpc(
+                "get_outs",
+                json!({ "outputs": outputs, "get_txid": false }),
+                OUTS_RESPONSE,
+            )
             .await?;
         if r.status != "OK" {
             return Err(Error::Daemon(format!("get_outs: {}", r.status)));
@@ -287,6 +332,7 @@ impl Daemon {
         self.rpc(
             "send_raw_transaction",
             json!({ "tx_as_hex": tx_hex, "do_not_relay": false }),
+            SMALL_JSON_RESPONSE,
         )
         .await
     }
@@ -294,11 +340,13 @@ impl Daemon {
     pub async fn pool_hashes(&self) -> Result<Vec<[u8; 32]>> {
         #[derive(Deserialize)]
         struct R {
-            #[serde(default)]
-            tx_hashes: Vec<String>,
+            #[serde(default, deserialize_with = "hashes")]
+            tx_hashes: Vec<[u8; 32]>,
         }
-        let r: R = self.rpc("get_transaction_pool_hashes", json!({})).await?;
-        Ok(r.tx_hashes.iter().filter_map(|h| hex32(h)).collect())
+        let r: R = self
+            .rpc("get_transaction_pool_hashes", json!({}), POOL_HASHES_RESPONSE)
+            .await?;
+        Ok(r.tx_hashes)
     }
 
     /// Transactions by hash, pruned. Ones the node no longer has are left out.
@@ -321,7 +369,11 @@ impl Daemon {
         }
         let hex_hashes: Vec<String> = hashes.iter().map(hex::encode).collect();
         let r: R = self
-            .rpc("get_transactions", json!({ "txs_hashes": hex_hashes, "prune": true }))
+            .rpc(
+                "get_transactions",
+                json!({ "txs_hashes": hex_hashes, "prune": true }),
+                TRANSACTIONS_RESPONSE,
+            )
             .await?;
         let mut out = vec![];
         for tx in r.txs {
@@ -361,7 +413,11 @@ impl Daemon {
         }
         let hex_hashes: Vec<String> = hashes.iter().map(hex::encode).collect();
         let r: R = self
-            .rpc("get_transactions", json!({ "txs_hashes": hex_hashes, "prune": true }))
+            .rpc(
+                "get_transactions",
+                json!({ "txs_hashes": hex_hashes, "prune": true }),
+                TRANSACTIONS_RESPONSE,
+            )
             .await?;
         if r.status != "OK" {
             return Err(Error::Daemon(format!("get_transactions: {}", r.status)));
@@ -400,10 +456,11 @@ fn redact_userinfo(url: &str) -> String {
 
 /// The node's cumulative distribution plus its base, refused unless it
 /// never goes down (the picker relies on that) and never overflows.
-fn checked_cumulative(distribution: Vec<u64>, base: u64) -> Result<Vec<u64>> {
+///
+/// Done in place: the distribution is millions of entries.
+fn checked_cumulative(mut distribution: Vec<u64>, base: u64) -> Result<Vec<u64>> {
     let mut last = 0u64;
-    let mut out = Vec::with_capacity(distribution.len());
-    for d in distribution {
+    for d in &mut distribution {
         let c = d
             .checked_add(base)
             .ok_or_else(|| Error::Daemon("get_output_distribution: overflows".into()))?;
@@ -411,9 +468,69 @@ fn checked_cumulative(distribution: Vec<u64>, base: u64) -> Result<Vec<u64>> {
             return Err(Error::Daemon("get_output_distribution: not cumulative".into()));
         }
         last = c;
-        out.push(c);
+        *d = c;
     }
-    Ok(out)
+    Ok(distribution)
+}
+
+/// A JSON array of numbers, refused past `MAX_DISTRIBUTION_ENTRIES`.
+fn capped_u64s<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<u64>, D::Error> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<u64>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "at most {MAX_DISTRIBUTION_ENTRIES} numbers")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Vec<u64>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(n) = seq.next_element::<u64>()? {
+                if out.len() >= MAX_DISTRIBUTION_ENTRIES {
+                    return Err(serde::de::Error::custom("too many entries"));
+                }
+                out.push(n);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_seq(V)
+}
+
+/// A JSON array of hex hashes, decoded as it is read: an entry that isn't 64
+/// hex digits is skipped, so nothing but the 32 bytes of each good hash is
+/// kept (a node can't make a limit's worth of `"",` cost many times that in
+/// `String`s).
+fn hashes<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<[u8; 32]>, D::Error> {
+    struct Hash(Option<[u8; 32]>);
+    impl<'de> Deserialize<'de> for Hash {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Hash, D::Error> {
+            struct V;
+            impl serde::de::Visitor<'_> for V {
+                type Value = Hash;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a hex hash")
+                }
+                fn visit_str<E: serde::de::Error>(self, s: &str) -> std::result::Result<Hash, E> {
+                    Ok(Hash(hex32(s)))
+                }
+            }
+            d.deserialize_str(V)
+        }
+    }
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<[u8; 32]>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an array of hex hashes")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Vec<[u8; 32]>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(Hash(h)) = seq.next_element()? {
+                out.extend(h);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_seq(V)
 }
 
 /// A block as the scanner takes it: what monero-oxide's `Scanner` reads,
@@ -783,5 +900,85 @@ mod tests {
         let d = Daemon::new(&format!("http://{addr}")).unwrap();
         let e = d.post("get_blocks.bin", vec![], false, 100 * 1024).await.unwrap_err();
         assert!(e.to_string().contains("over"), "{e}");
+    }
+
+    /// A node that answers every request with `body`, as JSON.
+    async fn answering(body: String) -> Daemon {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = s.write_all(head.as_bytes()).await;
+                    let _ = s.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+        Daemon::new(&format!("http://{addr}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn each_method_has_its_own_response_limit() {
+        // A `get_info` answer padded past what a small object can be.
+        let padded = format!(
+            r#"{{"result":{{"height":5,"pad":"{}"}}}}"#,
+            "x".repeat(SMALL_JSON_RESPONSE)
+        );
+        let e = answering(padded).await.info().await.unwrap_err();
+        assert!(e.to_string().contains("over"), "{e}");
+        let ok = answering(r#"{"result":{"height":5}}"#.into())
+            .await
+            .info()
+            .await
+            .unwrap();
+        assert_eq!(ok.height, 5);
+    }
+
+    #[tokio::test]
+    async fn a_json_rpc_error_is_read_without_keeping_its_bulk() {
+        let e = answering(r#"{"error":{"code":-2,"message":"nope","data":[0,0,0,0]}}"#.into())
+            .await
+            .info()
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("error -2: nope"), "{e}");
+        // An error that is a long array: refused, not decoded into values.
+        let array = format!(r#"{{"error":[{}0]}}"#, "0,".repeat(10_000));
+        assert!(answering(array).await.info().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pool_hashes_keep_only_hashes() {
+        let good = "ab".repeat(32);
+        let body = format!(r#"{{"tx_hashes":["","zz",{},"{good}","{}"]}}"#, 7, "a".repeat(63));
+        // A number in the list is malformed JSON for a hash list: an error.
+        assert!(answering(body).await.pool_hashes().await.is_err());
+        let body = format!(
+            r#"{{"tx_hashes":["","zz","{good}","{}"],"status":"OK"}}"#,
+            "a".repeat(63)
+        );
+        let hashes = answering(body).await.pool_hashes().await.unwrap();
+        assert_eq!(hashes, vec![[0xab; 32]]);
+    }
+
+    #[tokio::test]
+    async fn a_distribution_must_start_at_a_height_the_chain_can_reach() {
+        let at = |start: u64| {
+            format!(r#"{{"result":{{"distributions":[{{"start_height":{start},"distribution":[1,2,3],"base":0}}]}}}}"#)
+        };
+        let d = answering(at(10)).await.output_distribution().await.unwrap();
+        assert_eq!((d.start_height, d.cumulative), (10, vec![1, 2, 3]));
+        for bad in [u64::MAX, u64::MAX - 2, MAX_BLOCK_NUMBER] {
+            let e = answering(at(bad)).await.output_distribution().await.unwrap_err();
+            assert!(e.to_string().contains("out of range"), "{bad}: {e}");
+        }
     }
 }
