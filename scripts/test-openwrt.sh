@@ -22,7 +22,8 @@ set -eu
 cd "$(dirname "$0")/.."
 
 DIST=$(cd "${1:-dist}" && pwd)
-IMAGE="${ROOTFS_IMAGE:-openwrt/rootfs:x86-64-25.12.5}"
+# The official rootfs, pinned by digest.
+IMAGE="${ROOTFS_IMAGE:-openwrt/rootfs:x86-64-25.12.5@sha256:c5d5f05bab4ce06a4e840b3573671a06ec8ae9842273188ffc53f7021836b8e2}"
 C=monokulo-lws-openwrt-test-$$
 PKG=monokulo-lws
 KEY=$DIST/throwaway.pem
