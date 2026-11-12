@@ -14,6 +14,7 @@ use monero_epee::{Epee, HEADER, Type, VERSION};
 use monero_wallet::{
     block::Block,
     interface::ScannableBlock,
+    primitives::keccak256,
     transaction::{Pruned, Transaction},
 };
 use serde::Deserialize;
@@ -349,8 +350,14 @@ impl Daemon {
         Ok(r.tx_hashes)
     }
 
-    /// Transactions by hash, pruned. Ones the node no longer has are left out.
-    pub async fn transactions(&self, hashes: &[[u8; 32]]) -> Result<Vec<([u8; 32], Transaction<Pruned>)>> {
+    /// Transactions by hash, pruned, asked 100 at a time (a restricted node
+    /// answers no more). Only hashes asked for are taken, each once, and
+    /// each is checked against what its bytes hash to where they say enough
+    /// (a full blob, or a pruned one with its prunable hash). Ones the node
+    /// doesn't send are left out of both lists, to be asked for again; one
+    /// that doesn't read or hashes to something else is in `bad`, so the
+    /// caller can stop asking for it without failing the rest.
+    pub async fn transactions(&self, hashes: &[[u8; 32]]) -> Result<Transactions> {
         #[derive(Deserialize)]
         struct Tx {
             tx_hash: String,
@@ -358,35 +365,49 @@ impl Daemon {
             pruned_as_hex: String,
             #[serde(default)]
             as_hex: String,
+            #[serde(default)]
+            prunable_hash: String,
         }
         #[derive(Deserialize)]
         struct R {
             #[serde(default)]
             txs: Vec<Tx>,
+            #[serde(default)]
+            status: String,
         }
-        if hashes.is_empty() {
-            return Ok(vec![]);
-        }
-        let hex_hashes: Vec<String> = hashes.iter().map(hex::encode).collect();
-        let r: R = self
-            .rpc(
-                "get_transactions",
-                json!({ "txs_hashes": hex_hashes, "prune": true }),
-                TRANSACTIONS_RESPONSE,
-            )
-            .await?;
-        let mut out = vec![];
-        for tx in r.txs {
-            let Some(hash) = hex32(&tx.tx_hash) else { continue };
-            let blob = if tx.pruned_as_hex.is_empty() {
-                &tx.as_hex
-            } else {
-                &tx.pruned_as_hex
-            };
-            let bytes = hex::decode(blob).map_err(|e| Error::Daemon(format!("get_transactions: {e}")))?;
-            let parsed = Transaction::<Pruned>::read(&mut bytes.as_slice())
-                .map_err(|e| Error::Daemon(format!("get_transactions: transaction: {e}")))?;
-            out.push((hash, parsed));
+        let mut out = Transactions::default();
+        let mut seen = std::collections::HashSet::new();
+        for chunk in hashes.chunks(TXS_PER_REQUEST) {
+            let hex_hashes: Vec<String> = chunk.iter().map(hex::encode).collect();
+            let r: R = self
+                .rpc(
+                    "get_transactions",
+                    json!({ "txs_hashes": hex_hashes, "prune": true }),
+                    TRANSACTIONS_RESPONSE,
+                )
+                .await?;
+            if r.status != "OK" {
+                return Err(Error::Daemon(format!(
+                    "get_transactions: {}",
+                    r.status.chars().take(100).collect::<String>()
+                )));
+            }
+            for tx in r.txs {
+                let Some(hash) = hex32(&tx.tx_hash).filter(|h| chunk.contains(h)) else {
+                    tracing::warn!("get_transactions: the node sent a transaction not asked for");
+                    continue;
+                };
+                if !seen.insert(hash) {
+                    continue;
+                }
+                match read_transaction(&tx.pruned_as_hex, &tx.as_hex, &tx.prunable_hash, &hash) {
+                    Ok(parsed) => out.txs.push((hash, parsed)),
+                    Err(e) => {
+                        tracing::warn!("get_transactions: skipping {}: {e}", hex::encode(hash));
+                        out.bad.push(hash);
+                    }
+                }
+            }
         }
         Ok(out)
     }
@@ -460,6 +481,49 @@ pub(crate) fn check_chain(blocks: &[Fetched], start: u64) -> Result<()> {
         previous = Some(block.hash());
     }
     Ok(())
+}
+
+/// Transactions asked of `get_transactions`: those read, by hash, and those
+/// the node sent but that didn't read or didn't hash to their hash.
+#[derive(Debug, Default)]
+pub struct Transactions {
+    pub txs: Vec<([u8; 32], Transaction<Pruned>)>,
+    pub bad: Vec<[u8; 32]>,
+}
+
+/// Hashes asked of `get_transactions` at once (a restricted node answers at
+/// most 100).
+const TXS_PER_REQUEST: usize = 100;
+
+/// A transaction from `get_transactions`: the pruned blob if sent, else the
+/// full one, read and checked against `hash` as far as the bytes allow. A
+/// full blob says everything; a pruned version 2 one needs its prunable
+/// hash (one that isn't sent, or is zeros, can't be checked and is taken as
+/// it is); a pruned version 1 one can't be checked.
+fn read_transaction(
+    pruned_hex: &str,
+    full_hex: &str,
+    prunable_hex: &str,
+    hash: &[u8; 32],
+) -> Result<Transaction<Pruned>> {
+    let pruned = !pruned_hex.is_empty();
+    let bytes =
+        hex::decode(if pruned { pruned_hex } else { full_hex }).map_err(|e| Error::Daemon(format!("not hex: {e}")))?;
+    let mut rest = bytes.as_slice();
+    let tx = Transaction::<Pruned>::read(&mut rest).map_err(|e| Error::Daemon(format!("transaction: {e}")))?;
+    let computed = match &tx {
+        Transaction::V1 { .. } if !pruned => Some(keccak256(&bytes)),
+        Transaction::V1 { .. } => None,
+        Transaction::V2 { proofs: None, .. } => tx.hash_with_prunable_hash([0; 32]),
+        Transaction::V2 { proofs: Some(_), .. } if !pruned => tx.hash_with_prunable_hash(keccak256(rest)),
+        Transaction::V2 { proofs: Some(_), .. } => hex32(prunable_hex)
+            .filter(|p| *p != [0; 32])
+            .and_then(|p| tx.hash_with_prunable_hash(p)),
+    };
+    if computed.is_some_and(|c| c != *hash) {
+        return Err(Error::Daemon("its bytes hash to another hash".into()));
+    }
+    Ok(tx)
 }
 
 /// `user:password@` in a URL as `***@`.

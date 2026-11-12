@@ -823,10 +823,29 @@ impl Scanner {
         let Some(stand_in) = self.last_block.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
             return Ok(());
         };
-        let txs = self.daemon.transactions(&new).await?;
-        let Some(block) = pool_block(&stand_in, txs) else {
-            return Ok(());
+        // Only what the node sent counts as looked at: a transaction it left
+        // out is asked for again next time. One it sent that doesn't read (or
+        // isn't what it says) is looked at as far as it ever will be.
+        let fetched = self.daemon.transactions(&new).await?;
+        let mut scanned: Vec<[u8; 32]> = fetched.bad;
+        scanned.extend(fetched.txs.iter().map(|(h, _)| *h));
+        let found = if fetched.txs.is_empty() {
+            PoolFound::default()
+        } else {
+            let Some(block) = pool_block(&stand_in, fetched.txs) else {
+                return Ok(());
+            };
+            self.scan_pool_txs(accounts, &block)?
         };
+        let mut pool = self.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.accounts == ids {
+            pool.add(&scanned, found);
+        }
+        Ok(())
+    }
+
+    /// What `block` (of pool transactions) holds for `accounts`, with the live keyring.
+    fn scan_pool_txs(&self, accounts: &[Account], block: &ScannableBlock) -> Result<PoolFound> {
         let now = crate::db::now();
         let mut slot = self.live_ring.lock().unwrap_or_else(|e| e.into_inner()).take();
         let result = tokio::task::block_in_place(|| {
@@ -834,17 +853,18 @@ impl Scanner {
                 let w = ScanWriter::new(tx);
                 let ring = Ring::get(&mut slot, &w, accounts, self.config.lookahead, &self.arenas[0])?;
                 let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-                let hits = ring.keyring.flag_many(std::slice::from_ref(&block), threads, 0);
-                scan_pool_block(&w, ring, self.config.lookahead, accounts, &block, hits.as_deref(), now)
+                let hits = ring.keyring.flag_many(std::slice::from_ref(block), threads, 0);
+                scan_pool_block(&w, ring, self.config.lookahead, accounts, block, hits.as_deref(), now)
             })
         });
         *self.live_ring.lock().unwrap_or_else(|e| e.into_inner()) = slot;
-        let found = result?;
-        let mut pool = self.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        if pool.accounts == ids {
-            pool.add(&new, found);
-        }
-        Ok(())
+        result
+    }
+
+    /// As after the live lane scanned up to `block`.
+    #[cfg(test)]
+    pub fn set_last_block(&self, block: Block) {
+        *self.last_block.lock().unwrap() = Some(block);
     }
 
     /// As after the live lane's look at the pool with `accounts`: its
@@ -2231,5 +2251,94 @@ mod tests {
         };
         let (db, a, b) = record(Some(&gpu));
         check_recorded(&db, &a, &b);
+    }
+
+    /// A pool of 150 transactions on a node that answers 100 hashes a
+    /// request and has only some of them: what it sends is looked at once
+    /// (one paying the wallet is found; one that doesn't read and one whose
+    /// bytes aren't its hash are skipped, not retried, and don't fail the
+    /// rest), what it leaves out is asked for again, and a transaction it
+    /// sends unasked is ignored.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pool_is_asked_in_hundreds_and_only_what_came_counts_as_seen() {
+        use crate::testkit::{self, Tx, Wallet, fake_node, tx_key};
+        use serde_json::{Value, json};
+
+        let w = Wallet::new(77);
+        let (_, k) = tx_key(70);
+        let paying = Tx::new(k, vec![w.pay(&k, 0, 0, 0, 42_000), testkit::stranger(3)]).build();
+        let paying_hash = testkit::tx_hash(&paying, 1, 0, 0);
+        let (_, k2) = tx_key(71);
+        let other = Tx::new(k2, vec![testkit::stranger(4)]).build();
+        let other_hash = testkit::tx_hash(&other, 1, 1, 0);
+        let mut pool: Vec<[u8; 32]> = (0..150u8).map(|i| [i; 32]).collect();
+        let (bad, wrong) = (pool[3], pool[120]);
+        pool[0] = paying_hash;
+        let entry = |hash: &[u8; 32], tx: &Transaction<Pruned>, prunable: [u8; 32]| {
+            json!({
+                "tx_hash": hex::encode(hash),
+                "pruned_as_hex": hex::encode(tx.serialize()),
+                "prunable_hash": hex::encode(prunable),
+            })
+        };
+        let known: HashMap<String, Value> = [
+            (
+                paying_hash,
+                entry(&paying_hash, &paying, testkit::prunable_hash(1, 0, 0)),
+            ),
+            (bad, json!({ "tx_hash": hex::encode(bad), "pruned_as_hex": "00ff" })),
+            // `other`'s bytes under another hash.
+            (wrong, entry(&wrong, &other, testkit::prunable_hash(1, 1, 0))),
+        ]
+        .into_iter()
+        .map(|(h, v)| (hex::encode(h), v))
+        .collect();
+        let unasked = entry(&other_hash, &other, testkit::prunable_hash(1, 1, 0));
+        let listed: Vec<String> = pool.iter().map(hex::encode).collect();
+        let node = fake_node(move |route, input| match route {
+            "get_transaction_pool_hashes" => json!({ "status": "OK", "tx_hashes": listed }),
+            "get_transactions" => {
+                let mut txs: Vec<Value> = input["txs_hashes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|h| known.get(h.as_str().unwrap()).cloned())
+                    .collect();
+                txs.push(unasked.clone());
+                json!({ "status": "OK", "txs": txs })
+            }
+            _ => json!({}),
+        })
+        .await;
+
+        let db = Arc::new(Db::in_memory());
+        let account = w.add(&db, 100);
+        let app = testkit::app_with_node(db.clone(), 101, &node.url);
+        let last = testkit::block(100, [0; 32], testkit::dull_miner(100), vec![], 0, 0);
+        app.scanner.set_last_block(last.block.block);
+        let accounts = vec![account.clone()];
+        app.scanner.scan_pool(&accounts).await.unwrap();
+
+        let asked = |from: usize| -> Vec<usize> {
+            node.calls.lock().unwrap()[from..]
+                .iter()
+                .filter(|(r, _)| r == "get_transactions")
+                .map(|(_, v)| v["txs_hashes"].as_array().unwrap().len())
+                .collect()
+        };
+        assert_eq!(asked(0), vec![100, 50], "a hundred at a time");
+        {
+            let pool = app.scanner.mempool.lock().unwrap();
+            let seen: HashSet<[u8; 32]> = pool.seen.iter().copied().collect();
+            assert_eq!(seen, HashSet::from([paying_hash, bad, wrong]));
+        }
+        let received = app.scanner.mempool.lock().unwrap().for_account(account.id);
+        assert_eq!(received.len(), 1);
+        assert_eq!((received[0].tx_hash, received[0].amount), (paying_hash, 42_000));
+
+        let before = node.calls.lock().unwrap().len();
+        app.scanner.scan_pool(&accounts).await.unwrap();
+        assert_eq!(asked(before), vec![100, 47], "only what didn't come is asked again");
+        assert_eq!(app.scanner.mempool.lock().unwrap().for_account(account.id).len(), 1);
     }
 }
