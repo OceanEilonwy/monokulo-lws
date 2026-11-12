@@ -17,6 +17,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The mainnet-shaped correctness test's fixture, from monokulo-8ar at
+      # the commit Cargo.toml pins it to. LWS_REQUIRE_FIXTURE makes the test
+      # fail, not skip, if it isn't there.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OceanEilonwy/monokulo-8ar
+          ref: 1de7768c870b9a6d33ab12aa7b1f6bd07066e971
+          path: .fixtures/monokulo-8ar
+          sparse-checkout: prototypes/fixtures
+          persist-credentials: false
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -32,6 +42,9 @@ jobs:
       # The GPU tests are ignored by default: the runner has no GPU, and the
       # scanner falls back to monero-oxide without one.
       - name: Test
+        env:
+          LWS_FIXTURE: ${{ github.workspace }}/.fixtures/monokulo-8ar/prototypes/fixtures/mainnet-3797000-2000.bin
+          LWS_REQUIRE_FIXTURE: '1'
         run: cargo test --locked --workspace
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
