@@ -13,10 +13,17 @@
 //! ([`Amount`]), keys and hashes as lowercase hex ([`Hex32`], [`Hex8`]),
 //! timestamps as ISO 8601 text ([`Timestamp`]).
 //!
-//! `Debug` on the types that carry a private view key ([`Login`] and the
-//! admin requests) prints neither the key nor the address, and a type's
-//! deserialization errors never quote the value that failed, so neither
-//! ends up in a log by accident.
+//! Secret keys have their own types, [`PrivateViewKey`] and [`AdminKey`]:
+//! wiped when dropped, neither `Copy` nor `Clone`, compared in constant
+//! time, and `<redacted>` in `Debug` and `Display`. `Debug` on the types
+//! that carry an address ([`Login`], [`admin::AddAccount`]) leaves it out
+//! too, and a type's deserialization errors never quote the value that
+//! failed, so neither ends up in a log by accident.
+//!
+//! Invariants the spec states are in the types where they fit, checked when
+//! a value is read: closed sets are enums, [`Timestamp`] is a real time,
+//! a [`MinorRange`] runs forwards, and request lists with a limit are
+//! [`BoundedVec`]s.
 
 #![forbid(unsafe_code)]
 
