@@ -15,10 +15,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use lws_api::admin::*;
-use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::{Value, json};
 
-use super::{ApiError, ApiJson, App, parse_value};
+use super::{ApiBody, ApiError, App, parse_json};
 use crate::address::Address;
 use crate::db::{Accepted, Status};
 use crate::error::{Error, Result, bad};
@@ -38,8 +39,17 @@ async fn authorize(app: &App, auth: Option<lws_api::AdminKey>) -> Result<()> {
     }
 }
 
-fn params<P: DeserializeOwned>(value: &Value) -> Result<P> {
-    parse_value(value.clone())
+/// A command's `params`, read from the (wiped) body itself. They are not
+/// held as a `serde_json::Value` in between: a `Value` would keep a view key
+/// (`add_account`, `validate`) as a `String` that is freed without being
+/// wiped. `auth` is skipped here without being copied; `command` reads it
+/// on its own.
+fn params<P: DeserializeOwned>(body: &[u8]) -> Result<P> {
+    #[derive(Deserialize)]
+    struct Params<P> {
+        params: P,
+    }
+    parse_json::<Params<P>>(body).map(|p| p.params)
 }
 
 /// The addresses a command names, each parsed as a primary address on this
@@ -57,19 +67,23 @@ fn addresses(app: &App, list: &[String]) -> Result<Vec<Address>> {
 pub async fn command(
     State(app): State<Arc<App>>,
     Path(command): Path<String>,
-    ApiJson(req): ApiJson<Request<Value>>,
+    ApiBody(body): ApiBody,
 ) -> std::result::Result<Response, ApiError> {
-    authorize(&app, req.auth).await?;
+    // The key alone first (`params` is skipped, not copied); each command
+    // then reads its own `params` from the same buffer, which is wiped when
+    // the handler returns.
+    let head: Request<IgnoredAny> = parse_json(&body)?;
+    authorize(&app, head.auth).await?;
     let out = match command.as_str() {
-        "accept_requests" => return Ok(accept(&app, params(&req.params)?).await?),
-        "reject_requests" => reject(&app, params(&req.params)?).await?,
-        "add_account" => add_account(&app, params(&req.params)?).await?,
+        "accept_requests" => return Ok(accept(&app, params(&body)?).await?),
+        "reject_requests" => reject(&app, params(&body)?).await?,
+        "add_account" => add_account(&app, params(&body)?).await?,
         "list_accounts" => list_accounts(&app).await?,
         "list_requests" => list_requests(&app).await?,
-        "modify_account_status" => modify_status(&app, params(&req.params)?).await?,
-        "rescan" => rescan(&app, params(&req.params)?).await?,
-        "remove_accounts" => remove(&app, params(&req.params)?).await?,
-        "validate" => validate(&app, params(&req.params)?)?,
+        "modify_account_status" => modify_status(&app, params(&body)?).await?,
+        "rescan" => rescan(&app, params(&body)?).await?,
+        "remove_accounts" => remove(&app, params(&body)?).await?,
+        "validate" => validate(&app, params(&body)?)?,
         "webhook_add" | "webhook_delete" | "webhook_delete_uuid" | "webhook_list" => {
             return Ok((StatusCode::NOT_IMPLEMENTED, "webhooks aren't built yet").into_response());
         }
