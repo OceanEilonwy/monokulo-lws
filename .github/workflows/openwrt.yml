@@ -2,7 +2,14 @@
 # a signed apk repository holding it, for each OpenWrt release and CPU
 # architecture in the build matrix below (25.12 on the GL.iNet Flint 2,
 # mediatek/filogic, aarch64_cortex-a53; and 25.12 on x86_64). The build is
-# scripts/build-openwrt.sh.
+# scripts/build-openwrt.sh, in two jobs:
+#   build  the binary and the unsigned package (build-openwrt.sh build).
+#          No secret: cargo runs every dependency's build script and proc
+#          macro, and the Rust cache action restores files, here.
+#   sign   a fresh runner that never built anything signs it
+#          (build-openwrt.sh sign): the only job with the signing key, it
+#          runs no third-party action and no build, only openssl and the
+#          SDK image's apk (the image pinned by digest).
 #
 # Every push to main builds it; a pull request builds it when it changes
 # the package, the server or the build. Each matrix entry uploads as
@@ -20,6 +27,9 @@
 # Needs the repository secret APK_SIGNING_KEY: the private key matching
 # openwrt/keys/monokulo.pem (the same key signs monokulo and kringle). Pull
 # requests from forks (no secret access) still build, with a throwaway key.
+#
+# Actions are pinned by commit; the Docker images by digest (here and in
+# the scripts' defaults). A new SDK means a new tag and digest for both.
 
 name: openwrt package
 
@@ -48,7 +58,7 @@ permissions:
 jobs:
   build:
     # One build per OpenWrt release and CPU architecture. A release or
-    # architecture is supported by adding an entry here.
+    # architecture is supported by adding an entry here and in sign.
     name: build the openwrt package (${{ matrix.release }}, ${{ matrix.arch }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -59,13 +69,13 @@ jobs:
           # The GL.iNet Flint 2 (mediatek/filogic).
           - release: '25.12'
             arch: aarch64_cortex-a53
-            sdk_image: openwrt/sdk:mediatek-filogic-25.12.5
+            sdk_image: openwrt/sdk:mediatek-filogic-25.12.5@sha256:011c367ac3e63ab3fd345bdb242564fedda033b40e73f883bd550fcf0d27bf9c
             rust_target: aarch64-unknown-linux-musl
             toolchain_prefix: aarch64-openwrt-linux-musl
           # PCs, and x86_64 virtual machines (the test job boots this one).
           - release: '25.12'
             arch: x86_64
-            sdk_image: openwrt/sdk:x86-64-25.12.5
+            sdk_image: openwrt/sdk:x86-64-25.12.5@sha256:e916b7cc555890bdc4725c926e139b888294f0c8f56561b88d8da3a6348616a2
             rust_target: x86_64-unknown-linux-musl
             toolchain_prefix: x86_64-openwrt-linux-musl
     env:
@@ -74,27 +84,67 @@ jobs:
       RUST_TARGET: ${{ matrix.rust_target }}
       TOOLCHAIN_PREFIX: ${{ matrix.toolchain_prefix }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The package's release number is the commit count.
           fetch-depth: 0
+          persist-credentials: false
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.rust_target }} && rustup default stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: openwrt-${{ matrix.release }}-${{ matrix.arch }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build the package and repository
+      - name: Build the unsigned package
+        env:
+          SDK_VOLUME: "" # fresh runner every time, no point keeping SDK state
+        run: scripts/build-openwrt.sh build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openwrt-unsigned-${{ matrix.release }}-${{ matrix.arch }}
+          path: dist/unsigned/
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    # The signing key's job: a fresh runner, the build's unsigned package,
+    # and nothing run but this repository's script, openssl and the pinned
+    # SDK image's apk.
+    name: sign the openwrt package (${{ matrix.release }}, ${{ matrix.arch }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: '25.12'
+            arch: aarch64_cortex-a53
+            sdk_image: openwrt/sdk:mediatek-filogic-25.12.5@sha256:011c367ac3e63ab3fd345bdb242564fedda033b40e73f883bd550fcf0d27bf9c
+          - release: '25.12'
+            arch: x86_64
+            sdk_image: openwrt/sdk:x86-64-25.12.5@sha256:e916b7cc555890bdc4725c926e139b888294f0c8f56561b88d8da3a6348616a2
+    env:
+      SDK_IMAGE: ${{ matrix.sdk_image }}
+      OPENWRT_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: openwrt-unsigned-${{ matrix.release }}-${{ matrix.arch }}
+          path: dist/unsigned
+      - name: Sign the package and repository
         env:
           APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
-          SDK_VOLUME: "" # fresh runner every time, no point keeping SDK state
         run: |
           if [ -z "$APK_SIGNING_KEY" ] && [ "$GITHUB_EVENT_NAME" != pull_request ]; then
             echo "::error::Set the APK_SIGNING_KEY secret; routers won't trust a package signed with a throwaway key."
             exit 1
           fi
-          scripts/build-openwrt.sh
+          scripts/build-openwrt.sh sign
       - name: Summary
         env:
           SIGNED: ${{ secrets.APK_SIGNING_KEY != '' }}
@@ -114,7 +164,7 @@ jobs:
               echo "Signed with a **throwaway key**: for testing only."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: monokulo-lws-openwrt-${{ matrix.release }}-${{ matrix.arch }}
           path: |
@@ -125,7 +175,7 @@ jobs:
             dist/throwaway.pem
           if-no-files-found: error
           retention-days: 90
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: openwrt-repo-${{ matrix.release }}-${{ matrix.arch }}
           path: dist/repo/
@@ -138,16 +188,18 @@ jobs:
     # from the signed repository, started against a stand-in node, driven
     # through the LuCI page's backend, upgraded and removed.
     name: test the openwrt package (25.12, x86_64)
-    needs: build
+    needs: sign
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: monokulo-lws-openwrt-25.12-x86_64
           path: dist
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: openwrt-repo-25.12-x86_64
           path: dist/repo

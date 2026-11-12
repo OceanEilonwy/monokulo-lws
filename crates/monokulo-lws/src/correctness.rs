@@ -165,6 +165,42 @@ fn a_stand_in_block_numbers_outputs_as_the_whole_block_does() {
     assert_eq!(outputs_of(&db, &accounts).len(), 5);
 }
 
+/// The mainnet fixture (monokulo-8ar's
+/// prototypes/fixtures/mainnet-3797000-2000.bin, outside this repository)
+/// if it is at `path`. Missing, it fails the test when `required`
+/// (LWS_REQUIRE_FIXTURE=1, as CI sets it, so the test can't pass without
+/// running); otherwise the test is skipped, and says so.
+fn find_fixture(path: std::path::PathBuf, required: bool) -> Option<std::path::PathBuf> {
+    if path.exists() {
+        return Some(path);
+    }
+    assert!(
+        !required,
+        "no fixture at {} and LWS_REQUIRE_FIXTURE=1: set LWS_FIXTURE to monokulo-8ar's \
+         prototypes/fixtures/mainnet-3797000-2000.bin",
+        path.display()
+    );
+    eprintln!(
+        "SKIPPED: no fixture at {}, so the mainnet-shaped test did not run; set LWS_FIXTURE to monokulo-8ar's \
+         prototypes/fixtures/mainnet-3797000-2000.bin (LWS_REQUIRE_FIXTURE=1 makes a missing fixture fail)",
+        path.display()
+    );
+    None
+}
+
+#[test]
+#[should_panic(expected = "LWS_REQUIRE_FIXTURE=1")]
+fn a_missing_fixture_fails_when_it_is_required() {
+    find_fixture("/nonexistent/mainnet-3797000-2000.bin".into(), true);
+}
+
+#[test]
+fn a_missing_fixture_is_skipped_when_it_is_not_required() {
+    assert!(find_fixture("/nonexistent/mainnet-3797000-2000.bin".into(), false).is_none());
+    let here = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    assert_eq!(find_fixture(here.clone(), true), Some(here));
+}
+
 /// The fixture's first blocks, mainnet-shaped (about 57 transactions a
 /// block), with payments to `w` planted in some transactions: each planted
 /// output gets the transaction's own key and RingCT parts.
@@ -175,10 +211,8 @@ fn fixture_with_payments(w: &Wallet) -> Option<(Vec<Made>, Vec<u64>)> {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../monokulo-8ar/prototypes/fixtures/mainnet-3797000-2000.bin")
         });
-    if !path.exists() {
-        eprintln!("no fixture at {}: skipped", path.display());
-        return None;
-    }
+    let required = std::env::var("LWS_REQUIRE_FIXTURE").is_ok_and(|v| v == "1");
+    let path = find_fixture(path, required)?;
     let (blocks, firsts, _) = crate::scanner::fixture_blocks(&path).unwrap();
     let mut made = vec![];
     let mut expected = vec![];

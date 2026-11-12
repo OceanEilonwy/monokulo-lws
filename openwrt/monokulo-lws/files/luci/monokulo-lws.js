@@ -561,6 +561,14 @@ return view.extend({
 				return _('Use an absolute path such as /srv/monokulo-lws.');
 			if (/^\/(tmp|var)(\/|$)/.test(value))
 				return _('/tmp and /var are in memory: everything there is lost on reboot.');
+			// The init script refuses these too: the folder is made the
+			// server's own, so never a system folder or a top-level one.
+			if (/(^|\/)\.\.?(\/|$)|\/\//.test(value.replace(/\/+$/, '')))
+				return _('Use a plain path, without “.”, “..” or “//”.');
+			if (/^\/(etc|root|usr|bin|sbin|lib|lib64|proc|sys|dev|www|rom|overlay)?(\/|$)/.test(value))
+				return _('That is a system folder, or in one: use a folder of its own, such as /srv/monokulo-lws.');
+			if (!/^\/[^\/]+\/[^\/]/.test(value))
+				return _('Use a folder of its own inside another, such as /srv/monokulo-lws.');
 			return true;
 		};
 
