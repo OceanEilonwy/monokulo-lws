@@ -32,7 +32,8 @@ import { cursor } from 'uci';
 const NAME = 'monokulo-lws';
 const KEY_FILE = `/etc/${NAME}/secrets/MONOKULO_LWS_ADMIN_KEY`;
 const HELPER = `/usr/share/${NAME}/http.uc`;
-// The request bodies the helper reads, root's alone and in memory.
+// The request bodies the helper reads, and why the init script last refused
+// to start (check): root's alone and in memory.
 const RUN_DIR = `/var/run/${NAME}`;
 const STATUSES = [ 'active', 'inactive', 'hidden' ];
 
@@ -176,7 +177,7 @@ const methods = {
 				running,
 				running_build: running ? { version: instance.data?.version, commit: instance.data?.commit } : null,
 				installed: build(readfile(`/usr/share/${NAME}/version`)),
-				check_error: first_line_file(`/tmp/${NAME}.check`),
+				check_error: first_line_file(`${RUN_DIR}/check`),
 				admin_key: access(KEY_FILE) == true,
 				wallet_url: where.wallet,
 				admin_url: where.admin,

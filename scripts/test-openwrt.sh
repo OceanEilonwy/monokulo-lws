@@ -201,7 +201,7 @@ check "a state that isn't one is refused by the backend" \
 	". /tmp/t.sh; [ \"\$(rpc set_status '{\"addresses\":[\"$ADDRESS\"],\"status\":\"gone\"}' | jsonfilter -e '@.ok')\" = false ]"
 check "the page removes the wallet, whole" \
 	". /tmp/t.sh; r=\$(rpc remove_accounts '{\"addresses\":[\"$ADDRESS\"]}'); [ \"\$(echo \"\$r\" | jsonfilter -e '@.ok')\" = true ] && echo \"\$r\" | jsonfilter -e '@.result.removed[0]' | grep -qx $ADDRESS && ! rpc accounts | grep -q $ADDRESS && ! $PKG admin list --db $DB | grep -q $ADDRESS"
-check "the request bodies the backend hands its HTTP helper leave nothing behind" "[ -z \"\$(ls -A /var/run/$PKG 2>/dev/null)\" ]"
+check "the request bodies the backend hands its HTTP helper leave nothing behind" "[ -z \"\$(ls -A /var/run/$PKG 2>/dev/null | grep -vx check)\" ]"
 
 # --- settings: taken, refused, kept across an upgrade -------------------------
 
@@ -216,12 +216,25 @@ check "a reload with the admin port set to the wallet's leaves the server runnin
 check "a restart with that setting doesn't start it, and LuCI says why" \
 	". /tmp/t.sh; /etc/init.d/$PKG restart; sleep 1; ! running $PKG && rpc status | jsonfilter -e '@.check_error' | grep -q 'port of its own'"
 x "uci set $PKG.main.admin_port=8444; uci commit $PKG; /etc/init.d/$PKG restart"
-eventually "the server runs again with the admin port restored, and the refusal is gone" ". /tmp/t.sh; running $PKG && [ ! -e /tmp/$PKG.check ]"
+eventually "the server runs again with the admin port restored, and the refusal is gone" ". /tmp/t.sh; running $PKG && [ ! -e /var/run/$PKG/check ]"
 x ". /tmp/t.sh; pid $PKG >/tmp/$PKG.pid; uci set $PKG.main.data_dir=/tmp/$PKG-data; uci commit $PKG"
 check "a data folder in memory is refused on a reload, the server kept running" \
 	". /tmp/t.sh; /etc/init.d/$PKG reload; sleep 2; running $PKG && [ \"\$(pid $PKG)\" = \"\$(cat /tmp/$PKG.pid)\" ] && rpc status | jsonfilter -e '@.check_error' | grep -q 'in memory'"
+check "the refusal is kept where only root reaches it" \
+	"[ -s /var/run/$PKG/check ] && [ \"\$(ls -ldn /var/run/$PKG | awk '{ print \$1, \$3 }')\" = 'drwx------ 0' ]"
+for dir in /root /etc/$PKG /srv /srv/../root; do
+	x "uci set $PKG.main.data_dir=$dir; uci commit $PKG"
+	check "a system or top-level data folder ($dir) is refused on a reload, and isn't made the server's" \
+		". /tmp/t.sh; /etc/init.d/$PKG reload; sleep 2; running $PKG && [ \"\$(pid $PKG)\" = \"\$(cat /tmp/$PKG.pid)\" ] && [ -n \"\$(rpc status | jsonfilter -e '@.check_error')\" ] && [ \"\$(ls -ldn /root /etc /srv | awk '{ print \$3 }' | sort -u)\" = 0 ]"
+done
 x "uci set $PKG.main.data_dir=/srv/$PKG; uci commit $PKG; /etc/init.d/$PKG restart"
-eventually "the server runs again in its data folder" ". /tmp/t.sh; running $PKG && [ ! -e /tmp/$PKG.check ]"
+eventually "the server runs again in its data folder" ". /tmp/t.sh; running $PKG && [ ! -e /var/run/$PKG/check ]"
+# A link the server's user could plant in its own folder: root must not
+# follow it when it readies the folder.
+x "ln -s /etc/shadow /srv/$PKG/shadow; ln -s /etc /srv/$PKG/etc"
+check "a reload doesn't follow links in the data folder: /etc and /etc/shadow stay root's" \
+	". /tmp/t.sh; /etc/init.d/$PKG reload; sleep 2; running $PKG && [ \"\$(ls -ldn /etc /etc/shadow | awk '{ print \$3 }' | sort -u)\" = 0 ]"
+x "rm -f /srv/$PKG/shadow /srv/$PKG/etc"
 
 x "sha256sum $KEY_FILE >/tmp/$PKG.sum"
 check "an upgrade keeps the settings and the admin key" \

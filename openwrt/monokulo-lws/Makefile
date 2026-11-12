@@ -102,7 +102,7 @@ define Package/monokulo-lws/postrm
 if [ "$${PKG_UPGRADE}" != 1 ] && uci -q get firewall.monokulo_lws >/dev/null; then
 	uci -q delete firewall.monokulo_lws && uci -q commit firewall
 fi
-rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* /tmp/monokulo-lws.check 2>/dev/null
+rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* /var/run/monokulo-lws/check 2>/dev/null
 /etc/init.d/rpcd reload 2>/dev/null
 exit 0
 endef
