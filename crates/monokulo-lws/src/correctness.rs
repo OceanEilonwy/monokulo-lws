@@ -311,7 +311,11 @@ async fn the_served_commitment_is_the_chains_and_heads_the_rct_blob() {
     let payment = &txs.transactions[1];
     assert!(coinbase.coinbase && !payment.coinbase);
     let r = &payment.receives[0];
-    assert_eq!(r.global_index, 5_002, "after the miner's output and the stranger's");
+    assert_eq!(
+        r.global_index,
+        Amount(5_002),
+        "after the miner's output and the stranger's"
+    );
     assert_eq!(r.amount, Amount(7_000_000));
     let commitment = r.commitment.expect("served").0;
     assert_eq!(commitment, paid.commitment, "the transaction's outPk");
@@ -325,7 +329,7 @@ async fn the_served_commitment_is_the_chains_and_heads_the_rct_blob() {
     assert_eq!(opened.compress().to_bytes(), commitment, "mask·G + amount·H");
 
     let m = &coinbase.receives[0];
-    assert_eq!(m.global_index, 5_000);
+    assert_eq!(m.global_index, Amount(5_000));
     assert_eq!(m.amount, Amount(mined.amount));
     assert_eq!(m.rct.unwrap().0, *DScalar::ONE.as_bytes(), "a miner output's mask is 1");
     assert_eq!(
@@ -473,7 +477,7 @@ async fn subaddresses_through_additional_keys_and_the_lookahead() {
         accounts[0].id,
         &[lws_api::SubaddrRanges {
             key: 1,
-            value: vec![[5, 5]],
+            value: vec![mr(5, 5)],
         }],
         100,
     )
@@ -692,7 +696,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
         .collect();
     assert_eq!(same.len(), 1);
     assert_eq!((same[0].mempool, same[0].height), (false, Some(101)));
-    assert_eq!(same[0].receives[0].global_index, 6_001);
+    assert_eq!(same[0].receives[0].global_index, Amount(6_001));
     check_proof(same[0], mined_hash);
 
     // Then dropped from the pool: the outgoing one goes.
@@ -867,7 +871,7 @@ async fn totals_locks_unlock_times_and_timestamps() {
         coinbase.timestamp,
         Some(Timestamp::from_unix(1_700_000_000 + 150 * 120))
     );
-    assert_eq!(coinbase.timestamp.as_ref().unwrap().0, "2023-11-15T03:13:20Z");
+    assert_eq!(coinbase.timestamp.as_ref().unwrap().as_str(), "2023-11-15T03:13:20Z");
     // As monero-lws: every received output is listed, locked or not, and the
     // client decides from the transaction's unlock time.
     let outs = unspent(&app, &w).await;

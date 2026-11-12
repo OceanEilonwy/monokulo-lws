@@ -411,11 +411,12 @@ async fn node_with_outputs(blocks: u64, locked: fn(u64) -> bool) -> FakeNode {
     .await
 }
 
+/// `/get_random_outs` as a client would call it: the limits are checked when
+/// the JSON is read, as `ApiJson` reads it.
 async fn random_outs(app: &Arc<App>, count: u32, amounts: Vec<u64>) -> Result<RandomOuts, Error> {
-    let req = RandomOutsRequest {
-        count,
-        amounts: amounts.into_iter().map(Amount).collect(),
-    };
+    let amounts: Vec<String> = amounts.iter().map(u64::to_string).collect();
+    let body = json!({ "count": count, "amounts": amounts }).to_string();
+    let req: RandomOutsRequest = crate::rest::parse_json(body.as_bytes())?;
     match wallet::get_random_outs(State(app.clone()), ApiJson(req)).await {
         Ok(Json(v)) => Ok(v),
         Err(e) => Err(e.0),

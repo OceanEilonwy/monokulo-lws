@@ -895,7 +895,8 @@ async fn provisioning_a_full_major_is_a_conflict() {
 /// requested ones used to take ~1e8 comparisons under the database lock.
 #[test]
 fn subaddress_upserts_match_a_set_and_scale() {
-    use lws_api::SubaddrRanges;
+    use crate::testkit::mr;
+    use lws_api::{MinorRange, SubaddrRanges};
     use std::collections::BTreeSet;
     let db = Db::in_memory();
     let (address, key) = wallet(97);
@@ -914,13 +915,14 @@ fn subaddress_upserts_match_a_set_and_scale() {
         let mut out: Vec<SubaddrRanges> = vec![];
         for (maj, min) in minors {
             match out.last_mut() {
-                Some(r) if r.key == maj && r.value.last().unwrap()[1] + 1 == min => {
-                    r.value.last_mut().unwrap()[1] = min
+                Some(r) if r.key == maj && r.value.last().unwrap().hi() + 1 == min => {
+                    let last = r.value.last_mut().unwrap();
+                    *last = mr(last.lo(), min);
                 }
-                Some(r) if r.key == maj => r.value.push([min, min]),
+                Some(r) if r.key == maj => r.value.push(mr(min, min)),
                 _ => out.push(SubaddrRanges {
                     key: maj,
-                    value: vec![[min, min]],
+                    value: vec![mr(min, min)],
                 }),
             }
         }
@@ -933,13 +935,13 @@ fn subaddress_upserts_match_a_set_and_scale() {
             let hi = lo + next(8) as u32;
             wanted.push(SubaddrRanges {
                 key: next(3) as u32,
-                value: vec![[lo, hi]],
+                value: vec![mr(lo, hi)],
             });
         }
         let mut fresh = BTreeSet::new();
         for w in &wanted {
-            for &[lo, hi] in &w.value {
-                for m in lo..=hi {
+            for r in &w.value {
+                for m in r.lo()..=r.hi() {
                     if !model.contains(&(w.key, m)) {
                         fresh.insert((w.key, m));
                     }
@@ -956,10 +958,10 @@ fn subaddress_upserts_match_a_set_and_scale() {
     }
 
     // Large: every other minor of major 5 stored, then 1,000 more asked for.
-    let stored: Vec<[u32; 2]> = (0..10_000u32).map(|i| [i * 2, i * 2]).collect();
+    let stored: Vec<MinorRange> = (0..10_000u32).map(|i| mr(i * 2, i * 2)).collect();
     db.upsert_subaddrs(account, &[SubaddrRanges { key: 5, value: stored }], 100_000)
         .unwrap();
-    let asked: Vec<[u32; 2]> = (0..1_000u32).map(|i| [i * 20 + 1, i * 20 + 1]).collect();
+    let asked: Vec<MinorRange> = (0..1_000u32).map(|i| mr(i * 20 + 1, i * 20 + 1)).collect();
     let started = std::time::Instant::now();
     let added = db
         .upsert_subaddrs(
@@ -976,7 +978,7 @@ fn subaddress_upserts_match_a_set_and_scale() {
     // A minor at the very top is new once and covered after.
     let top = [SubaddrRanges {
         key: 9,
-        value: vec![[u32::MAX - 1, u32::MAX]],
+        value: vec![mr(u32::MAX - 1, u32::MAX)],
     }];
     assert_eq!(db.upsert_subaddrs(account, &top, 100_000).unwrap().len(), 1);
     assert!(db.upsert_subaddrs(account, &top, 100_000).unwrap().is_empty());
@@ -1170,4 +1172,38 @@ async fn accept_requests_is_all_or_nothing() {
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert!(app.db.requests().unwrap().is_empty());
+}
+
+/// Closed sets on the admin API are enums: a status that isn't one of the
+/// three is refused when the request is read, and nothing changes.
+#[tokio::test]
+async fn an_unknown_account_status_is_refused() {
+    let app = app(Setup::default());
+    let admin = admin_router(app.clone());
+    let auth = hex::encode(*crate::admin_keys::create(&app.db).unwrap());
+    let (address, _) = add(&app, 44, Status::Active);
+    for status in ["Hidden", "deleted", ""] {
+        let r = call(
+            &admin,
+            "/modify_account_status",
+            &json!({ "auth": auth, "params": { "status": status, "addresses": [address] } }),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{status}");
+    }
+    assert_eq!(
+        app.db.account(&parsed(&address)).unwrap().unwrap().status,
+        Status::Active
+    );
+    let r = call(
+        &admin,
+        "/modify_account_status",
+        &json!({ "auth": auth, "params": { "status": "hidden", "addresses": [address] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(
+        app.db.account(&parsed(&address)).unwrap().unwrap().status,
+        Status::Hidden
+    );
 }

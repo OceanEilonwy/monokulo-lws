@@ -21,8 +21,8 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lws_api::PrivateViewKey;
 use lws_api::admin::RequestKind;
+use lws_api::{MinorRange, PrivateViewKey};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use crate::address::Address;
@@ -128,33 +128,17 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
-    /// Scanned and served.
-    Active,
-    /// Served from what was scanned, no longer scanned.
-    Inactive,
-    /// Neither: the way to delete.
-    Hidden,
-}
+/// An account's status: the admin API's, stored as its text.
+pub use lws_api::admin::AccountStatus as Status;
 
-impl Status {
-    pub fn parse(s: &str) -> Option<Status> {
-        Some(match s {
-            "active" => Status::Active,
-            "inactive" => Status::Inactive,
-            "hidden" => Status::Hidden,
-            _ => return None,
-        })
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Status::Active => "active",
-            Status::Inactive => "inactive",
-            Status::Hidden => "hidden",
-        }
-    }
+/// A stored status. Text that isn't one is an error: an account whose
+/// status can't be read is neither served nor scanned as something it may
+/// not be.
+fn status_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Status> {
+    let text = r.get_ref(i)?.as_str()?;
+    Status::parse(text).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, "not an account status".into())
+    })
 }
 
 /// `Debug` leaves out the view key and the address (`crate::redact`). Not
@@ -351,7 +335,7 @@ fn account_row(r: &rusqlite::Row) -> rusqlite::Result<Account> {
         id: r.get(0)?,
         address: r.get(1)?,
         view_key: view_key_col(r, 2)?,
-        status: Status::parse(&r.get::<_, String>(3)?).unwrap_or(Status::Hidden),
+        status: status_col(r, 3)?,
         start_height: r.get::<_, i64>(4)? as u64,
         scan_height: r.get::<_, i64>(5)? as u64,
         access_time: r.get::<_, i64>(6)? as u64,
@@ -809,20 +793,16 @@ impl Db {
     ) -> Result<Vec<lws_api::SubaddrRanges>> {
         let mut wanted_by_major: std::collections::BTreeMap<u32, Vec<[u32; 2]>> = Default::default();
         for want in wanted {
-            for &[lo, hi] in &want.value {
-                if lo > hi {
-                    return Err(bad("a subaddress range runs backwards"));
-                }
-            }
+            // A `MinorRange` runs forwards by construction.
             wanted_by_major
                 .entry(want.key)
                 .or_default()
-                .extend_from_slice(&want.value);
+                .extend(want.value.iter().map(|r| [r.lo(), r.hi()]));
         }
         self.write(|tx| {
             let mut by_major: HashMap<u32, Vec<[u32; 2]>> = subaddrs_in(tx, account)?
                 .into_iter()
-                .map(|r| (r.key, r.value))
+                .map(|r| (r.key, r.value.iter().map(|r| [r.lo(), r.hi()]).collect()))
                 .collect();
             let mut added = vec![];
             let mut touched = vec![];
@@ -838,7 +818,10 @@ impl Db {
                 *have = merge(std::mem::take(have));
                 added.push(lws_api::SubaddrRanges {
                     key: maj,
-                    value: new_here,
+                    value: new_here
+                        .iter()
+                        .map(|&[lo, hi]| MinorRange::new(lo, hi).expect("uncovered runs forwards"))
+                        .collect(),
                 });
                 touched.push(maj);
             }
@@ -1309,11 +1292,13 @@ pub(crate) fn subaddrs_in(c: &Connection, account: i64) -> Result<Vec<lws_api::S
         Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?))
     })? {
         let (maj, lo, hi) = row?;
+        let range = MinorRange::new(lo, hi)
+            .ok_or_else(|| Error::Internal("a stored subaddress range runs backwards".into()))?;
         match out.last_mut() {
-            Some(last) if last.key == maj => last.value.push([lo, hi]),
+            Some(last) if last.key == maj => last.value.push(range),
             _ => out.push(lws_api::SubaddrRanges {
                 key: maj,
-                value: vec![[lo, hi]],
+                value: vec![range],
             }),
         }
     }
@@ -1518,10 +1503,9 @@ impl<'a> ScanWriter<'a> {
             .query_row(
                 "SELECT scan_height, status FROM accounts WHERE id = ?1",
                 [account],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+                |r| Ok((r.get::<_, i64>(0)? as u64, status_col(r, 1)?)),
             )
-            .optional()?
-            .map(|(h, s)| (h, Status::parse(&s).unwrap_or(Status::Hidden))))
+            .optional()?)
     }
 
     pub fn set_scan_height(&self, account: i64, height: u64) -> Result<()> {
@@ -1642,6 +1626,7 @@ impl<'a> ScanWriter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::mr;
 
     /// A stagenet address for a name (`"A"`, `"B"`).
     fn addr(name: &str) -> Address {
@@ -1686,6 +1671,23 @@ mod tests {
         assert!(db.accounts(Some(Status::Active)).unwrap().is_empty());
     }
 
+    /// A status the code doesn't know is an error, not taken as hidden (or
+    /// anything else).
+    #[test]
+    fn an_unknown_stored_status_is_an_error() {
+        let db = Db::in_memory();
+        let a = acct(&db);
+        db.write(|tx| {
+            tx.execute("UPDATE accounts SET status = 'deleted' WHERE id = ?1", [a.id])?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(db.account(&addr("A")).is_err());
+        assert!(db.accounts(None).is_err());
+        let standing = db.write(|tx| ScanWriter::new(tx).standing(a.id));
+        assert!(standing.is_err());
+    }
+
     #[test]
     fn subaddress_ranges_merge_and_report_only_new() {
         let db = Db::in_memory();
@@ -1695,7 +1697,7 @@ mod tests {
                 a.id,
                 &[lws_api::SubaddrRanges {
                     key: 0,
-                    value: vec![[1, 10]],
+                    value: vec![mr(1, 10)],
                 }],
                 1000,
             )
@@ -1704,7 +1706,7 @@ mod tests {
             new,
             vec![lws_api::SubaddrRanges {
                 key: 0,
-                value: vec![[1, 10]]
+                value: vec![mr(1, 10)]
             }]
         );
         let new = db
@@ -1712,7 +1714,7 @@ mod tests {
                 a.id,
                 &[lws_api::SubaddrRanges {
                     key: 0,
-                    value: vec![[5, 15], [20, 20]],
+                    value: vec![mr(5, 15), mr(20, 20)],
                 }],
                 1000,
             )
@@ -1721,7 +1723,7 @@ mod tests {
             new,
             vec![lws_api::SubaddrRanges {
                 key: 0,
-                value: vec![[11, 15], [20, 20]]
+                value: vec![mr(11, 15), mr(20, 20)]
             }]
         );
         let all = db.subaddrs(a.id).unwrap();
@@ -1729,7 +1731,7 @@ mod tests {
             all,
             vec![lws_api::SubaddrRanges {
                 key: 0,
-                value: vec![[1, 15], [20, 20]]
+                value: vec![mr(1, 15), mr(20, 20)]
             }]
         );
         assert!(
@@ -1737,7 +1739,7 @@ mod tests {
                 a.id,
                 &[lws_api::SubaddrRanges {
                     key: 1,
-                    value: vec![[0, 100]]
+                    value: vec![mr(0, 100)]
                 }],
                 50
             )
@@ -1748,7 +1750,7 @@ mod tests {
                 a.id,
                 &[lws_api::SubaddrRanges {
                     key: 0,
-                    value: vec![[2, 3]],
+                    value: vec![mr(2, 3)],
                 }],
                 1000,
             )

@@ -317,11 +317,55 @@ secret32! {
 
 /// A moment, as `YYYY-MM-DDTHH:MM:SSZ` (what monero-lws writes). It is kept
 /// as text: a client that wants the number can parse it, and a server builds
-/// it with [`Timestamp::from_unix`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Timestamp(pub String);
+/// it with [`Timestamp::from_unix`]. Reading checks the shape and the
+/// ranges (a real month, day, hour, minute and second); anything else is
+/// refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Timestamp(String);
+
+impl<'de> Deserialize<'de> for Timestamp {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = text(d)?;
+        Timestamp::parse(&s).ok_or_else(|| de::Error::custom("not a YYYY-MM-DDTHH:MM:SSZ time"))
+    }
+}
 
 impl Timestamp {
+    /// `s` if it is a `YYYY-MM-DDTHH:MM:SSZ` time that exists.
+    pub fn parse(s: &str) -> Option<Timestamp> {
+        let b = s.as_bytes();
+        if b.len() != 20
+            || b[4] != b'-'
+            || b[7] != b'-'
+            || b[10] != b'T'
+            || b[13] != b':'
+            || b[16] != b':'
+            || b[19] != b'Z'
+        {
+            return None;
+        }
+        let num = |range: std::ops::Range<usize>| -> Option<u32> {
+            b[range]
+                .iter()
+                .try_fold(0u32, |n, c| c.is_ascii_digit().then(|| n * 10 + u32::from(c - b'0')))
+        };
+        let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+        let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let days = match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return None,
+        };
+        (d >= 1 && d <= days && hh < 24 && mm < 60 && ss < 60).then(|| Timestamp(s.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// ISO 8601 in UTC from seconds since the epoch.
     pub fn from_unix(secs: u64) -> Timestamp {
         let days = (secs / 86_400) as i64;
@@ -467,7 +511,10 @@ pub struct ReceivedOutput {
     pub amount: Amount,
     pub public_key: Hex32,
     pub index: u16,
-    pub global_index: u64,
+    /// As in [`Output`]: a JSON number as monero-lws writes it, read from a
+    /// string too.
+    #[serde(with = "as_number")]
+    pub global_index: Amount,
     pub tx_pub_key: Hex32,
     /// The unencrypted RingCT mask. Absent for a non-RingCT output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -613,7 +660,15 @@ pub struct UnspentOuts {
     pub fees: Vec<u64>,
 }
 
-/// `/get_random_outs` request.
+/// The most ring members a `/get_random_outs` ring may ask for (monero-lws's
+/// limit).
+pub const MAX_RING_MEMBERS: u32 = 20;
+/// The most rings a `/get_random_outs` request may ask for (monero-lws's
+/// limit).
+pub const MAX_RINGS: usize = 150;
+
+/// `/get_random_outs` request. The limits are part of the types: a request
+/// past them doesn't parse.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RandomOutsRequest {
     /// Ring members wanted for each ring, 0 to 20. The spec calls it the
@@ -621,10 +676,88 @@ pub struct RandomOutsRequest {
     /// them the real output: a client making rings of 16 asks for 16 and
     /// drops a member that happens to be the output it spends (or the
     /// last one), as wallet2-derived clients do.
-    pub count: u32,
+    pub count: AtMost<MAX_RING_MEMBERS>,
     /// One entry per ring, at most 150; `"0"` for RingCT, the only amount
     /// this server answers. Duplicates are answered each.
-    pub amounts: Vec<Amount>,
+    pub amounts: BoundedVec<Amount, MAX_RINGS>,
+}
+
+/// A `u32` no greater than `MAX`, checked when made and when read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct AtMost<const MAX: u32>(u32);
+
+impl<const MAX: u32> AtMost<MAX> {
+    pub fn new(v: u32) -> Option<Self> {
+        (v <= MAX).then_some(AtMost(v))
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de, const MAX: u32> Deserialize<'de> for AtMost<MAX> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = u32::deserialize(d)?;
+        AtMost::new(v).ok_or_else(|| de::Error::custom(format!("must be at most {MAX}")))
+    }
+}
+
+/// A list of at most `MAX` entries, checked when made and when read (where
+/// reading stops at entry `MAX + 1`, before taking more memory).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundedVec<T, const MAX: usize>(Vec<T>);
+
+impl<T, const MAX: usize> BoundedVec<T, MAX> {
+    pub fn new(v: Vec<T>) -> Option<Self> {
+        (v.len() <= MAX).then_some(BoundedVec(v))
+    }
+
+    pub fn into_vec(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<T, const MAX: usize> std::ops::Deref for BoundedVec<T, MAX> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T, const MAX: usize> Default for BoundedVec<T, MAX> {
+    fn default() -> Self {
+        BoundedVec(Vec::new())
+    }
+}
+
+impl<T: Serialize, const MAX: usize> Serialize for BoundedVec<T, MAX> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de, T: Deserialize<'de>, const MAX: usize> Deserialize<'de> for BoundedVec<T, MAX> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T, const MAX: usize>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>, const MAX: usize> de::Visitor<'de> for V<T, MAX> {
+            type Value = BoundedVec<T, MAX>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a list of at most {MAX} entries")
+            }
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX));
+                while let Some(x) = seq.next_element()? {
+                    if out.len() == MAX {
+                        return Err(de::Error::custom(format!("at most {MAX} entries")));
+                    }
+                    out.push(x);
+                }
+                Ok(BoundedVec(out))
+            }
+        }
+        d.deserialize_seq(V(std::marker::PhantomData))
+    }
 }
 
 /// One possible ring member.
@@ -706,11 +839,45 @@ pub struct SubmitRequest {
 /// A transaction that doesn't parse is HTTP 400 before the node sees it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubmitResponse {
-    pub status: String,
+    pub status: SubmitStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_relayed: Option<bool>,
+}
+
+/// `/submit_raw_tx`'s `status`: `"OK"` or `"Failed"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SubmitStatus {
+    #[serde(rename = "OK")]
+    Ok,
+    Failed,
+}
+
+/// A Monero network, as `/get_version` names it: `"main"`, `"stage"` or
+/// `"test"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    Main,
+    Stage,
+    Test,
+}
+
+impl Network {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Network::Main => "main",
+            Network::Stage => "stage",
+            Network::Test => "test",
+        }
+    }
+}
+
+impl fmt::Display for Network {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// `/get_version` response.
@@ -725,8 +892,7 @@ pub struct Version {
     pub blockchain_height: u64,
     pub api: u32,
     pub max_subaddresses: u32,
-    /// `"main"`, `"stage"` or `"test"`.
-    pub network: String,
+    pub network: Network,
     pub testnet: bool,
 }
 
@@ -736,7 +902,39 @@ pub struct SubaddrRanges {
     /// The major index.
     pub key: u32,
     /// `[low, high]` pairs of minor indices.
-    pub value: Vec<[u32; 2]>,
+    pub value: Vec<MinorRange>,
+}
+
+/// `[low, high]`: minor indices, inclusive at both ends, with
+/// `low <= high`, checked when made and when read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct MinorRange([u32; 2]);
+
+impl MinorRange {
+    /// `None` if the range runs backwards.
+    pub fn new(lo: u32, hi: u32) -> Option<MinorRange> {
+        (lo <= hi).then_some(MinorRange([lo, hi]))
+    }
+
+    pub fn lo(self) -> u32 {
+        self.0[0]
+    }
+
+    pub fn hi(self) -> u32 {
+        self.0[1]
+    }
+
+    /// How many minors: at least 1, at most 2^32.
+    pub fn minors(self) -> u64 {
+        u64::from(self.hi() - self.lo()) + 1
+    }
+}
+
+impl<'de> Deserialize<'de> for MinorRange {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let [lo, hi] = <[u32; 2]>::deserialize(d)?;
+        MinorRange::new(lo, hi).ok_or_else(|| de::Error::custom("a subaddress range runs backwards"))
+    }
 }
 
 /// `/get_subaddrs` response.
@@ -863,10 +1061,41 @@ pub mod admin {
         pub addresses: Vec<String>,
     }
 
-    /// `"active"`, `"inactive"` or `"hidden"`.
-    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    /// What an account is to the server. `"active"`, `"inactive"` or
+    /// `"hidden"` on the wire; anything else fails to parse.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum AccountStatus {
+        /// Scanned and served.
+        Active,
+        /// Served from what was scanned, no longer scanned.
+        Inactive,
+        /// Neither: the way to delete.
+        Hidden,
+    }
+
+    impl AccountStatus {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                AccountStatus::Active => "active",
+                AccountStatus::Inactive => "inactive",
+                AccountStatus::Hidden => "hidden",
+            }
+        }
+
+        pub fn parse(s: &str) -> Option<AccountStatus> {
+            Some(match s {
+                "active" => AccountStatus::Active,
+                "inactive" => AccountStatus::Inactive,
+                "hidden" => AccountStatus::Hidden,
+                _ => return None,
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct ModifyStatus {
-        pub status: String,
+        pub status: AccountStatus,
         pub addresses: Vec<String>,
     }
 
@@ -1231,6 +1460,107 @@ mod tests {
         let outs: RandomOuts = round_trips(&json);
         assert_eq!(outs.amount_outs[0].outputs[0].global_index, Amount(123_456_789));
         let request: RandomOutsRequest = round_trips(r#"{"count":16,"amounts":["0","0"]}"#);
-        assert_eq!(request.amounts, vec![Amount(0), Amount(0)]);
+        assert_eq!(*request.amounts, [Amount(0), Amount(0)]);
+        assert_eq!(request.count.get(), 16);
+    }
+
+    #[test]
+    fn random_outs_limits_are_part_of_the_request() {
+        let amounts = |n: usize| format!("[{}]", vec!["\"0\""; n].join(","));
+        let request = |count: u32, n: usize| {
+            serde_json::from_str::<RandomOutsRequest>(&format!(r#"{{"count":{count},"amounts":{}}}"#, amounts(n)))
+        };
+        assert!(request(20, 150).is_ok());
+        assert!(request(21, 1).is_err());
+        assert!(request(20, 151).is_err());
+        assert!(request(0, 0).is_ok());
+        assert!(AtMost::<20>::new(21).is_none());
+        assert!(BoundedVec::<u8, 2>::new(vec![1, 2, 3]).is_none());
+        assert_eq!(BoundedVec::<u8, 2>::new(vec![1, 2]).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn subaddress_ranges_run_forwards() {
+        let r: SubaddrRanges = round_trips(r#"{"key":1,"value":[[0,3],[5,5]]}"#);
+        assert_eq!((r.value[0].lo(), r.value[0].hi(), r.value[0].minors()), (0, 3, 4));
+        assert!(serde_json::from_str::<SubaddrRanges>(r#"{"key":1,"value":[[3,2]]}"#).is_err());
+        assert!(serde_json::from_str::<SubaddrRanges>(r#"{"key":1,"value":[[3]]}"#).is_err());
+        assert!(MinorRange::new(3, 2).is_none());
+        assert_eq!(MinorRange::new(0, u32::MAX).unwrap().minors(), 1 << 32);
+    }
+
+    #[test]
+    fn closed_sets_are_enums_and_refuse_anything_else() {
+        use admin::{AccountStatus, ModifyStatus};
+        for status in [AccountStatus::Active, AccountStatus::Inactive, AccountStatus::Hidden] {
+            assert_eq!(AccountStatus::parse(status.as_str()), Some(status));
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{}\"", status.as_str())
+            );
+        }
+        let m: ModifyStatus = serde_json::from_str(r#"{"status":"hidden","addresses":["A"]}"#).unwrap();
+        assert_eq!(m.status, AccountStatus::Hidden);
+        for bad in ["Active", "ACTIVE", "deleted", ""] {
+            let json = format!(r#"{{"status":"{bad}","addresses":[]}}"#);
+            assert!(serde_json::from_str::<ModifyStatus>(&json).is_err(), "{bad}");
+            assert_eq!(AccountStatus::parse(bad), None);
+        }
+        for network in [Network::Main, Network::Stage, Network::Test] {
+            assert_eq!(
+                serde_json::to_string(&network).unwrap(),
+                format!("\"{}\"", network.as_str())
+            );
+        }
+        assert!(serde_json::from_str::<Network>("\"mainnet\"").is_err());
+        assert!(serde_json::from_str::<SubmitStatus>("\"ok\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<SubmitStatus>("\"OK\"").unwrap(),
+            SubmitStatus::Ok
+        );
+    }
+
+    #[test]
+    fn timestamps_are_checked_when_read() {
+        let t: Timestamp = serde_json::from_str("\"2024-02-29T23:59:59Z\"").unwrap();
+        assert_eq!(t.as_str(), "2024-02-29T23:59:59Z");
+        for bad in [
+            "2023-02-29T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2023-13-01T00:00:00Z",
+            "2023-00-01T00:00:00Z",
+            "2023-04-31T00:00:00Z",
+            "2023-01-01T24:00:00Z",
+            "2023-01-01T00:60:00Z",
+            "2023-01-01T00:00:60Z",
+            "2023-01-01 00:00:00Z",
+            "2023-01-01T00:00:00",
+            "2023-01-01T00:00:00+00:00",
+            "+023-01-01T00:00:00Z",
+            "yesterday",
+            "",
+        ] {
+            assert!(Timestamp::parse(bad).is_none(), "{bad}");
+            assert!(
+                serde_json::from_str::<Timestamp>(&format!("\"{bad}\"")).is_err(),
+                "{bad}"
+            );
+        }
+        for secs in [0, 951_782_400, 1_687_301_600, 4_102_444_799] {
+            let t = Timestamp::from_unix(secs);
+            assert_eq!(Timestamp::parse(t.as_str()), Some(t));
+        }
+    }
+
+    #[test]
+    fn global_index_is_a_number_in_both_output_lists() {
+        let key = "11".repeat(32);
+        let json = format!(
+            r#"{{"amount":"5","public_key":"{key}","index":0,"global_index":35,"tx_pub_key":"{key}","recipient":{{"maj_i":0,"min_i":0}}}}"#
+        );
+        let r: ReceivedOutput = round_trips(&json);
+        assert_eq!(r.global_index, Amount(35));
+        let spec: ReceivedOutput = serde_json::from_str(&json.replace("35", "\"35\"")).unwrap();
+        assert_eq!(spec.global_index, Amount(35));
     }
 }

@@ -89,11 +89,12 @@ pub fn view_pair(spend_pub: &[u8; 32], view_key: &PrivateViewKey) -> Result<View
     ViewPair::new(spend, view_scalar(view_key)?).map_err(|e| bad(format!("view pair: {e}")))
 }
 
-pub fn network_name(network: Network) -> &'static str {
+/// The network as the API names it (`main`, `stage`, `test`).
+pub fn network_name(network: Network) -> lws_api::Network {
     match network {
-        Network::Mainnet => "main",
-        Network::Stagenet => "stage",
-        Network::Testnet => "test",
+        Network::Mainnet => lws_api::Network::Main,
+        Network::Stagenet => lws_api::Network::Stage,
+        Network::Testnet => lws_api::Network::Test,
     }
 }
 

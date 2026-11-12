@@ -151,7 +151,7 @@ async fn list_requests(app: &App) -> Result<Value> {
 }
 
 async fn modify_status(app: &App, p: ModifyStatus) -> Result<Value> {
-    let status = Status::parse(&p.status).ok_or_else(|| bad("status must be active, inactive or hidden"))?;
+    let status = p.status;
     let named = addresses(app, &p.addresses)?;
     let done = app.db.call(move |db| db.set_status(&named, status)).await?;
     app.scanner.wake.notify_one();

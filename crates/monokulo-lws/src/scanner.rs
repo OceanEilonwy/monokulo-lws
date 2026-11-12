@@ -201,7 +201,7 @@ fn watched(lookahead: u32, ranges: &[SubaddrRanges]) -> Vec<SubaddressIndex> {
     let registered = ranges.iter().flat_map(|r| {
         r.value
             .iter()
-            .flat_map(move |[lo, hi]| (*lo..=*hi).map(move |minor| (r.key, minor)))
+            .flat_map(move |m| (m.lo()..=m.hi()).map(move |minor| (r.key, minor)))
     });
     for (major, minor) in lookahead.chain(registered) {
         if (major, minor) == (0, 0) || !seen.insert((major, minor)) {
@@ -2184,6 +2184,7 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::mr;
 
     #[test]
     fn unlock_rules() {
@@ -2590,11 +2591,11 @@ mod tests {
         let ranges = vec![
             SubaddrRanges {
                 key: 0,
-                value: vec![[0, 3]],
+                value: vec![mr(0, 3)],
             },
             SubaddrRanges {
                 key: 2,
-                value: vec![[5, 6]],
+                value: vec![mr(5, 6)],
             },
         ];
         let got: Vec<(u32, u32)> = watched(3, &ranges).iter().map(|i| (i.account(), i.address())).collect();

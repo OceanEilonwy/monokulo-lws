@@ -28,6 +28,11 @@ use crate::lanes::Join;
 use crate::rest::{App, Config, Policy};
 use crate::scanner::{Batch, LaneConfig, Ring, ScanConfig, Scanner, record_batch};
 
+/// A minor range, `lo <= hi`.
+pub fn mr(lo: u32, hi: u32) -> lws_api::MinorRange {
+    lws_api::MinorRange::new(lo, hi).expect("a range that runs forwards")
+}
+
 /// The lookahead the tests scan with: minors 1 and 2 of major 0.
 pub const LOOKAHEAD: u32 = 3;
 

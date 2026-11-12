@@ -288,7 +288,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
             amount: Amount(o.amount),
             public_key: Hex(o.public_key),
             index: o.out_index,
-            global_index: o.global_index,
+            global_index: Amount(o.global_index),
             tx_pub_key: Hex(o.tx_pub_key),
             rct: o.mask.map(Hex),
             recipient: meta(o.maj, o.min),
@@ -381,7 +381,7 @@ pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJso
                     amount: Amount(r.amount),
                     public_key: Hex(r.public_key),
                     index: r.out_index,
-                    global_index: 0,
+                    global_index: Amount(0),
                     tx_pub_key: Hex(r.tx_pub_key),
                     rct: r.mask.map(Hex),
                     recipient: meta(r.maj, r.min),
@@ -492,10 +492,6 @@ pub async fn get_unspent_outs(
     }))
 }
 
-/// Ring members a ring and rings a request, at most: monero-lws's limits.
-pub const MAX_RING_SIZE: u32 = 20;
-pub const MAX_RINGS: usize = 150;
-
 /// `/get_random_outs`, as monero-lws answers it: `count` members for every
 /// ring, picked as wallet2 picks them (`decoys`), each unlocked by the
 /// node's word, none twice in a ring, sorted by global index, with `rct`
@@ -505,18 +501,14 @@ pub async fn get_random_outs(
     State(app): State<Arc<App>>,
     ApiJson(req): ApiJson<RandomOutsRequest>,
 ) -> Reply<RandomOuts> {
-    if req.count > MAX_RING_SIZE {
-        return Err(bad(format!("count must be at most {MAX_RING_SIZE}")).into());
-    }
-    if req.amounts.len() > MAX_RINGS {
-        return Err(bad(format!("at most {MAX_RINGS} amounts")).into());
-    }
+    // `count` and the number of `amounts` are within monero-lws's limits
+    // (`lws_api::MAX_RING_MEMBERS`, `lws_api::MAX_RINGS`) by their types.
     if req.amounts.iter().any(|a| a.0 != 0) {
         return Err(bad("only RingCT (amount 0) outputs are served").into());
     }
     // As monero-lws: nothing to pick, an empty ring for each amount, and the
     // node isn't asked.
-    if req.count == 0 || req.amounts.is_empty() {
+    if req.count.get() == 0 || req.amounts.is_empty() {
         return Ok(Json(RandomOuts {
             amount_outs: req
                 .amounts
@@ -530,7 +522,12 @@ pub async fn get_random_outs(
     }
     let rings = app
         .picker
-        .rings(&app.daemon, req.count as usize, req.amounts.len(), chain_height(&app))
+        .rings(
+            &app.daemon,
+            req.count.get() as usize,
+            req.amounts.len(),
+            chain_height(&app),
+        )
         .await?;
     Ok(Json(RandomOuts {
         amount_outs: rings
@@ -623,7 +620,7 @@ pub async fn submit_raw_tx(
     if result.status == "OK" {
         if result.not_relayed {
             return Ok(Json(SubmitResponse {
-                status: "OK".into(),
+                status: SubmitStatus::Ok,
                 reason: Some("Not relayed".into()),
                 not_relayed: Some(true),
             })
@@ -635,7 +632,7 @@ pub async fn submit_raw_tx(
         }
         app.scanner.wake.notify_one();
         return Ok(Json(SubmitResponse {
-            status: "OK".into(),
+            status: SubmitStatus::Ok,
             reason: None,
             not_relayed: None,
         })
@@ -644,7 +641,7 @@ pub async fn submit_raw_tx(
     Ok((
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(SubmitResponse {
-            status: "Failed".into(),
+            status: SubmitStatus::Failed,
             reason: Some(refusal_reason(&result)),
             not_relayed: None,
         }),
@@ -724,15 +721,8 @@ fn check_ranges(ranges: &[SubaddrRanges], max: u64) -> Result<()> {
     if count > MAX_RANGES {
         return Err(bad(format!("at most {MAX_RANGES} ranges a request")));
     }
-    let mut minors = 0u64;
-    for r in ranges {
-        for &[lo, hi] in &r.value {
-            if lo > hi {
-                return Err(bad("a subaddress range runs backwards"));
-            }
-            minors += u64::from(hi - lo) + 1;
-        }
-    }
+    // Each range runs forwards (`MinorRange`): at least one minor.
+    let minors: u64 = ranges.iter().flat_map(|r| &r.value).map(|r| r.minors()).sum();
     if minors > max {
         return Err(Error::Conflict(format!("asking for more than the limit of {max}")));
     }
@@ -802,7 +792,7 @@ pub async fn provision_subaddrs(
         let next = match have
             .iter()
             .find(|r| r.key == maj)
-            .and_then(|r| r.value.iter().map(|[_, hi]| *hi).max())
+            .and_then(|r| r.value.iter().map(|r| r.hi()).max())
         {
             Some(hi) => hi.checked_add(1).ok_or_else(full)?,
             None => 0,
@@ -811,7 +801,7 @@ pub async fn provision_subaddrs(
         let hi = lo.checked_add(n_min - 1).ok_or_else(full)?;
         wanted.push(SubaddrRanges {
             key: maj,
-            value: vec![[lo, hi]],
+            value: vec![MinorRange::new(lo, hi).ok_or_else(full)?],
         });
     }
     let (new_subaddrs, all_subaddrs) = upsert(&app, account.id, wanted, max, req.get_all).await?;
@@ -833,7 +823,7 @@ pub async fn get_version(State(app): State<Arc<App>>) -> Reply<Version> {
         blockchain_height: info.map(|i| i.height).unwrap_or(status.chain_height),
         api: 2,
         max_subaddresses: app.config.max_subaddresses,
-        network: crypto::network_name(network).into(),
+        network: crypto::network_name(network),
         testnet: network != monero_wallet::address::Network::Mainnet,
     }))
 }
@@ -845,7 +835,7 @@ pub async fn daemon_status(State(app): State<Arc<App>>) -> Reply<serde_json::Val
     let info = app.info().await;
     Ok(Json(json!({
         "server": env!("CARGO_PKG_VERSION"),
-        "network": crypto::network_name(app.scanner.config.network),
+        "network": crypto::network_name(app.scanner.config.network).as_str(),
         "daemon_reachable": info.is_ok(),
         "daemon_height": info.as_ref().map(|i| i.height).unwrap_or(status.chain_height),
         "daemon_synced": info.as_ref().map(|i| i.synchronized).unwrap_or(false),
