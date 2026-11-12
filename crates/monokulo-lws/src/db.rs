@@ -8,11 +8,12 @@
 //! `admin_keys`), and for proofs of inclusion (`proof`) the blocks and the
 //! pruned transactions that pay an account, as the node sent them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lws_api::admin::RequestKind;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::error::{Error, Result, bad};
@@ -392,27 +393,7 @@ impl Db {
 
     /// Adds an account; `Err(Conflict)` if the address is already here.
     pub fn add_account(&self, new: &NewAccount, status: Status) -> Result<Account> {
-        self.write(|tx| {
-            let n = now();
-            let changed = tx.execute(
-                "INSERT OR IGNORE INTO accounts (address, view_key, spend_pub, view_pub, status, start_height, scan_height, created, access_time, generated_locally) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?7, ?8)",
-                params![
-                    new.address,
-                    new.view_key.as_slice(),
-                    new.spend_pub.as_slice(),
-                    new.view_pub.as_slice(),
-                    status.as_str(),
-                    new.start_height as i64,
-                    n as i64,
-                    new.generated_locally as i64
-                ],
-            )?;
-            if changed == 0 {
-                return Err(Error::Conflict("account exists".into()));
-            }
-            tx.query_row(&format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE address = ?1"), [&new.address], account_row)
-                .map_err(Error::from)
-        })
+        self.write(|tx| insert_account(tx, new, status))
     }
 
     pub fn set_status(&self, addresses: &[String], status: Status) -> Result<Vec<String>> {
@@ -443,23 +424,7 @@ impl Db {
 
     /// Scan these accounts again from `height`: their rows from there on go.
     pub fn rescan(&self, addresses: &[String], height: u64) -> Result<Vec<String>> {
-        self.write(|tx| {
-            let mut done = vec![];
-            for a in addresses {
-                let id: Option<i64> = tx
-                    .query_row("SELECT id FROM accounts WHERE address = ?1", [a], |r| r.get(0))
-                    .optional()?;
-                let Some(id) = id else { continue };
-                delete_account_from(tx, id, height)?;
-                tx.execute(
-                    "UPDATE accounts SET scan_height = MIN(scan_height, ?1) WHERE id = ?2",
-                    params![height as i64, id],
-                )?;
-                done.push(a.clone());
-            }
-            drop_unused_kept(tx, height)?;
-            Ok(done)
-        })
+        self.write(|tx| rescan_in(tx, addresses, height))
     }
 
     /// Forgets these accounts whole: the account, its view key, its
@@ -488,26 +453,19 @@ impl Db {
     }
 
     /// An accepted import: the accounts start at block 0 and scan again
-    /// from it, as monero-lws's import does.
+    /// from it, as monero-lws's import does. One transaction.
     pub fn import(&self, addresses: &[String]) -> Result<Vec<String>> {
-        let done = self.rescan(addresses, 0)?;
-        self.write(|tx| {
-            for a in &done {
-                tx.execute("UPDATE accounts SET start_height = 0 WHERE address = ?1", [a])?;
-            }
-            Ok(())
-        })?;
-        Ok(done)
+        self.write(|tx| import_in(tx, addresses))
     }
 
     // ---- requests ----
 
-    pub fn add_request(&self, kind: &str, new: &NewAccount) -> Result<bool> {
+    pub fn add_request(&self, kind: RequestKind, new: &NewAccount) -> Result<bool> {
         self.write(|tx| {
             let changed = tx.execute(
                 "INSERT OR IGNORE INTO requests (kind, address, view_key, spend_pub, view_pub, start_height, generated_locally, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
-                    kind,
+                    kind.as_str(),
                     new.address,
                     new.view_key.as_slice(),
                     new.spend_pub.as_slice(),
@@ -521,47 +479,59 @@ impl Db {
         })
     }
 
-    pub fn requests(&self) -> Result<Vec<(String, NewAccount)>> {
+    pub fn requests(&self) -> Result<Vec<(RequestKind, NewAccount)>> {
         self.read(|c| {
-            let mut st = c.prepare(
-                "SELECT kind, address, view_key, spend_pub, view_pub, start_height, generated_locally FROM requests ORDER BY created",
-            )?;
-            let rows = st
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        NewAccount {
-                            address: r.get(1)?,
-                            view_key: blob32(r.get(2)?)?,
-                            spend_pub: blob32(r.get(3)?)?,
-                            view_pub: blob32(r.get(4)?)?,
-                            start_height: r.get::<_, i64>(5)? as u64,
-                            generated_locally: r.get::<_, i64>(6)? != 0,
-                        },
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut st = c.prepare(&format!("SELECT {REQUEST_COLS} FROM requests ORDER BY created"))?;
+            let rows = st.query_map([], request_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
     }
 
-    /// Removes the named requests of a kind, returning what they were.
-    pub fn take_requests(&self, kind: &str, addresses: &[String]) -> Result<Vec<NewAccount>> {
-        let all = self.requests()?;
-        let mut taken = vec![];
+    /// Removes the named requests of a kind, returning what they were. One
+    /// transaction, so two callers can't both take the same request.
+    pub fn take_requests(&self, kind: RequestKind, addresses: &[String]) -> Result<Vec<NewAccount>> {
         self.write(|tx| {
-            for (k, new) in all {
-                if k == kind && addresses.contains(&new.address) {
-                    tx.execute(
-                        "DELETE FROM requests WHERE kind = ?1 AND address = ?2",
-                        params![kind, new.address],
-                    )?;
-                    taken.push(new);
+            let taken = named_requests(tx, kind, addresses)?;
+            for new in &taken {
+                delete_request(tx, kind, &new.address)?;
+            }
+            Ok(taken)
+        })
+    }
+
+    /// Accepts the named requests of a kind, all or none, in one
+    /// transaction: a create request becomes an active account, an import
+    /// request scans its account again from block 0. If any named create
+    /// request's address already has an account, nothing is changed and
+    /// those addresses are returned. An import request whose account has
+    /// gone since is dropped and not counted as done.
+    pub fn accept_requests(&self, kind: RequestKind, addresses: &[String]) -> Result<Accepted> {
+        self.write(|tx| {
+            let taken = named_requests(tx, kind, addresses)?;
+            if kind == RequestKind::Create {
+                let mut exists = vec![];
+                for new in &taken {
+                    if account_id(tx, &new.address)?.is_some() {
+                        exists.push(new.address.clone());
+                    }
+                }
+                if !exists.is_empty() {
+                    return Ok(Accepted::Exists(exists));
                 }
             }
-            Ok(())
-        })?;
-        Ok(taken)
+            let mut done = vec![];
+            for new in &taken {
+                delete_request(tx, kind, &new.address)?;
+                match kind {
+                    RequestKind::Create => {
+                        insert_account(tx, new, Status::Active)?;
+                        done.push(new.address.clone());
+                    }
+                    RequestKind::Import => done.extend(import_in(tx, std::slice::from_ref(&new.address))?),
+                }
+            }
+            Ok(Accepted::Done(done))
+        })
     }
 
     // ---- subaddresses ----
@@ -851,6 +821,116 @@ impl Db {
             Ok(rows)
         })
     }
+}
+
+/// What [`Db::accept_requests`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Accepted {
+    /// These addresses were accepted.
+    Done(Vec<String>),
+    /// Nothing was: these addresses already have an account.
+    Exists(Vec<String>),
+}
+
+fn account_id(c: &Connection, address: &str) -> Result<Option<i64>> {
+    Ok(
+        c.query_row("SELECT id FROM accounts WHERE address = ?1", [address], |r| r.get(0))
+            .optional()?,
+    )
+}
+
+/// Adds an account inside `tx`; `Err(Conflict)` if the address is already here.
+fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<Account> {
+    let n = now();
+    let changed = tx.execute(
+        "INSERT OR IGNORE INTO accounts (address, view_key, spend_pub, view_pub, status, start_height, scan_height, created, access_time, generated_locally) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?7, ?8)",
+        params![
+            new.address,
+            new.view_key.as_slice(),
+            new.spend_pub.as_slice(),
+            new.view_pub.as_slice(),
+            status.as_str(),
+            new.start_height as i64,
+            n as i64,
+            new.generated_locally as i64
+        ],
+    )?;
+    if changed == 0 {
+        return Err(Error::Conflict("account exists".into()));
+    }
+    tx.query_row(
+        &format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE address = ?1"),
+        [&new.address],
+        account_row,
+    )
+    .map_err(Error::from)
+}
+
+/// [`Db::rescan`] inside `tx`.
+fn rescan_in(tx: &Transaction, addresses: &[String], height: u64) -> Result<Vec<String>> {
+    let mut done = vec![];
+    for a in addresses {
+        let Some(id) = account_id(tx, a)? else { continue };
+        delete_account_from(tx, id, height)?;
+        tx.execute(
+            "UPDATE accounts SET scan_height = MIN(scan_height, ?1) WHERE id = ?2",
+            params![height as i64, id],
+        )?;
+        done.push(a.clone());
+    }
+    drop_unused_kept(tx, height)?;
+    Ok(done)
+}
+
+/// [`Db::import`] inside `tx`.
+fn import_in(tx: &Transaction, addresses: &[String]) -> Result<Vec<String>> {
+    let done = rescan_in(tx, addresses, 0)?;
+    for a in &done {
+        tx.execute("UPDATE accounts SET start_height = 0 WHERE address = ?1", [a])?;
+    }
+    Ok(done)
+}
+
+const REQUEST_COLS: &str = "kind, address, view_key, spend_pub, view_pub, start_height, generated_locally";
+
+fn request_row(r: &rusqlite::Row) -> rusqlite::Result<(RequestKind, NewAccount)> {
+    Ok((
+        RequestKind::parse(&r.get::<_, String>(0)?).ok_or(rusqlite::Error::InvalidQuery)?,
+        NewAccount {
+            address: r.get(1)?,
+            view_key: blob32(r.get(2)?)?,
+            spend_pub: blob32(r.get(3)?)?,
+            view_pub: blob32(r.get(4)?)?,
+            start_height: r.get::<_, i64>(5)? as u64,
+            generated_locally: r.get::<_, i64>(6)? != 0,
+        },
+    ))
+}
+
+/// The pending requests of a kind under these addresses, each address once.
+fn named_requests(c: &Connection, kind: RequestKind, addresses: &[String]) -> Result<Vec<NewAccount>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {REQUEST_COLS} FROM requests WHERE kind = ?1 AND address = ?2"
+    ))?;
+    let mut seen = HashSet::new();
+    let mut out = vec![];
+    for a in addresses {
+        if !seen.insert(a.as_str()) {
+            continue;
+        }
+        if let Some((_, new)) = st.query_row(params![kind.as_str(), a], request_row).optional()? {
+            out.push(new);
+        }
+    }
+    Ok(out)
+}
+
+fn delete_request(tx: &Transaction, kind: RequestKind, address: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM requests WHERE kind = ?1 AND address = ?2",
+        params![kind.as_str(), address],
+    )?;
+    Ok(())
 }
 
 fn merge(mut ranges: Vec<[u32; 2]>) -> Vec<[u32; 2]> {

@@ -695,11 +695,37 @@ pub mod admin {
         pub addresses: Vec<String>,
     }
 
-    /// `"import"` or `"create"`.
-    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    /// What a pending request asks for: a new account, or an import (a scan
+    /// from block 0) of an existing one. `"create"` or `"import"` on the wire;
+    /// anything else fails to parse.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum RequestKind {
+        Create,
+        Import,
+    }
+
+    impl RequestKind {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                RequestKind::Create => "create",
+                RequestKind::Import => "import",
+            }
+        }
+
+        pub fn parse(s: &str) -> Option<RequestKind> {
+            match s {
+                "create" => Some(RequestKind::Create),
+                "import" => Some(RequestKind::Import),
+                _ => None,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct Requests {
         #[serde(rename = "type")]
-        pub kind: String,
+        pub kind: RequestKind,
         pub addresses: Vec<String>,
     }
 
@@ -850,6 +876,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!e.contains("5Secret"), "{e}");
+    }
+
+    #[test]
+    fn request_kinds_are_create_or_import() {
+        use admin::{RequestKind, Requests};
+        let r: Requests = serde_json::from_str(r#"{"type":"import","addresses":["A"]}"#).unwrap();
+        assert_eq!(r.kind, RequestKind::Import);
+        assert!(serde_json::from_str::<Requests>(r#"{"type":"imports","addresses":[]}"#).is_err());
+        for kind in [RequestKind::Create, RequestKind::Import] {
+            assert_eq!(RequestKind::parse(kind.as_str()), Some(kind));
+            assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{}\"", kind.as_str()));
+        }
     }
 
     #[test]

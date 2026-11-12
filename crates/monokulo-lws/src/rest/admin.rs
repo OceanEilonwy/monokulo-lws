@@ -19,7 +19,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use super::{ApiError, ApiJson, App, parse_value};
-use crate::db::{NewAccount, Status};
+use crate::db::{Accepted, NewAccount, Status};
 use crate::error::{Error, Result, bad};
 use crate::{admin_keys, crypto};
 
@@ -47,7 +47,7 @@ pub async fn command(
 ) -> std::result::Result<Response, ApiError> {
     authorize(&app, req.auth.as_ref())?;
     let out = match command.as_str() {
-        "accept_requests" => accept(&app, params(&req.params)?)?,
+        "accept_requests" => return Ok(accept(&app, params(&req.params)?)?),
         "reject_requests" => reject(&app, params(&req.params)?)?,
         "add_account" => add_account(&app, params(&req.params)?)?,
         "list_accounts" => list_accounts(&app)?,
@@ -64,30 +64,27 @@ pub async fn command(
     Ok(Json(out).into_response())
 }
 
-fn accept(app: &App, p: Requests) -> Result<Value> {
-    let taken = app.db.take_requests(&p.kind, &p.addresses)?;
-    let mut done = vec![];
-    for new in taken {
-        match p.kind.as_str() {
-            "create" => {
-                app.db.add_account(&new, Status::Active)?;
-            }
-            "import" => {
-                app.db.import(std::slice::from_ref(&new.address))?;
-            }
-            _ => return Err(bad("type must be \"create\" or \"import\"")),
+/// All or nothing: if any named create request's address already has an
+/// account, 409 with those addresses and nothing is accepted.
+fn accept(app: &App, p: Requests) -> Result<Response> {
+    match app.db.accept_requests(p.kind, &p.addresses)? {
+        Accepted::Done(done) => {
+            app.scanner.wake.notify_one();
+            Ok(Json(json!({ "updated": done })).into_response())
         }
-        done.push(new.address);
+        Accepted::Exists(exists) => Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "these addresses already have an account; nothing was accepted",
+                "exists": exists,
+            })),
+        )
+            .into_response()),
     }
-    app.scanner.wake.notify_one();
-    Ok(json!({ "updated": done }))
 }
 
 fn reject(app: &App, p: Requests) -> Result<Value> {
-    if p.kind != "create" && p.kind != "import" {
-        return Err(bad("type must be \"create\" or \"import\""));
-    }
-    let taken = app.db.take_requests(&p.kind, &p.addresses)?;
+    let taken = app.db.take_requests(p.kind, &p.addresses)?;
     Ok(json!({ "updated": taken.into_iter().map(|n| n.address).collect::<Vec<_>>() }))
 }
 
@@ -136,10 +133,9 @@ fn list_requests(app: &App) -> Result<Value> {
             address: new.address,
             start_height: new.start_height,
         };
-        if kind == "create" {
-            out.create.push(row)
-        } else {
-            out.import.push(row)
+        match kind {
+            RequestKind::Create => out.create.push(row),
+            RequestKind::Import => out.import.push(row),
         }
     }
     Ok(serde_json::to_value(out).expect("json"))

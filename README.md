@@ -130,7 +130,9 @@ Commands: `accept_requests`, `reject_requests` (`{"type":"create"|"import",
 `remove_accounts` (`{"addresses":[...]}`), which forgets the accounts and
 everything scanned for them, where monero-lws only hides (`admin
 remove-account` does the same on the command line). Webhooks answer 501 for
-now.
+now. `accept_requests` is all or nothing: if any named create request's
+address already has an account it answers 409 with those addresses under
+`exists`, and accepts none.
 
 ## What it answers
 

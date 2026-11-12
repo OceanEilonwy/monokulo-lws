@@ -820,3 +820,86 @@ async fn remove_accounts_forgets_the_accounts_whole() {
     .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
 }
+
+/// `accept_requests` is all or nothing: one address that already has an
+/// account means 409 naming it, and no request is taken or accepted. An
+/// unknown type is refused before anything is looked at.
+#[tokio::test]
+async fn accept_requests_is_all_or_nothing() {
+    let app = app(Setup {
+        create: Policy::Approve,
+        ..Setup::default()
+    });
+    let wallets = wallet_router(app.clone());
+    let admin = admin_router(app.clone());
+    let auth = hex::encode(*crate::admin_keys::create(&app.db).unwrap());
+    let (a, ka) = wallet(80);
+    let (b, kb) = wallet(81);
+    let (c, kc) = wallet(82);
+    for (address, key) in [(&a, &ka), (&b, &kb), (&c, &kc)] {
+        let mut create = login_body(address, key);
+        create["create_account"] = json!(true);
+        assert_eq!(call(&wallets, "/login", &create).await.status, StatusCode::OK);
+    }
+    // The operator adds one of them by hand meanwhile.
+    let r = call(
+        &admin,
+        "/add_account",
+        &json!({ "auth": auth, "params": { "address": a, "key": hex::encode(ka) } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+    let r = call(
+        &admin,
+        "/accept_requests",
+        &json!({ "auth": auth, "params": { "type": "imports", "addresses": [b] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert_eq!(app.db.requests().unwrap().len(), 3);
+
+    let r = call(
+        &admin,
+        "/accept_requests",
+        &json!({ "auth": auth, "params": { "type": "create", "addresses": [a, b, c] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.body);
+    let body: Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(body["exists"], json!([a]));
+    assert_eq!(app.db.requests().unwrap().len(), 3, "nothing was taken");
+    assert!(app.db.account(&b).unwrap().is_none());
+    assert!(app.db.account(&c).unwrap().is_none());
+
+    let r = call(
+        &admin,
+        "/accept_requests",
+        &json!({ "auth": auth, "params": { "type": "create", "addresses": [b, c, b] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let body: Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(body["updated"], json!([b, c]));
+    assert_eq!(app.db.account(&b).unwrap().unwrap().status, Status::Active);
+    assert!(app.db.account(&c).unwrap().is_some());
+    let left: Vec<String> = app.db.requests().unwrap().into_iter().map(|(_, n)| n.address).collect();
+    assert_eq!(left, vec![a.clone()]);
+
+    // Rejecting takes the request away; an unknown type is a 400 there too.
+    let r = call(
+        &admin,
+        "/reject_requests",
+        &json!({ "auth": auth, "params": { "type": "nope", "addresses": [a] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = call(
+        &admin,
+        "/reject_requests",
+        &json!({ "auth": auth, "params": { "type": "create", "addresses": [a] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(app.db.requests().unwrap().is_empty());
+}

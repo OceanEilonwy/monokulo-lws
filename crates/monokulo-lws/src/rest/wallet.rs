@@ -9,6 +9,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use lws_api::admin::RequestKind;
 use lws_api::*;
 use serde_json::json;
 use subtle::ConstantTimeEq;
@@ -152,9 +153,11 @@ pub async fn login(
     if !req.create_account {
         return Err(Error::Forbidden.into());
     }
-    if app.config.create == Policy::Off {
-        return Err(Error::NoCreate.into());
-    }
+    let approve = match app.config.create {
+        Policy::Off => return Err(Error::NoCreate.into()),
+        Policy::Auto => false,
+        Policy::Approve => true,
+    };
     creation_allowed(&app, client.as_ref())?;
     let height = creation_height(&app).await?;
     let new = NewAccount {
@@ -165,34 +168,24 @@ pub async fn login(
         start_height: height.saturating_sub(1),
         generated_locally: req.generated_locally,
     };
-    match app.config.create {
-        Policy::Off => Err(Error::NoCreate.into()),
-        Policy::Auto => {
-            let account = app.db.add_account(&new, Status::Active)?;
-            app.scanner.wake.notify_one();
-            tracing::info!("new account #{} from height {}", account.id, new.start_height);
-            Ok(Json(LoginResponse {
-                new_address: true,
-                generated_locally: Some(req.generated_locally),
-                start_height: Some(new.start_height),
-                lookahead: lookahead(&app),
-            }))
+    if approve {
+        queue_has_room(&app)?;
+        if !app.db.add_request(RequestKind::Create, &new)? {
+            // Asked before and not yet accepted.
+            return Err(Error::Forbidden.into());
         }
-        Policy::Approve => {
-            queue_has_room(&app)?;
-            if !app.db.add_request("create", &new)? {
-                // Asked before and not yet accepted.
-                return Err(Error::Forbidden.into());
-            }
-            tracing::info!("a new account request is waiting for approval");
-            Ok(Json(LoginResponse {
-                new_address: true,
-                generated_locally: Some(req.generated_locally),
-                start_height: Some(new.start_height),
-                lookahead: lookahead(&app),
-            }))
-        }
+        tracing::info!("a new account request is waiting for approval");
+    } else {
+        let account = app.db.add_account(&new, Status::Active)?;
+        app.scanner.wake.notify_one();
+        tracing::info!("new account #{} from height {}", account.id, new.start_height);
     }
+    Ok(Json(LoginResponse {
+        new_address: true,
+        generated_locally: Some(req.generated_locally),
+        start_height: Some(new.start_height),
+        lookahead: lookahead(&app),
+    }))
 }
 
 pub async fn get_address_info(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<AddressInfo> {
@@ -663,13 +656,13 @@ pub async fn import_wallet_request(
                 .db
                 .requests()?
                 .iter()
-                .any(|(k, r)| k == "import" && r.address == new.address)
+                .any(|(k, r)| *k == RequestKind::Import && r.address == new.address)
             {
                 return Ok(reply(false, false, "Already requested"));
             }
             queue_has_room(&app)?;
             creation_allowed(&app, client.as_ref())?;
-            let added = app.db.add_request("import", &new)?;
+            let added = app.db.add_request(RequestKind::Import, &new)?;
             Ok(reply(added, false, if added { "Pending" } else { "Already requested" }))
         }
     }

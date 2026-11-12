@@ -532,7 +532,7 @@ fn admin(command: AdminCommand) -> anyhow::Result<()> {
                 println!("{:<8} {:>9} {}", a.status.as_str(), a.scan_height, a.address);
             }
             for (kind, r) in db.requests()? {
-                println!("request {kind:<7} {:>9} {}", r.start_height, r.address);
+                println!("request {:<7} {:>9} {}", kind.as_str(), r.start_height, r.address);
             }
         }
     }
