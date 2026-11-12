@@ -315,9 +315,11 @@ users (a view key can't be changed; only a new wallet escapes it).
 
 No view key and no address appears in the log at any level:
 
-- The types that hold them (`Login`, `admin::AddAccount`, `admin::Validate`,
-  `admin::Request`, `db::Account`, `db::NewAccount`, `crypto::Checked`) print
-  `<redacted>` for both in `Debug`.
+- A key is never a bare byte array: `lws_api::PrivateViewKey` and
+  `lws_api::AdminKey` print `<redacted>` in `Debug` and `Display`, so any
+  struct that holds one, derived `Debug` or not, can't print it. The types
+  that also hold an address (`Login`, `admin::AddAccount`, `db::Account`,
+  `db::NewAccount`, `crypto::Checked`) print `<redacted>` for it too.
 - Accounts are named by row id in log lines (`new account #12`), never by
   address, not even shortened.
 - No error variant carries a key or an address; a request that fails
@@ -348,13 +350,26 @@ HSTS. The certificate is read at start; restart to renew.
 
 ## Memory
 
-`crypto::Checked`, which carries a copy of the presented view key through a
-request, wipes it when dropped; the admin CLI wipes the keys it reads and
-prints. Beyond that, keys are where they must be: in the database's pages
-and SQLite's cache, in the scanner's keyring and monero-oxide scanners for
-as long as an account is scanned, and in request buffers until they're
-freed. Wiping every transient copy would not change what someone who can
-read the process's memory learns.
+View keys and admin keys are `lws_api::PrivateViewKey` and
+`lws_api::AdminKey` from the moment a request is parsed (or a row read) to
+the moment they're dropped. Each holds its 32 bytes on the heap, so a move
+copies a pointer and not the key, and wipes them when dropped. Neither is
+`Copy` or `Clone`: a login's key is moved into `crypto::Checked` and from
+there into a new account, and an account is passed by reference; a copy is
+made only explicitly, from `as_bytes()`. Comparison is constant time
+(`subtle`), `==` included. The hex written and read for them goes through
+wiped buffers, a key column is read from SQLite's buffer straight into the
+key's own, and the derivations made from a view key (`crypto`: the view key
+as a scalar, `8·a·R`, `H_s(8·a·R ‖ i)` and what is hashed from it, the
+subaddress hash input) are wiped too. The admin CLI wipes the keys it reads
+and prints.
+
+What is left is where keys must be: in the database's pages and SQLite's
+cache, in the scanner's keyring and monero-oxide scanners for as long as an
+account is scanned, and in the request body until it is freed (a JSON body
+is parsed in place, so its bytes are not wiped). None of this changes what
+someone who can read the process's memory learns while the process runs;
+it shortens how long stale copies of keys of finished requests linger.
 
 ## Dependencies
 
@@ -450,4 +465,5 @@ except where it says otherwise.
 - **PROXY protocol.** Only a header from a trusted proxy is supported.
 - **Reloading the TLS certificate without a restart.** Not needed at the
   rates the server restarts; a reverse proxy does it if wanted.
-- **Wiping every transient copy of a view key.** See "Memory".
+- **Wiping the request body.** A view key arrives as JSON text in a body
+  buffer owned by hyper and axum, which is freed, not wiped. See "Memory".

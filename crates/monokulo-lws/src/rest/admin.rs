@@ -19,16 +19,15 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use super::{ApiError, ApiJson, App, parse_value};
-use crate::db::{Accepted, NewAccount, Status};
+use crate::db::{Accepted, Status};
 use crate::error::{Error, Result, bad};
 use crate::{admin_keys, crypto};
 
-async fn authorize(app: &App, auth: Option<&lws_api::Hex32>) -> Result<()> {
+async fn authorize(app: &App, auth: Option<lws_api::AdminKey>) -> Result<()> {
     if !app.config.admin_auth {
         return Ok(());
     }
-    let Some(auth) = auth else { return Err(Error::Forbidden) };
-    let key = zeroize::Zeroizing::new(auth.0);
+    let Some(key) = auth else { return Err(Error::Forbidden) };
     if app.db.call(move |db| admin_keys::verify(db, &key)).await? {
         Ok(())
     } else {
@@ -46,7 +45,7 @@ pub async fn command(
     Path(command): Path<String>,
     ApiJson(req): ApiJson<Request<Value>>,
 ) -> std::result::Result<Response, ApiError> {
-    authorize(&app, req.auth.as_ref()).await?;
+    authorize(&app, req.auth).await?;
     let out = match command.as_str() {
         "accept_requests" => return Ok(accept(&app, params(&req.params)?).await?),
         "reject_requests" => reject(&app, params(&req.params)?).await?,
@@ -92,22 +91,16 @@ async fn reject(app: &App, p: Requests) -> Result<Value> {
 async fn add_account(app: &App, p: AddAccount) -> Result<Value> {
     // A key that isn't the address's is the operator's mistake, not a
     // failed login: a 400 with the reason, and 403 stays the admin key's.
-    let checked = crypto::check_login(app.scanner.config.network, &p.address, &p.key.0).map_err(|e| match e {
+    let checked = crypto::check_login(app.scanner.config.network, &p.address, p.key).map_err(|e| match e {
         Error::Forbidden => bad("the view key doesn't belong to the address"),
         other => other,
     })?;
     let height = app.scanner.status().chain_height;
-    let new = NewAccount {
-        address: checked.address.clone(),
-        view_key: checked.view_key,
-        spend_pub: checked.spend_pub,
-        view_pub: checked.view_pub,
-        start_height: height.saturating_sub(1),
-        generated_locally: false,
-    };
+    let new = checked.into_new_account(height.saturating_sub(1), false);
+    let address = new.address.clone();
     app.db.call(move |db| db.add_account(&new, Status::Active)).await?;
     app.scanner.wake.notify_one();
-    Ok(json!({ "updated": [checked.address.clone()] }))
+    Ok(json!({ "updated": [address] }))
 }
 
 async fn list_accounts(app: &App) -> Result<Value> {
@@ -166,21 +159,15 @@ async fn remove(app: &App, p: Addresses) -> Result<Value> {
 fn validate(app: &App, p: Validate) -> Result<Value> {
     use monero_wallet::address::{AddressType, MoneroAddress};
     use monero_wallet::ed25519::CompressedPoint;
-    let key = |s: &str, what: &str| -> Result<[u8; 32]> {
-        crate::daemon::hex32(s).ok_or_else(|| bad(format!("{what} must be 64 hex characters")))
-    };
-    let spend = key(&p.spend_public_hex, "spend_public_hex")?;
-    let view_pub = key(&p.view_public_hex, "view_public_hex")?;
-    let view_key = key(&p.view_key_hex, "view_key_hex")?;
-    let spend_point = CompressedPoint::from(spend)
+    let spend_point = CompressedPoint::from(p.spend_public_hex.0)
         .decompress()
         .ok_or_else(|| bad("spend_public_hex isn't a point"))?;
-    let view_point = CompressedPoint::from(view_pub)
+    let view_point = CompressedPoint::from(p.view_public_hex.0)
         .decompress()
         .ok_or_else(|| bad("view_public_hex isn't a point"))?;
     let address =
         MoneroAddress::new(app.scanner.config.network, AddressType::Legacy, spend_point, view_point).to_string();
-    match crypto::check_login(app.scanner.config.network, &address, &view_key) {
+    match crypto::check_login(app.scanner.config.network, &address, p.view_key_hex) {
         Ok(_) => Ok(json!({ "address": address })),
         Err(e) => Ok(json!({ "error": e.to_string() })),
     }

@@ -24,6 +24,8 @@ use std::borrow::Cow;
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use subtle::{Choice, ConstantTimeEq};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// A `uint64-string`: a 64-bit amount or index written as a decimal string,
 /// since JSON numbers past 2^53 lose precision in many readers.
@@ -181,6 +183,123 @@ impl<'de> Deserialize<'de> for HexBytes {
     }
 }
 
+/// Defines a 32-byte secret: 64 hex characters on the wire, held on the
+/// heap (so moving the value moves a pointer, not the secret) and wiped
+/// when dropped. It is neither `Copy` nor `Clone`: a copy is made only on
+/// purpose, from [`as_bytes`](PrivateViewKey::as_bytes). `==` compares in
+/// constant time (`subtle`); `Debug` and `Display` print `<redacted>`.
+macro_rules! secret32 {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        pub struct $name(Box<[u8; 32]>);
+
+        impl $name {
+            /// The key in these bytes. The caller still holds (and should
+            /// wipe) its own copy.
+            pub fn from_bytes(bytes: &[u8; 32]) -> Self {
+                let mut key = Self(Box::new([0; 32]));
+                key.0.copy_from_slice(bytes);
+                key
+            }
+
+            /// The key in 64 hex characters (either case); `None` for
+            /// anything else.
+            pub fn from_hex(s: &str) -> Option<Self> {
+                let mut key = Self(Box::new([0; 32]));
+                hex::decode_to_slice(s.as_bytes(), key.0.as_mut_slice()).ok()?;
+                Some(key)
+            }
+
+            /// The key in a 32-byte slice; `None` for any other length.
+            pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+                let bytes: &[u8; 32] = bytes.try_into().ok()?;
+                Some(Self::from_bytes(bytes))
+            }
+
+            /// The key itself, to compute with. Any copy made from it is the
+            /// caller's to wipe.
+            pub fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+        }
+
+        impl Zeroize for $name {
+            fn zeroize(&mut self) {
+                self.0.as_mut().zeroize();
+            }
+        }
+
+        impl Drop for $name {
+            fn drop(&mut self) {
+                self.zeroize();
+            }
+        }
+
+        impl ZeroizeOnDrop for $name {}
+
+        impl ConstantTimeEq for $name {
+            fn ct_eq(&self, other: &Self) -> Choice {
+                self.0.as_slice().ct_eq(other.0.as_slice())
+            }
+        }
+
+        /// Constant time, whatever the bytes.
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                self.ct_eq(other).into()
+            }
+        }
+
+        impl Eq for $name {}
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(REDACTED)
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(REDACTED)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                let mut text = Zeroizing::new([0u8; 64]);
+                hex::encode_to_slice(self.0.as_slice(), text.as_mut_slice()).expect("64 bytes for 32");
+                s.serialize_str(std::str::from_utf8(text.as_slice()).expect("hex is ASCII"))
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = text(d)?;
+                if s.len() != 64 {
+                    return Err(de::Error::custom(format!("expected 64 hex characters, got {}", s.len())));
+                }
+                let mut key = Self(Box::new([0; 32]));
+                // Not the decoder's own error, which names the offending character.
+                hex::decode_to_slice(s.as_bytes(), key.0.as_mut_slice()).map_err(|_| de::Error::custom("not hex"))?;
+                if let Cow::Owned(owned) = s {
+                    drop(Zeroizing::new(owned));
+                }
+                Ok(key)
+            }
+        }
+    };
+}
+
+secret32! {
+    /// A private view key: the only credential a wallet login has.
+    PrivateViewKey
+}
+
+secret32! {
+    /// An admin API key, as presented in a request's `auth`.
+    AdminKey
+}
+
 /// A moment, as `YYYY-MM-DDTHH:MM:SSZ` (what monero-lws writes). It is kept
 /// as text: a client that wants the number can parse it, and a server builds
 /// it with [`Timestamp::from_unix`].
@@ -218,11 +337,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// Every account-scoped request: the primary address and its private view
 /// key. The view key is the only credential the protocol has. `Debug`
-/// prints neither.
-#[derive(Clone, Serialize, Deserialize)]
+/// prints neither. Not `Clone`, as the key isn't.
+#[derive(Serialize, Deserialize)]
 pub struct Login {
     pub address: String,
-    pub view_key: Hex32,
+    pub view_key: PrivateViewKey,
 }
 
 /// What a secret or an address prints as in `Debug`.
@@ -431,7 +550,7 @@ pub struct AddressTxs {
 }
 
 /// `/get_unspent_outs` request.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UnspentOutsRequest {
     #[serde(flatten)]
     pub login: Login,
@@ -519,7 +638,7 @@ pub struct RandomOuts {
 }
 
 /// `/login` request.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LoginRequest {
     #[serde(flatten)]
     pub login: Login,
@@ -614,7 +733,7 @@ pub struct Subaddrs {
 }
 
 /// `/upsert_subaddrs` request.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UpsertSubaddrsRequest {
     #[serde(flatten)]
     pub login: Login,
@@ -624,7 +743,7 @@ pub struct UpsertSubaddrsRequest {
 }
 
 /// `/provision_subaddrs` request: hand out the next minors.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProvisionSubaddrsRequest {
     #[serde(flatten)]
     pub login: Login,
@@ -653,11 +772,11 @@ pub mod admin {
     use super::*;
 
     /// `Debug` leaves out the key.
-    #[derive(Clone, Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize)]
     #[serde(bound(deserialize = "P: Deserialize<'de> + Default"))]
     pub struct Request<P> {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub auth: Option<Hex32>,
+        pub auth: Option<AdminKey>,
         #[serde(default)]
         pub params: P,
     }
@@ -675,10 +794,10 @@ pub mod admin {
     pub struct Empty {}
 
     /// `Debug` prints neither the address nor the key.
-    #[derive(Clone, Default, Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize)]
     pub struct AddAccount {
         pub address: String,
-        pub key: Hex32,
+        pub key: PrivateViewKey,
     }
 
     impl fmt::Debug for AddAccount {
@@ -742,22 +861,13 @@ pub mod admin {
         pub addresses: Vec<String>,
     }
 
-    /// `Debug` leaves out the view key.
-    #[derive(Clone, Default, Serialize, Deserialize)]
+    /// The keys of a primary address, to check that they make one on this
+    /// network. `Debug` leaves out the view key (as [`PrivateViewKey`] does).
+    #[derive(Debug, Serialize, Deserialize)]
     pub struct Validate {
-        pub spend_public_hex: String,
-        pub view_public_hex: String,
-        pub view_key_hex: String,
-    }
-
-    impl fmt::Debug for Validate {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.debug_struct("Validate")
-                .field("spend_public_hex", &self.spend_public_hex)
-                .field("view_public_hex", &self.view_public_hex)
-                .field("view_key_hex", &REDACTED)
-                .finish()
-        }
+        pub spend_public_hex: Hex32,
+        pub view_public_hex: Hex32,
+        pub view_key_hex: PrivateViewKey,
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -824,15 +934,17 @@ mod tests {
 
     #[test]
     fn debug_hides_keys_and_addresses() {
-        let key = Hex([0xcd; 32]);
-        let login = Login {
+        let key = [0xcd; 32];
+        let hex_key = hex::encode(key);
+        let login = || Login {
             address: "5SecretAddress".into(),
-            view_key: key,
+            view_key: PrivateViewKey::from_bytes(&key),
         };
         let printed = format!(
-            "{login:?} {:?}",
+            "{:?} {:?}",
+            login(),
             UnspentOutsRequest {
-                login: login.clone(),
+                login: login(),
                 amount: Amount(1),
                 mixin: 15,
                 use_dust: false,
@@ -840,18 +952,83 @@ mod tests {
             }
         );
         assert!(!printed.contains("5SecretAddress"), "{printed}");
-        assert!(!printed.contains(&key.to_string()), "{printed}");
+        assert!(!printed.contains(&hex_key), "{printed}");
         let add = admin::AddAccount {
             address: "5SecretAddress".into(),
-            key,
+            key: PrivateViewKey::from_bytes(&key),
         };
         let req = admin::Request {
-            auth: Some(key),
+            auth: Some(AdminKey::from_bytes(&key)),
             params: add,
         };
-        let printed = format!("{req:?}");
+        let validate = admin::Validate {
+            spend_public_hex: Hex([1; 32]),
+            view_public_hex: Hex([2; 32]),
+            view_key_hex: PrivateViewKey::from_bytes(&key),
+        };
+        let printed = format!("{req:?} {req:#?} {validate:?}");
         assert!(!printed.contains("5SecretAddress"), "{printed}");
-        assert!(!printed.contains(&key.to_string()), "{printed}");
+        assert!(!printed.contains(&hex_key), "{printed}");
+        assert!(!printed.contains("205"), "{printed}");
+    }
+
+    #[test]
+    fn secret_keys_print_redacted_and_compare_in_constant_time() {
+        let key = PrivateViewKey::from_bytes(&[0xab; 32]);
+        assert_eq!(format!("{key:?}"), "<redacted>");
+        assert_eq!(format!("{key}"), "<redacted>");
+        assert_eq!(format!("{:?}", AdminKey::from_bytes(&[0xab; 32])), "<redacted>");
+        let same = PrivateViewKey::from_bytes(&[0xab; 32]);
+        let mut other = [0xab; 32];
+        other[31] ^= 1;
+        let other = PrivateViewKey::from_bytes(&other);
+        assert!(bool::from(key.ct_eq(&same)) && key == same);
+        assert!(!bool::from(key.ct_eq(&other)) && key != other);
+        assert!(PrivateViewKey::from_slice(&[0xab; 31]).is_none());
+        assert!(PrivateViewKey::from_slice(&[0xab; 32]).unwrap() == key);
+    }
+
+    #[test]
+    fn secret_keys_read_and_write_hex() {
+        let json = format!("\"{}\"", "ab".repeat(32));
+        let key: PrivateViewKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(key.as_bytes(), &[0xab; 32]);
+        assert_eq!(serde_json::to_string(&key).unwrap(), json);
+        assert!(serde_json::from_str::<PrivateViewKey>(&json.to_uppercase()).is_ok());
+        for bad in [
+            "\"abab\"",
+            "5",
+            &format!("\"{}zz\"", "ab".repeat(31)),
+            &format!("\"{}00\"", "ab".repeat(32)),
+        ] {
+            assert!(serde_json::from_str::<PrivateViewKey>(bad).is_err(), "{bad}");
+            assert!(serde_json::from_str::<AdminKey>(bad).is_err(), "{bad}");
+        }
+        let mut key = key;
+        key.zeroize();
+        assert_eq!(key.as_bytes(), &[0; 32]);
+    }
+
+    /// The secret key types are neither `Copy` nor `Clone`: if either were,
+    /// `<T as NotIf<_>>::check` would be ambiguous (two impls would fit) and
+    /// this would not compile.
+    #[test]
+    fn secret_keys_are_neither_copy_nor_clone() {
+        trait NotCopy<A> {
+            fn check() {}
+        }
+        impl<T> NotCopy<()> for T {}
+        impl<T: Copy> NotCopy<u8> for T {}
+        trait NotClone<A> {
+            fn check() {}
+        }
+        impl<T> NotClone<()> for T {}
+        impl<T: Clone> NotClone<u8> for T {}
+        <PrivateViewKey as NotCopy<_>>::check();
+        <PrivateViewKey as NotClone<_>>::check();
+        <AdminKey as NotCopy<_>>::check();
+        <AdminKey as NotClone<_>>::check();
+        <Login as NotClone<_>>::check();
     }
 
     #[test]

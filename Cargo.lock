@@ -885,6 +885,8 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]

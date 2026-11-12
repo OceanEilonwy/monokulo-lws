@@ -99,7 +99,7 @@ fn both_ways(wallets: &[&Wallet], start: u64, make: impl Fn() -> Vec<Made>) -> (
 }
 
 fn found(w: &Wallet, block: ScannableBlock) -> Vec<(u64, [u8; 32], u64)> {
-    let pair = crypto::view_pair(&w.spend_pub().compress().to_bytes(), &w.view.to_bytes()).unwrap();
+    let pair = crypto::view_pair(&w.spend_pub().compress().to_bytes(), &w.view_key()).unwrap();
     let mut scanner = OxideScanner::new(pair);
     let mut out: Vec<_> = scanner
         .scan(block)
@@ -375,7 +375,7 @@ async fn the_served_commitment_is_the_chains_and_heads_the_rct_blob() {
     // The regular output's blob decrypts to its mask and amount.
     let o = outs.outputs.iter().find(|o| o.global_index == Amount(5_002)).unwrap();
     let blob = &o.rct.as_ref().unwrap().0;
-    let shared = crypto::shared_scalar(&w.view.to_bytes(), &o.tx_pub_key.0, o.index as u64).unwrap();
+    let shared = crypto::shared_scalar(&w.view_key(), &o.tx_pub_key.0, o.index as u64).unwrap();
     let s1: DScalar = Scalar::hash(shared.as_bytes()).into();
     let s2: DScalar = Scalar::hash(s1.as_bytes()).into();
     assert_eq!(

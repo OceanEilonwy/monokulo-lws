@@ -21,6 +21,7 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lws_api::PrivateViewKey;
 use lws_api::admin::RequestKind;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
@@ -155,12 +156,12 @@ impl Status {
     }
 }
 
-/// `Debug` leaves out the view key and the address (`crate::redact`).
-#[derive(Clone)]
+/// `Debug` leaves out the view key and the address (`crate::redact`). Not
+/// `Clone`: the view key isn't, so an account is passed by reference.
 pub struct Account {
     pub id: i64,
     pub address: String,
-    pub view_key: [u8; 32],
+    pub view_key: PrivateViewKey,
     pub spend_pub: [u8; 32],
     pub view_pub: [u8; 32],
     pub status: Status,
@@ -171,11 +172,11 @@ pub struct Account {
 }
 
 /// A new account or a pending request, before it has a row. `Debug` leaves
-/// out the view key and the address (`crate::redact`).
-#[derive(Clone)]
+/// out the view key and the address (`crate::redact`). Not `Clone`, as
+/// the view key isn't.
 pub struct NewAccount {
     pub address: String,
-    pub view_key: [u8; 32],
+    pub view_key: PrivateViewKey,
     pub spend_pub: [u8; 32],
     pub view_pub: [u8; 32],
     pub start_height: u64,
@@ -332,11 +333,26 @@ fn blob32(v: Vec<u8>) -> rusqlite::Result<[u8; 32]> {
     v.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
 }
 
+/// A view key column, read straight from SQLite's buffer into the key's own
+/// (no `Vec` copy left behind). A blob of the wrong length is an error.
+/// (`PrivateViewKey` is `lws_api`'s, so it can't implement `FromSql` here;
+/// it is written as `key.as_bytes().as_slice()`.)
+fn view_key_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<PrivateViewKey> {
+    let blob = r.get_ref(i)?.as_blob()?;
+    PrivateViewKey::from_slice(blob).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            i,
+            rusqlite::types::Type::Blob,
+            format!("a view key of {} bytes", blob.len()).into(),
+        )
+    })
+}
+
 fn account_row(r: &rusqlite::Row) -> rusqlite::Result<Account> {
     Ok(Account {
         id: r.get(0)?,
         address: r.get(1)?,
-        view_key: blob32(r.get(2)?)?,
+        view_key: view_key_col(r, 2)?,
         spend_pub: blob32(r.get(3)?)?,
         view_pub: blob32(r.get(4)?)?,
         status: Status::parse(&r.get::<_, String>(5)?).unwrap_or(Status::Hidden),
@@ -704,7 +720,7 @@ impl Db {
                 params![
                     kind.as_str(),
                     new.address,
-                    new.view_key.as_slice(),
+                    new.view_key.as_bytes().as_slice(),
                     new.spend_pub.as_slice(),
                     new.view_pub.as_slice(),
                     start_height,
@@ -1162,7 +1178,7 @@ fn insert_account(tx: &Transaction, new: &NewAccount, status: Status) -> Result<
         "INSERT OR IGNORE INTO accounts (address, view_key, spend_pub, view_pub, status, start_height, scan_height, created, access_time, generated_locally) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?7, ?8)",
         params![
             new.address,
-            new.view_key.as_slice(),
+            new.view_key.as_bytes().as_slice(),
             new.spend_pub.as_slice(),
             new.view_pub.as_slice(),
             status.as_str(),
@@ -1215,7 +1231,7 @@ fn request_row(r: &rusqlite::Row) -> rusqlite::Result<(RequestKind, NewAccount)>
         RequestKind::parse(&r.get::<_, String>(0)?).ok_or(rusqlite::Error::InvalidQuery)?,
         NewAccount {
             address: r.get(1)?,
-            view_key: blob32(r.get(2)?)?,
+            view_key: view_key_col(r, 2)?,
             spend_pub: blob32(r.get(3)?)?,
             view_pub: blob32(r.get(4)?)?,
             start_height: r.get::<_, i64>(5)? as u64,
@@ -1636,7 +1652,7 @@ mod tests {
         db.add_account(
             &NewAccount {
                 address: "A".into(),
-                view_key: [1; 32],
+                view_key: PrivateViewKey::from_bytes(&[1; 32]),
                 spend_pub: [2; 32],
                 view_pub: [3; 32],
                 start_height: 10,
@@ -1656,7 +1672,7 @@ mod tests {
             db.add_account(
                 &NewAccount {
                     address: "A".into(),
-                    view_key: [1; 32],
+                    view_key: PrivateViewKey::from_bytes(&[1; 32]),
                     spend_pub: [2; 32],
                     view_pub: [3; 32],
                     start_height: 0,

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use curve25519_dalek::{EdwardsPoint, constants::ED25519_BASEPOINT_TABLE, scalar::Scalar as DScalar};
-use lws_api::{Hex, Login};
+use lws_api::{Login, PrivateViewKey};
 use monero_wallet::{
     address::{AddressType, MoneroAddress, Network},
     block::{Block, BlockHeader},
@@ -58,6 +58,11 @@ impl Wallet {
         }
     }
 
+    /// The private view key, as the server holds it.
+    pub fn view_key(&self) -> PrivateViewKey {
+        PrivateViewKey::from_bytes(self.view.as_bytes())
+    }
+
     pub fn spend_pub(&self) -> EdwardsPoint {
         &self.spend * ED25519_BASEPOINT_TABLE
     }
@@ -68,7 +73,7 @@ impl Wallet {
 
     /// A subaddress's spend key `D`; the primary spend key for (0, 0).
     pub fn sub_spend(&self, major: u32, minor: u32) -> EdwardsPoint {
-        self.spend_pub() + &crypto::subaddress_derivation(self.view.as_bytes(), major, minor) * ED25519_BASEPOINT_TABLE
+        self.spend_pub() + &crypto::subaddress_derivation(&self.view_key(), major, minor) * ED25519_BASEPOINT_TABLE
     }
 
     pub fn address(&self) -> String {
@@ -84,7 +89,7 @@ impl Wallet {
     pub fn login(&self) -> Login {
         Login {
             address: self.address(),
-            view_key: Hex(self.view.to_bytes()),
+            view_key: self.view_key(),
         }
     }
 
@@ -92,7 +97,7 @@ impl Wallet {
         db.add_account(
             &NewAccount {
                 address: self.address(),
-                view_key: self.view.to_bytes(),
+                view_key: self.view_key(),
                 spend_pub: self.spend_pub().compress().to_bytes(),
                 view_pub: self.view_pub().compress().to_bytes(),
                 start_height: start,

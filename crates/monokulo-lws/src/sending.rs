@@ -193,7 +193,7 @@ async fn the_rct_blob_opens_with_monero_oxide() {
     ];
     proofs.base.commitments[1] = CompressedPoint::from(<[u8; 32]>::try_from(&blob[..32]).unwrap());
     let made = block(101, [1; 32], dull_miner(101), vec![old], 6_000, 0);
-    let pair = crypto::view_pair(&w.spend_pub().compress().to_bytes(), &w.view.to_bytes()).unwrap();
+    let pair = crypto::view_pair(&w.spend_pub().compress().to_bytes(), &w.view_key()).unwrap();
     let found = OxideScanner::new(pair)
         .scan(made.block)
         .unwrap()

@@ -49,6 +49,7 @@ impl fmt::Debug for Checked {
 mod tests {
     use super::*;
     use crate::db::Status;
+    use lws_api::PrivateViewKey;
 
     #[test]
     fn debug_leaves_out_keys_and_addresses() {
@@ -57,7 +58,7 @@ mod tests {
         let account = Account {
             id: 7,
             address: address.clone(),
-            view_key: key,
+            view_key: PrivateViewKey::from_bytes(&key),
             spend_pub: [1; 32],
             view_pub: [2; 32],
             status: Status::Active,
@@ -68,18 +69,13 @@ mod tests {
         };
         let new = NewAccount {
             address: address.clone(),
-            view_key: key,
+            view_key: PrivateViewKey::from_bytes(&key),
             spend_pub: [1; 32],
             view_pub: [2; 32],
             start_height: 1,
             generated_locally: true,
         };
-        let checked = Checked {
-            address: address.clone(),
-            spend_pub: [1; 32],
-            view_pub: [2; 32],
-            view_key: key,
-        };
+        let checked = Checked::unchecked(address.clone(), [1; 32], [2; 32], PrivateViewKey::from_bytes(&key));
         let hex_key = hex::encode(key);
         for printed in [
             format!("{account:?}"),

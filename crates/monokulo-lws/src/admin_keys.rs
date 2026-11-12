@@ -9,6 +9,7 @@
 //! remembers that it was done. The functions here don't run it again, so an
 //! admin request makes no write transaction.
 
+use lws_api::AdminKey;
 use rusqlite::{OptionalExtension, params};
 use sha3::{Digest, Sha3_256};
 use subtle::{Choice, ConstantTimeEq};
@@ -80,13 +81,13 @@ pub fn count(db: &Db) -> Result<u64> {
 /// Whether `presented` is one of the keys. The presented key is hashed and
 /// compared with every stored hash in constant time, all of them each time,
 /// so the time taken says nothing of which (or whether one) matched.
-pub fn verify(db: &Db, presented: &[u8; 32]) -> Result<bool> {
+pub fn verify(db: &Db, presented: &AdminKey) -> Result<bool> {
     let stored: Vec<Vec<u8>> = db.read(|c| {
         Ok(c.prepare("SELECT key FROM admin_keys")?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?)
     })?;
-    Ok(matches(&stored, &hash(presented)))
+    Ok(matches(&stored, &hash(presented.as_bytes())))
 }
 
 fn matches(stored: &[Vec<u8>], wanted: &[u8; 32]) -> bool {
@@ -117,12 +118,12 @@ mod tests {
             .unwrap();
         assert_eq!(stored, vec![hash(&key).to_vec()]);
         assert_ne!(stored[0], key.to_vec(), "the key itself is not in the database");
-        assert!(verify(&db, &key).unwrap());
+        assert!(verify(&db, &AdminKey::from_bytes(&key)).unwrap());
         let mut wrong = *key;
         wrong[31] ^= 1;
-        assert!(!verify(&db, &wrong).unwrap());
+        assert!(!verify(&db, &AdminKey::from_bytes(&wrong)).unwrap());
         // The hash itself is not a key.
-        assert!(!verify(&db, &hash(&key)).unwrap());
+        assert!(!verify(&db, &AdminKey::from_bytes(&hash(&key))).unwrap());
     }
 
     #[test]
@@ -139,14 +140,17 @@ mod tests {
         .unwrap();
         // What open_db does once.
         migrate(&db).unwrap();
-        assert!(verify(&db, &old).unwrap(), "the old key still opens the admin API");
+        assert!(
+            verify(&db, &AdminKey::from_bytes(&old)).unwrap(),
+            "the old key still opens the admin API"
+        );
         let stored: Vec<u8> = db
             .read(|c| Ok(c.query_row("SELECT key FROM admin_keys", [], |r| r.get(0))?))
             .unwrap();
         assert_eq!(stored, hash(&old).to_vec());
         // Running again doesn't hash the hash.
         migrate(&db).unwrap();
-        assert!(verify(&db, &old).unwrap());
+        assert!(verify(&db, &AdminKey::from_bytes(&old)).unwrap());
     }
 
     #[test]
@@ -154,7 +158,7 @@ mod tests {
         let db = Db::in_memory();
         let key = create(&db).unwrap();
         // Without the migration's mark, a verify that migrated would add it.
-        assert!(verify(&db, &key).unwrap());
+        assert!(verify(&db, &AdminKey::from_bytes(&key)).unwrap());
         assert_eq!(count(&db).unwrap(), 1);
         let marked: bool = db
             .read(|c| Ok(c.prepare("SELECT 1 FROM meta WHERE key = ?1")?.exists([HASHED])?))

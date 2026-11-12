@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use curve25519_dalek::scalar::Scalar as DScalar;
-use lws_api::SubaddrRanges;
+use lws_api::{PrivateViewKey, SubaddrRanges};
 use monero_wallet::{
     Scanner as OxideScanner, WalletOutput,
     address::{Network, SubaddressIndex},
@@ -222,7 +222,7 @@ impl Ring {
         let mut in_keyring = Vec::with_capacity(accounts.len());
         for (account, ranges) in accounts {
             let pair = crypto::view_pair(&account.spend_pub, &account.view_key)?;
-            let id = keyring.add(&pair, &zeroize::Zeroizing::new(account.view_key));
+            let id = keyring.add(&pair, &zeroize::Zeroizing::new(*account.view_key.as_bytes()));
             for index in watched(lookahead, ranges) {
                 keyring.watch(id, &pair, index);
             }
@@ -357,7 +357,7 @@ pub fn stand_in(block: &ScannableBlock, first_indexes: &[Option<u64>], tx: usize
 pub struct SpendMap(HashMap<u64, Vec<(i64, OutputRow)>>);
 
 impl SpendMap {
-    fn of(w: &ScanWriter, accounts: &[Account]) -> Result<SpendMap> {
+    fn of<'a>(w: &ScanWriter, accounts: impl IntoIterator<Item = &'a Account>) -> Result<SpendMap> {
         let mut map = SpendMap::default();
         for account in accounts {
             for (_, row) in w.owned_indexes(account.id)? {
@@ -1396,15 +1396,16 @@ pub fn write_scanned(
     scanned: Scanned,
     live: bool,
 ) -> Result<()> {
-    let mut current = Vec::with_capacity(accounts.len());
+    // Only these accounts are written to, from here on.
+    let mut accounts_now: Vec<&Account> = Vec::with_capacity(accounts.len());
     for account in accounts {
         if w.standing(account.id)? == Some((account.scan_height, Status::Active)) {
-            current.push(account.clone());
+            accounts_now.push(account);
         }
     }
-    let accounts = current.as_slice();
-    let by_id: HashMap<i64, &Account> = accounts.iter().map(|a| (a.id, a)).collect();
-    let mut spends = SpendMap::of(w, accounts)?;
+    let accounts = accounts_now;
+    let by_id: HashMap<i64, &Account> = accounts.iter().map(|a| (a.id, *a)).collect();
+    let mut spends = SpendMap::of(w, accounts.iter().copied())?;
     let mut per_block = scanned.per_block.into_iter();
     for (i, block) in batch.blocks.iter().enumerate() {
         let height = start + i as u64;
@@ -1480,7 +1481,7 @@ struct TxMeta {
 }
 
 impl TxMeta {
-    fn of(tx: &Transaction<Pruned>, output: &WalletOutput, view_key: &[u8; 32]) -> TxMeta {
+    fn of(tx: &Transaction<Pruned>, output: &WalletOutput, view_key: &PrivateViewKey) -> TxMeta {
         let prefix = tx.prefix();
         let (main_key, additional) = extra_keys(&prefix.extra);
         let index = output.index_in_transaction();
@@ -2115,7 +2116,7 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
             accounts.push(db.add_account(
                 &crate::db::NewAccount {
                     address: format!("replay-{i}"),
-                    view_key: view.to_bytes(),
+                    view_key: PrivateViewKey::from_bytes(&view.to_bytes()),
                     spend_pub: spend.compress().to_bytes(),
                     view_pub,
                     start_height: 3_797_000,
@@ -2333,7 +2334,11 @@ mod tests {
     }
 
     fn found(keys: &Keys, block: ScannableBlock) -> Vec<(u64, [u8; 32])> {
-        let pair = crypto::view_pair(&keys.spend.compress().to_bytes(), &keys.view.to_bytes()).unwrap();
+        let pair = crypto::view_pair(
+            &keys.spend.compress().to_bytes(),
+            &PrivateViewKey::from_bytes(keys.view.as_bytes()),
+        )
+        .unwrap();
         let mut scanner = OxideScanner::new(pair);
         scanner
             .scan(block)
@@ -2402,13 +2407,18 @@ mod tests {
         assert!(map.get(12).is_empty());
     }
 
+    /// `account` read again: an `Account` isn't `Clone` (its view key isn't).
+    fn again(db: &Db, account: &Account) -> Account {
+        db.account(&account.address).unwrap().unwrap()
+    }
+
     fn account(db: &Db, keys: &Keys, address: &str, start: u64) -> Account {
         let spend_pub = keys.spend.compress().to_bytes();
         let view_pub = (&keys.view * ED25519_BASEPOINT_TABLE).compress().to_bytes();
         db.add_account(
             &NewAccount {
                 address: address.into(),
-                view_key: keys.view.to_bytes(),
+                view_key: PrivateViewKey::from_bytes(keys.view.as_bytes()),
                 spend_pub,
                 view_pub,
                 start_height: start,
@@ -2435,7 +2445,7 @@ mod tests {
             first_indexes: vec![firsts_pays, firsts_spends],
             raw: vec![],
         };
-        let accounts = vec![a.clone(), b.clone()];
+        let accounts = vec![again(&db, &a), again(&db, &b)];
         let mut slot = None;
         db.write(|tx| {
             let w = ScanWriter::new(tx);
@@ -2512,7 +2522,7 @@ mod tests {
             first_indexes: vec![firsts_pays, firsts_spends],
             raw: vec![],
         };
-        let accounts = vec![a.clone(), b.clone()];
+        let accounts = vec![again(&db, &a), again(&db, &b)];
         let mut slot = None;
         db.read(|c| Ring::get(&mut slot, c, &accounts, 1, &Arena::new()).map(|_| ()))
             .unwrap();
@@ -2826,7 +2836,7 @@ mod tests {
         let scan = |slot: &mut Option<Ring>, accounts: &[Account], b: &Batch, at: &Window| {
             app.scanner.scan_batch(slot, &arena, accounts, b, at).unwrap()
         };
-        let accounts = vec![account.clone()];
+        let accounts = vec![again(&db, &account)];
 
         let before = db.reorg_generation().unwrap();
         db.rewind(1_000).unwrap();
@@ -2940,7 +2950,7 @@ mod tests {
         let app = testkit::app_with_node(db.clone(), 101, &node.url);
         let last = testkit::block(100, [0; 32], testkit::dull_miner(100), vec![], 0, 0);
         app.scanner.set_last_block(last.block.block);
-        let accounts = vec![account.clone()];
+        let accounts = vec![again(&db, &account)];
         app.scanner.scan_pool(&accounts).await.unwrap();
 
         let asked = |from: usize| -> Vec<usize> {

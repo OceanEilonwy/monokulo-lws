@@ -38,7 +38,7 @@ use monero_wallet::address::Network;
 use tokio::sync::Mutex;
 
 use crate::daemon::Daemon;
-use crate::db::{Db, NewAccount, Status};
+use crate::db::{Db, Status};
 use crate::limits::{Cidr, ClientIpConfig, Limits, PER_48_FACTOR};
 use crate::rest::{App, Config, Policy};
 use crate::scanner::{LaneConfig, ScanConfig, Scanner};
@@ -504,20 +504,9 @@ fn admin(command: AdminCommand) -> anyhow::Result<()> {
                     zeroize::Zeroizing::new(line.trim().to_string())
                 }
             };
-            let key =
-                zeroize::Zeroizing::new(daemon::hex32(&view_key).context("the view key must be 64 hex characters")?);
-            let checked = crypto::check_login(network, &address, &key)?;
-            let account = db.add_account(
-                &NewAccount {
-                    address: checked.address.clone(),
-                    view_key: checked.view_key,
-                    spend_pub: checked.spend_pub,
-                    view_pub: checked.view_pub,
-                    start_height,
-                    generated_locally: false,
-                },
-                Status::Active,
-            )?;
+            let key = lws_api::PrivateViewKey::from_hex(&view_key).context("the view key must be 64 hex characters")?;
+            let checked = crypto::check_login(network, &address, key)?;
+            let account = db.add_account(&checked.into_new_account(start_height, false), Status::Active)?;
             println!("added {} from height {}", account.address, account.start_height);
         }
         AdminCommand::RemoveAccount { db, address } => {

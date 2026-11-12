@@ -15,9 +15,10 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 use super::*;
-use crate::db::{Db, NewAccount, Status};
+use crate::db::{Db, Status};
 use crate::limits::{ClientIpConfig, Limits};
 use crate::scanner::{LaneConfig, ScanConfig, Scanner};
+use lws_api::PrivateViewKey;
 
 /// A stagenet wallet: its address and private view key.
 fn wallet(seed: u64) -> (String, [u8; 32]) {
@@ -96,19 +97,9 @@ fn app(setup: Setup) -> Arc<App> {
 
 fn add(app: &App, seed: u64, status: Status) -> (String, [u8; 32]) {
     let (address, key) = wallet(seed);
-    let checked = crate::crypto::check_login(Network::Stagenet, &address, &key).unwrap();
+    let checked = crate::crypto::check_login(Network::Stagenet, &address, PrivateViewKey::from_bytes(&key)).unwrap();
     app.db
-        .add_account(
-            &NewAccount {
-                address: checked.address.clone(),
-                view_key: checked.view_key,
-                spend_pub: checked.spend_pub,
-                view_pub: checked.view_pub,
-                start_height: 10,
-                generated_locally: false,
-            },
-            status,
-        )
+        .add_account(&checked.into_new_account(10, false), status)
         .unwrap();
     (address, key)
 }
@@ -887,19 +878,9 @@ fn subaddress_upserts_match_a_set_and_scale() {
     use std::collections::BTreeSet;
     let db = Db::in_memory();
     let (address, key) = wallet(97);
-    let checked = crate::crypto::check_login(Network::Stagenet, &address, &key).unwrap();
+    let checked = crate::crypto::check_login(Network::Stagenet, &address, PrivateViewKey::from_bytes(&key)).unwrap();
     let account = db
-        .add_account(
-            &NewAccount {
-                address: checked.address.clone(),
-                view_key: checked.view_key,
-                spend_pub: checked.spend_pub,
-                view_pub: checked.view_pub,
-                start_height: 0,
-                generated_locally: false,
-            },
-            Status::Active,
-        )
+        .add_account(&checked.into_new_account(0, false), Status::Active)
         .unwrap()
         .id;
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -1015,15 +996,8 @@ async fn rescan_heights_past_i64_are_refused() {
     assert_eq!((a.start_height, a.scan_height), (0, 0));
     // A new account can't start there either.
     let (other, key) = wallet(99);
-    let checked = crate::crypto::check_login(Network::Stagenet, &other, &key).unwrap();
-    let new = NewAccount {
-        address: checked.address.clone(),
-        view_key: checked.view_key,
-        spend_pub: checked.spend_pub,
-        view_pub: checked.view_pub,
-        start_height: u64::MAX,
-        generated_locally: false,
-    };
+    let checked = crate::crypto::check_login(Network::Stagenet, &other, PrivateViewKey::from_bytes(&key)).unwrap();
+    let new = checked.into_new_account(u64::MAX, false);
     assert!(matches!(
         app.db.add_account(&new, Status::Active),
         Err(crate::error::Error::BadRequest(_))
@@ -1065,15 +1039,9 @@ fn the_request_queue_cap_is_exact_under_concurrency() {
     let db = Arc::new(Db::in_memory());
     let new = |seed: u64| {
         let (address, key) = wallet(seed);
-        let checked = crate::crypto::check_login(Network::Stagenet, &address, &key).unwrap();
-        NewAccount {
-            address: checked.address.clone(),
-            view_key: checked.view_key,
-            spend_pub: checked.spend_pub,
-            view_pub: checked.view_pub,
-            start_height: 0,
-            generated_locally: false,
-        }
+        let checked =
+            crate::crypto::check_login(Network::Stagenet, &address, PrivateViewKey::from_bytes(&key)).unwrap();
+        checked.into_new_account(0, false)
     };
     let threads: Vec<_> = (0..16u64)
         .map(|i| {

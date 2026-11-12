@@ -27,14 +27,15 @@ type Reply<T> = std::result::Result<Json<T>, ApiError>;
 /// the account is here and not hidden. Hidden, unknown, pending and a key
 /// that doesn't fit all look the same: 403 and the same body. A wrong key
 /// is refused by `check_login` before the database is asked, so neither the
-/// answer nor its timing says whether an address has an account.
-async fn authorize(app: &App, login: &Login) -> Result<Account> {
-    let checked = crypto::check_login(app.scanner.config.network, &login.address, &login.view_key.0)?;
-    let address = checked.address.clone();
+/// answer nor its timing says whether an address has an account. The login
+/// is taken whole: its view key ends in the `Checked`, and is wiped there.
+async fn authorize(app: &App, login: Login) -> Result<Account> {
+    let checked = crypto::check_login(app.scanner.config.network, &login.address, login.view_key)?;
+    let address = checked.address().to_owned();
     let Some(account) = app.db.call(move |db| db.account(&address)).await? else {
         return Err(Error::Forbidden);
     };
-    if account.status == Status::Hidden || account.view_key.ct_eq(&checked.view_key).unwrap_u8() == 0 {
+    if account.status == Status::Hidden || account.view_key.ct_eq(checked.view_key()).unwrap_u8() == 0 {
         return Err(Error::Forbidden);
     }
     let id = account.id;
@@ -45,7 +46,7 @@ async fn authorize(app: &App, login: &Login) -> Result<Account> {
 /// As [`authorize`], for a call that changes the account (an import, new
 /// subaddresses): an inactive account is served what was scanned but not
 /// changed.
-async fn authorize_active(app: &App, login: &Login) -> Result<Account> {
+async fn authorize_active(app: &App, login: Login) -> Result<Account> {
     let account = authorize(app, login).await?;
     if account.status != Status::Active {
         return Err(Error::Forbidden);
@@ -80,8 +81,8 @@ fn creation_allowed(app: &App, client: Option<&Extension<ClientIp>>) -> Result<(
 /// Queues a create or import request: `Ok(false)` if one is already
 /// pending, `Busy` when the queue is full (monero-lws's
 /// `--create-queue-max`).
-async fn queue(app: &App, kind: RequestKind, new: &NewAccount) -> Result<bool> {
-    let (new, max) = (new.clone(), app.limits.max_pending_requests);
+async fn queue(app: &App, kind: RequestKind, new: NewAccount) -> Result<bool> {
+    let max = app.limits.max_pending_requests;
     match app.db.call(move |db| db.add_request(kind, &new, max)).await? {
         Queued::Added => Ok(true),
         Queued::Duplicate => Ok(false),
@@ -153,10 +154,10 @@ pub async fn login(
     client: Option<Extension<ClientIp>>,
     ApiJson(req): ApiJson<LoginRequest>,
 ) -> Reply<LoginResponse> {
-    let checked = crypto::check_login(app.scanner.config.network, &req.login.address, &req.login.view_key.0)?;
-    let address = checked.address.clone();
+    let checked = crypto::check_login(app.scanner.config.network, &req.login.address, req.login.view_key)?;
+    let address = checked.address().to_owned();
     if let Some(account) = app.db.call(move |db| db.account(&address)).await? {
-        if account.status == Status::Hidden || account.view_key.ct_eq(&checked.view_key).unwrap_u8() == 0 {
+        if account.status == Status::Hidden || account.view_key.ct_eq(checked.view_key()).unwrap_u8() == 0 {
             return Err(Error::Forbidden.into());
         }
         let id = account.id;
@@ -179,7 +180,7 @@ pub async fn login(
     strict_allowed(&app, client.as_ref())?;
     // Asked before and not yet accepted: refused before it can spend the
     // global token.
-    let address = checked.address.clone();
+    let address = checked.address().to_owned();
     if approve
         && app
             .db
@@ -190,35 +191,28 @@ pub async fn login(
     }
     global_allowed(&app)?;
     let height = creation_height(&app).await?;
-    let new = NewAccount {
-        address: checked.address.clone(),
-        view_key: checked.view_key,
-        spend_pub: checked.spend_pub,
-        view_pub: checked.view_pub,
-        start_height: height.saturating_sub(1),
-        generated_locally: req.generated_locally,
-    };
+    let new = checked.into_new_account(height.saturating_sub(1), req.generated_locally);
+    let start_height = new.start_height;
     if approve {
-        if !queue(&app, RequestKind::Create, &new).await? {
+        if !queue(&app, RequestKind::Create, new).await? {
             return Err(Error::Forbidden.into());
         }
         tracing::info!("a new account request is waiting for approval");
     } else {
-        let adding = new.clone();
-        let account = app.db.call(move |db| db.add_account(&adding, Status::Active)).await?;
+        let account = app.db.call(move |db| db.add_account(&new, Status::Active)).await?;
         app.scanner.wake.notify_one();
-        tracing::info!("new account #{} from height {}", account.id, new.start_height);
+        tracing::info!("new account #{} from height {start_height}", account.id);
     }
     Ok(Json(LoginResponse {
         new_address: true,
         generated_locally: Some(req.generated_locally),
-        start_height: Some(new.start_height),
+        start_height: Some(start_height),
         lookahead: lookahead(&app),
     }))
 }
 
 pub async fn get_address_info(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<AddressInfo> {
-    let account = authorize(&app, &login).await?;
+    let account = authorize(&app, login).await?;
     let chain = chain_height(&app);
     let now = crate::db::now();
     let id = account.id;
@@ -275,7 +269,7 @@ fn proof_of(row: crate::db::ProofRow) -> Proof {
 }
 
 pub async fn get_address_txs(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<AddressTxs> {
-    let account = authorize(&app, &login).await?;
+    let account = authorize(&app, login).await?;
     let chain = chain_height(&app);
     let id = account.id;
     let (
@@ -415,7 +409,7 @@ pub async fn get_unspent_outs(
     State(app): State<Arc<App>>,
     ApiJson(req): ApiJson<UnspentOutsRequest>,
 ) -> Reply<UnspentOuts> {
-    let account = authorize(&app, &req.login).await?;
+    let account = authorize(&app, req.login).await?;
     let fee = app.fee().await?;
     let id = account.id;
     let Holdings { txs, outputs, spends } = app.db.call(move |db| db.holdings(id)).await?;
@@ -663,7 +657,7 @@ pub async fn import_wallet_request(
     client: Option<Extension<ClientIp>>,
     ApiJson(login): ApiJson<Login>,
 ) -> Reply<ImportResponse> {
-    let account = authorize_active(&app, &login).await?;
+    let account = authorize_active(&app, login).await?;
     let reply = |new_request, request_fulfilled, status: &str| {
         Json(ImportResponse {
             payment_address: None,
@@ -707,7 +701,7 @@ pub async fn import_wallet_request(
                 return Ok(reply(false, false, "Already requested"));
             }
             creation_allowed(&app, client.as_ref())?;
-            let added = queue(&app, RequestKind::Import, &new).await?;
+            let added = queue(&app, RequestKind::Import, new).await?;
             Ok(reply(added, false, if added { "Pending" } else { "Already requested" }))
         }
     }
@@ -767,7 +761,7 @@ async fn upsert(
 
 pub async fn get_subaddrs(State(app): State<Arc<App>>, ApiJson(login): ApiJson<Login>) -> Reply<Subaddrs> {
     let max = subaddresses_on(&app)?;
-    let account = authorize(&app, &login).await?;
+    let account = authorize(&app, login).await?;
     let id = account.id;
     Ok(Json(Subaddrs {
         all_subaddrs: app.db.call(move |db| db.subaddrs(id)).await?,
@@ -781,7 +775,7 @@ pub async fn upsert_subaddrs(
 ) -> Reply<NewSubaddrs> {
     let max = subaddresses_on(&app)?;
     check_ranges(&req.subaddrs, max)?;
-    let account = authorize_active(&app, &req.login).await?;
+    let account = authorize_active(&app, req.login).await?;
     let (new_subaddrs, all_subaddrs) = upsert(&app, account.id, req.subaddrs, max, req.get_all).await?;
     Ok(Json(NewSubaddrs {
         new_subaddrs,
@@ -794,7 +788,7 @@ pub async fn provision_subaddrs(
     ApiJson(req): ApiJson<ProvisionSubaddrsRequest>,
 ) -> Reply<NewSubaddrs> {
     let max = subaddresses_on(&app)?;
-    let account = authorize_active(&app, &req.login).await?;
+    let account = authorize_active(&app, req.login).await?;
     let maj_i = req.maj_i.unwrap_or(0);
     let n_maj = req.n_maj.unwrap_or(1).max(1);
     let n_min = req.n_min.unwrap_or(1).max(1);
