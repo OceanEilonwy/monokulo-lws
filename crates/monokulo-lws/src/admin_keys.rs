@@ -4,8 +4,10 @@
 //! the key is random and 256 bits long, so there is nothing to guess.
 //!
 //! The `admin_keys` table is the one the database always had; a database
-//! from before hashing has its plain keys hashed in place the first time any
-//! of these functions runs, and `meta` remembers that it was done.
+//! from before hashing has its plain keys hashed in place by [`migrate`],
+//! which `open_db` runs once when the database is opened, and `meta`
+//! remembers that it was done. The functions here don't run it again, so an
+//! admin request makes no write transaction.
 
 use rusqlite::{OptionalExtension, params};
 use sha3::{Digest, Sha3_256};
@@ -25,7 +27,8 @@ pub fn hash(key: &[u8; 32]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Hashes keys stored in the clear by an older version, once.
+/// Hashes keys stored in the clear by an older version, once. Run when the
+/// database is opened, before anything else here.
 pub fn migrate(db: &Db) -> Result<()> {
     db.write(|tx| {
         let done: Option<String> = tx
@@ -56,7 +59,6 @@ pub fn migrate(db: &Db) -> Result<()> {
 
 /// A new key: stored hashed, returned once for the operator.
 pub fn create(db: &Db) -> Result<Zeroizing<[u8; 32]>> {
-    migrate(db)?;
     let mut key = Zeroizing::new([0u8; 32]);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, key.as_mut());
     let hashed = hash(&key);
@@ -72,7 +74,6 @@ pub fn create(db: &Db) -> Result<Zeroizing<[u8; 32]>> {
 
 /// How many keys there are.
 pub fn count(db: &Db) -> Result<u64> {
-    migrate(db)?;
     db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM admin_keys", [], |r| r.get::<_, i64>(0))? as u64))
 }
 
@@ -80,7 +81,6 @@ pub fn count(db: &Db) -> Result<u64> {
 /// compared with every stored hash in constant time, all of them each time,
 /// so the time taken says nothing of which (or whether one) matched.
 pub fn verify(db: &Db, presented: &[u8; 32]) -> Result<bool> {
-    migrate(db)?;
     let stored: Vec<Vec<u8>> = db.read(|c| {
         Ok(c.prepare("SELECT key FROM admin_keys")?
             .query_map([], |r| r.get(0))?
@@ -137,6 +137,8 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        // What open_db does once.
+        migrate(&db).unwrap();
         assert!(verify(&db, &old).unwrap(), "the old key still opens the admin API");
         let stored: Vec<u8> = db
             .read(|c| Ok(c.query_row("SELECT key FROM admin_keys", [], |r| r.get(0))?))
@@ -145,6 +147,19 @@ mod tests {
         // Running again doesn't hash the hash.
         migrate(&db).unwrap();
         assert!(verify(&db, &old).unwrap());
+    }
+
+    #[test]
+    fn verify_and_count_write_nothing() {
+        let db = Db::in_memory();
+        let key = create(&db).unwrap();
+        // Without the migration's mark, a verify that migrated would add it.
+        assert!(verify(&db, &key).unwrap());
+        assert_eq!(count(&db).unwrap(), 1);
+        let marked: bool = db
+            .read(|c| Ok(c.prepare("SELECT 1 FROM meta WHERE key = ?1")?.exists([HASHED])?))
+            .unwrap();
+        assert!(!marked, "verify or count ran the migration");
     }
 
     #[test]
