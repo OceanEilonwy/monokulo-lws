@@ -29,6 +29,9 @@ rustls = { version = "=0.23.46", default-features = false, features = ["ring", "
 rustls-pki-types = { version = "=1.15.1", features = ["std"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "=0.5.3", features = ["util"] }
+# Request bodies are read frame by frame into a wiped buffer; this names
+# the body-limit error axum's `Limited` wrapper raises.
+http-body-util = "=0.1.5"
 # Admin keys are stored as SHA3-256 hashes.
 sha3 = "=0.10.9"
 rusqlite = { version = "0.41", features = ["bundled"] }

@@ -297,15 +297,20 @@ macro_rules! secret32 {
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 let s = text(d)?;
-                if s.len() != 64 {
-                    return Err(de::Error::custom(format!("expected 64 hex characters, got {}", s.len())));
-                }
                 let mut key = Self(Box::new([0; 32]));
-                // Not the decoder's own error, which names the offending character.
-                hex::decode_to_slice(s.as_bytes(), key.0.as_mut_slice()).map_err(|_| de::Error::custom("not hex"))?;
+                let decoded = if s.len() != 64 {
+                    Err(format!("expected 64 hex characters, got {}", s.len()))
+                } else {
+                    // Not the decoder's own error, which names the offending character.
+                    hex::decode_to_slice(s.as_bytes(), key.0.as_mut_slice()).map_err(|_| "not hex".to_owned())
+                };
+                // An owned copy (the text had escapes, or came from a reader
+                // that doesn't lend its input) is wiped on every path, a
+                // refused one included: a near-key is still mostly a key.
                 if let Cow::Owned(owned) = s {
                     drop(Zeroizing::new(owned));
                 }
+                decoded.map_err(de::Error::custom)?;
                 Ok(key)
             }
         }

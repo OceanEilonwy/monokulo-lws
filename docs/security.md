@@ -371,12 +371,46 @@ as a scalar, `8·a·R`, `H_s(8·a·R ‖ i)` and what is hashed from it, the
 subaddress hash input) are wiped too. The admin CLI wipes the keys it reads
 and prints.
 
-What is left is where keys must be: in the database's pages and SQLite's
-cache, in the scanner's keyring and monero-oxide scanners for as long as an
-account is scanned, and in the request body until it is freed (a JSON body
-is parsed in place, so its bytes are not wiped). None of this changes what
-someone who can read the process's memory learns while the process runs;
-it shortens how long stale copies of keys of finished requests linger.
+Request bodies are wiped too, as far as the server's own code reaches.
+`rest::ApiBody` reads a body frame by frame, copies each frame into a
+`Zeroizing<Vec<u8>>` and drops the frame at once; the buffer is set aside
+from `Content-Length` up to 4 KiB at most (so a lying header reserves
+nothing large) and grows only by moving into a bigger wiped buffer, the old
+one wiped, never by `Vec`'s own reallocation. The per-endpoint body limits
+apply as before (413 past them, frame-by-frame bodies included). `ApiJson`
+parses from that buffer with `serde_json::from_slice` and the buffer is
+wiped when the extractor returns, parsed or refused. serde_json lends a
+string without escapes straight from the buffer, so a key's hex goes from
+the body into its `PrivateViewKey` with no `String` in between; the admin
+API reads `auth` and then each command's `params` from the same buffer
+rather than through a `serde_json::Value`, which would hold a key as a
+`String`. A rejection carries line and column only, never a part of the
+body. Admin keys travel only in the body's `auth` (there is no key
+header), so they get the same treatment. (`rest::tests::bodies_are_read_into_a_wiped_buffer_within_the_limit`,
+`rest::tests::admin_params_are_read_from_the_body`)
+
+What is not wiped, because it is out of the server's reach without a
+zeroing allocator (which was decided against):
+
+- hyper's connection read buffer, which holds the request as it came off
+  the socket (the frames copied above are slices of it) until hyper reuses
+  or frees it;
+- with `--tls-cert`, rustls's buffers of decrypted plaintext, likewise
+  until reused (behind a reverse proxy, the proxy's own buffers instead);
+- a key written with JSON escapes (`0...`, which no client needs for
+  hex): serde_json unescapes it into its internal scratch buffer, which is
+  freed without being wiped (the owned copy then handed to the key type is
+  wiped);
+- the kernel's socket buffers.
+
+What is left beyond that is where keys must be: in the database's pages and
+SQLite's cache, and in the scanner's keyring and monero-oxide scanners for
+as long as an account is scanned. None of this changes what someone who
+can read the process's memory learns while the process runs; it shortens
+how long stale copies of keys of finished requests linger. A core dump
+would hold all of it, so the OpenWrt service turns core dumps off
+(`procd_set_param limits core="0"`); elsewhere, the operator should
+(`ulimit -c 0`, or `LimitCORE=0` under systemd).
 
 ## Dependencies
 
@@ -472,5 +506,9 @@ except where it says otherwise.
 - **PROXY protocol.** Only a header from a trusted proxy is supported.
 - **Reloading the TLS certificate without a restart.** Not needed at the
   rates the server restarts; a reverse proxy does it if wanted.
-- **Wiping the request body.** A view key arrives as JSON text in a body
-  buffer owned by hyper and axum, which is freed, not wiped. See "Memory".
+- **Wiping hyper's and rustls's buffers.** The server wipes its own copy of
+  a request body, but hyper's read buffer and rustls's plaintext buffers
+  keep the request's text until they are reused. Reaching them would take a
+  zeroing global allocator, a cost on every allocation the scanner makes,
+  for copies that live in the same process as every key in the keyring.
+  See "Memory".

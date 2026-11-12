@@ -1214,3 +1214,133 @@ async fn an_unknown_account_status_is_refused() {
         Status::Hidden
     );
 }
+
+/// A body that arrives in the given frames, without a `Content-Length`
+/// (as a chunked upload does).
+struct Frames(std::collections::VecDeque<axum::body::Bytes>);
+
+impl Frames {
+    fn body(chunks: impl IntoIterator<Item = Vec<u8>>) -> Body {
+        Body::new(Frames(chunks.into_iter().map(axum::body::Bytes::from).collect()))
+    }
+}
+
+impl hyper::body::Body for Frames {
+    type Data = axum::body::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(self.0.pop_front().map(|c| Ok(hyper::body::Frame::data(c))))
+    }
+}
+
+async fn call_frames(router: &Router, path: &str, body: Body) -> StatusCode {
+    let mut request = Request::post(path)
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo("198.51.100.1:5000".parse::<SocketAddr>().unwrap()));
+    router.clone().oneshot(request).await.unwrap().status()
+}
+
+/// The body is read into a wiped buffer, frame by frame, whole; the limit
+/// still holds for a body without a `Content-Length` that only grows past
+/// it frame by frame.
+#[tokio::test]
+async fn bodies_are_read_into_a_wiped_buffer_within_the_limit() {
+    let text = br#"{"a": "0123456789", "b": [1, 2, 3]}"#.to_vec();
+    let frames = Frames::body(text.chunks(3).map(<[u8]>::to_vec));
+    // The type is the point: the buffer is wiped when it is dropped.
+    let buf: Zeroizing<Vec<u8>> = read_body(frames, usize::MAX).await.unwrap();
+    assert_eq!(buf.as_slice(), text.as_slice());
+
+    // A lying Content-Length reserves no more than the cap.
+    let small = read_body(Body::from("{}"), usize::MAX).await.unwrap();
+    assert!(small.capacity() <= PRESIZE_CAP, "{}", small.capacity());
+
+    let app = app(Setup::default());
+    let router = wallet_router(app.clone());
+    let (address, key) = add(&app, 50, Status::Active);
+    let login = login_body(&address, &key).to_string().into_bytes();
+    let frames = Frames::body(login.chunks(7).map(<[u8]>::to_vec));
+    assert_eq!(call_frames(&router, "/get_address_info", frames).await, StatusCode::OK);
+
+    // 5 KiB of padding in 1 KiB frames, past the 4 KiB limit.
+    let mut chunks = vec![login[..login.len() - 1].to_vec(), b", \"pad\": \"".to_vec()];
+    chunks.extend(std::iter::repeat_n(vec![b'x'; 1024], 5));
+    chunks.push(b"\"}".to_vec());
+    assert_eq!(
+        call_frames(&router, "/get_address_info", Frames::body(chunks)).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+}
+
+/// Growing the buffer keeps what it held and makes room for what comes.
+#[test]
+fn a_wiped_buffer_grows_whole() {
+    let mut buf = Zeroizing::new(Vec::with_capacity(2));
+    append(&mut buf, b"ab");
+    append(&mut buf, b"cdefg");
+    assert!(buf.capacity() >= 7);
+    append(&mut buf, b"h");
+    assert_eq!(buf.as_slice(), b"abcdefgh");
+}
+
+/// A key written with an escape (which serde_json can't lend from the body,
+/// and copies) is still read, and still refused when it is too short.
+#[tokio::test]
+async fn an_escaped_view_key_still_logs_in() {
+    let app = app(Setup::default());
+    let router = wallet_router(app.clone());
+    let (address, key) = add(&app, 51, Status::Active);
+    let hex_key = hex::encode(key);
+    let escaped = format!("\\u{:04x}{}", hex_key.as_bytes()[0], &hex_key[1..]);
+    let body = format!("{{\"address\": \"{address}\", \"view_key\": \"{escaped}\"}}");
+    let r = call_from(&router, "/get_address_info", &body, "198.51.100.1:5000", &[]).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let short = format!(
+        "{{\"address\": \"{address}\", \"view_key\": \"\\u0030{}\"}}",
+        &hex_key[2..]
+    );
+    let r = call_from(&router, "/get_address_info", &short, "198.51.100.1:5000", &[]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+/// The admin API reads `auth` and each command's `params` from the body
+/// itself: a command that takes none ignores what is there, one that needs
+/// them refuses a body without them, and the key is still checked first.
+#[tokio::test]
+async fn admin_params_are_read_from_the_body() {
+    let app = app(Setup::default());
+    let admin = admin_router(app.clone());
+    let auth = hex::encode(*crate::admin_keys::create(&app.db).unwrap());
+    let (address, key) = wallet(52);
+
+    let r = call(
+        &admin,
+        "/list_accounts",
+        &json!({ "auth": auth, "params": { "x": [1] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(
+        call(&admin, "/add_account", &json!({ "auth": auth })).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    let params = json!({ "address": address, "key": hex::encode(key) });
+    assert_eq!(
+        call(&admin, "/add_account", &json!({ "params": params })).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert!(app.db.account(&parsed(&address)).unwrap().is_none());
+    // `params` before `auth` is the same request.
+    let body = format!("{{\"params\": {params}, \"auth\": \"{auth}\"}}");
+    let r = call_from(&admin, "/add_account", &body, "198.51.100.1:5000", &[]).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(app.db.account(&parsed(&address)).unwrap().is_some());
+}
