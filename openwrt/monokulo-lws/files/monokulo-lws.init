@@ -346,6 +346,8 @@ start_service() {
 	procd_set_param env RUST_LOG="$LOG_LEVEL"
 	procd_set_param user "$RUN_AS"
 	procd_set_param nice "$NICE"
+	# No core dumps: one would hold every account's private view key.
+	procd_set_param limits core="0"
 	# The build, kept with the instance so LuCI reports the one running,
 	# not only the one installed. A new build changes it, as new settings
 	# change the command line, so procd restarts the instance onto them.
