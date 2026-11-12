@@ -846,6 +846,37 @@ async fn an_output_without_its_transaction_is_no_panic() {
     }
 }
 
+/// A major whose highest minor is u32::MAX has no room: 409, not an
+/// overflow (a panic in a debug build, minors from 0 in a release one).
+#[tokio::test]
+async fn provisioning_a_full_major_is_a_conflict() {
+    let app = app(Setup::default());
+    let router = wallet_router(app.clone());
+    let (address, key) = add(&app, 96, Status::Active);
+    let mut body = login_body(&address, &key);
+    body["subaddrs"] = json!([{ "key": 0, "value": [[4294967295u32, 4294967295u32]] }]);
+    let r = call(&router, "/upsert_subaddrs", &body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let mut body = login_body(&address, &key);
+    body["maj_i"] = json!(0);
+    body["n_min"] = json!(5);
+    let r = call(&router, "/provision_subaddrs", &body).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.body);
+    // Nor can a range be asked for that runs past the top.
+    let mut body = login_body(&address, &key);
+    body["maj_i"] = json!(1);
+    body["min_i"] = json!(4294967294u32);
+    body["n_min"] = json!(5);
+    let r = call(&router, "/provision_subaddrs", &body).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.body);
+    // Another major still has room.
+    let mut body = login_body(&address, &key);
+    body["maj_i"] = json!(2);
+    body["n_min"] = json!(5);
+    let r = call(&router, "/provision_subaddrs", &body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+}
+
 /// A repeated create request is refused before it takes a token from the
 /// global bucket, so it can't drain it for everyone.
 #[tokio::test]

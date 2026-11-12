@@ -762,16 +762,22 @@ pub async fn provision_subaddrs(
     }
     let have = app.db.subaddrs(account.id)?;
     let mut wanted = vec![];
+    let full = || Error::Conflict("no room left in that major index".into());
     for maj in maj_i..maj_i.saturating_add(n_maj) {
-        let next = have
+        // The minor after the highest one held; none if that is u32::MAX.
+        let next = match have
             .iter()
             .find(|r| r.key == maj)
-            .and_then(|r| r.value.iter().map(|[_, hi]| hi + 1).max())
-            .unwrap_or(0);
+            .and_then(|r| r.value.iter().map(|[_, hi]| *hi).max())
+        {
+            Some(hi) => hi.checked_add(1).ok_or_else(full)?,
+            None => 0,
+        };
         let lo = req.min_i.unwrap_or(next).max(next);
+        let hi = lo.checked_add(n_min - 1).ok_or_else(full)?;
         wanted.push(SubaddrRanges {
             key: maj,
-            value: vec![[lo, lo.saturating_add(n_min - 1)]],
+            value: vec![[lo, hi]],
         });
     }
     let new_subaddrs = app.db.upsert_subaddrs(account.id, &wanted, max)?;
