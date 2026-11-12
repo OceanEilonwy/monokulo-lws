@@ -833,14 +833,10 @@ impl Scanner {
     /// Scans `batch` (from `at.start`) for `accounts`, each only in the
     /// blocks at or above its scan height, then writes outputs, spends, scan
     /// heights and block hashes (the live lane's all, a catch-up lane's
-    /// from `at.keep_from` on), in one transaction. The scanning (the
+    /// from `at.keep_from` on) with [`write_in_chunks`]. The scanning (the
     /// prefilter, then monero-oxide on what it flags) is done first, with
-    /// no lock on the writer; the write transaction holds only the checks
-    /// and the inserts. Nothing is written if a reorg was unwound since
-    /// `at.generation` was read (`Stale`), or if the blocks don't follow,
-    /// or aren't, the ones whose hashes are kept (`Diverged`): both are
-    /// checked inside the write transaction, so they hold for what is
-    /// written.
+    /// no lock on the writer; each write transaction holds only the checks
+    /// and the inserts of one chunk of blocks.
     fn scan_batch(
         &self,
         slot: &mut Option<Ring>,
@@ -856,25 +852,7 @@ impl Scanner {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         let hits = ring.keyring.flag_many(&batch.blocks, threads, 0);
         let scanned = scan_blocks(ring, lookahead, accounts, batch, at.start, hits.as_deref())?;
-        self.db.write(|tx| {
-            let w = ScanWriter::new(tx);
-            if w.reorg_generation()? != at.generation {
-                return Ok(Outcome::Stale);
-            }
-            if !follows_kept(&w, batch, at.start)? {
-                return Ok(Outcome::Diverged);
-            }
-            write_scanned(&w, accounts, batch, at.start, scanned, at.live)?;
-            if !at.live {
-                for (i, block) in batch.blocks.iter().enumerate() {
-                    let height = height_at(at.start, i)?;
-                    if height >= at.keep_from {
-                        w.keep_hash(height, &BlockHash(block.block.hash()))?;
-                    }
-                }
-            }
-            Ok(Outcome::Written)
-        })
+        write_in_chunks(&self.db, accounts, batch, scanned, at, WRITE_BUDGET)
     }
 
     /// The live lane got past where it stands without a reorg: the next
@@ -1236,21 +1214,22 @@ fn submitted_block(
 /// Where a batch sits and what its writing checks: its first height, whether
 /// it is the live lane's, the reorg generation read before it was fetched,
 /// and (for a catch-up lane) the height from which its block hashes are kept.
-struct Window {
-    start: Height,
-    live: bool,
-    generation: u64,
-    keep_from: Height,
+pub(crate) struct Window {
+    pub(crate) start: Height,
+    pub(crate) live: bool,
+    pub(crate) generation: u64,
+    pub(crate) keep_from: Height,
 }
 
 /// What came of writing a batch.
 #[derive(Debug, PartialEq, Eq)]
-enum Outcome {
+pub(crate) enum Outcome {
     Written,
-    /// A reorg was unwound while it was fetched; nothing written.
+    /// A reorg was unwound while it was fetched; nothing more written
+    /// (chunks written before it stay).
     Stale,
     /// It doesn't follow, or isn't, the chain whose hashes are kept;
-    /// nothing written.
+    /// nothing more written.
     Diverged,
 }
 
@@ -1281,14 +1260,14 @@ fn halt_message(lowest: Height) -> String {
 /// it, and each of its blocks is the one whose hash is kept at its height,
 /// where one is: checked in the batch's own transaction, so it holds for
 /// what is written.
-fn follows_kept(w: &ScanWriter, batch: &Batch, start: Height) -> Result<bool> {
-    if let (Some(before), Some(first)) = (start.prev(), batch.blocks.first())
+fn follows_kept(w: &ScanWriter, blocks: &[ScannableBlock], start: Height) -> Result<bool> {
+    if let (Some(before), Some(first)) = (start.prev(), blocks.first())
         && w.block_hash(before)?
             .is_some_and(|kept| kept != BlockHash(first.block.header.previous))
     {
         return Ok(false);
     }
-    for (i, block) in batch.blocks.iter().enumerate() {
+    for (i, block) in blocks.iter().enumerate() {
         if w.block_hash(height_at(start, i)?)?
             .is_some_and(|kept| kept != BlockHash(block.block.hash()))
         {
@@ -1405,53 +1384,177 @@ pub fn scan_blocks(
     Ok(Scanned { per_block })
 }
 
+/// How long one write transaction of a batch may hold the writer before
+/// committing what it has, so a client's write (an account made, a request,
+/// subaddresses, an import, a rescan) waits at most about this long behind
+/// the scanner, not a whole batch: a catch-up lane's batch of 1,000 busy
+/// blocks for 1,000 accounts holds the writer for over a second on a fast
+/// x86 machine, ten times that on a router. At least one block is written
+/// a transaction, however long it takes.
+pub(crate) const WRITE_BUDGET: Duration = Duration::from_millis(50);
+
+/// Writes what [`scan_blocks`] found in `batch` for `accounts`, in chunks:
+/// each chunk is its own write transaction of as many blocks as fit in
+/// `budget` (one at least), and each checks for itself, inside its
+/// transaction, that no reorg was unwound since `at.generation` was read
+/// (else `Stale`) and that its blocks follow, and are, the ones whose hashes
+/// are kept (else `Diverged`); it moves its accounts' scan heights to its
+/// end. So a kill between chunks leaves every account at a height it
+/// really scanned to, and a chunk after a reorg writes nothing. The writer
+/// is taken in turn (`Db::write`), so a client's write waiting for it goes
+/// between two chunks. What chunks were written before a `Stale` or
+/// `Diverged` stay: each was checked when it was written, and a reorg
+/// unwinds them like any other rows.
+pub(crate) fn write_in_chunks(
+    db: &Db,
+    accounts: &[Account],
+    batch: &Batch,
+    mut scanned: Scanned,
+    at: &Window,
+    budget: Duration,
+) -> Result<Outcome> {
+    let mut spends = None;
+    let mut from = 0;
+    while from < batch.blocks.len() {
+        let written = db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            if w.reorg_generation()? != at.generation {
+                return Ok(Err(Outcome::Stale));
+            }
+            // The chunk's first block here, the rest as they are written.
+            let first = height_at(at.start, from)?;
+            if !follows_kept(&w, batch.blocks.get(from..=from).unwrap_or_default(), first)? {
+                return Ok(Err(Outcome::Diverged));
+            }
+            let chunk = Chunk {
+                from,
+                live: at.live,
+                keep_from: at.keep_from,
+                budget: Some(budget),
+                check: true,
+            };
+            write_chunk(&w, accounts, batch, at.start, &mut scanned, &chunk, &mut spends).map(Ok)
+        })?;
+        match written {
+            Err(stopped) => return Ok(stopped),
+            Ok(next) => from = next,
+        }
+    }
+    Ok(Outcome::Written)
+}
+
 /// Writes what [`scan_blocks`] found in `batch` (from `start`) for
 /// `accounts`, then candidate spends, scan heights and, for the live lane,
-/// block hashes. Only accounts still where the batch was planned from are
-/// written: one rescanned, rewound by a reorg or hidden while the blocks
-/// were fetched or scanned is left for the next batch, which starts from
-/// where it stands now.
+/// block hashes, all in `w`'s transaction (`record_batch`'s, and tests').
+/// The scanner writes in chunks instead ([`write_in_chunks`]).
 pub fn write_scanned(
     w: &ScanWriter,
     accounts: &[Account],
     batch: &Batch,
     start: Height,
-    scanned: Scanned,
+    mut scanned: Scanned,
     live: bool,
 ) -> Result<()> {
+    let chunk = Chunk {
+        from: 0,
+        live,
+        keep_from: Height::MAX,
+        budget: None,
+        check: false,
+    };
+    write_chunk(w, accounts, batch, start, &mut scanned, &chunk, &mut None).map(drop)
+}
+
+/// One chunk of a batch to write: from its `from`th block, as many as fit
+/// in `budget` (all, without one); the live lane's or a catch-up lane's,
+/// which keeps hashes from `keep_from` on. With `check`, the chunk ends
+/// before a block that isn't the one whose hash is kept at its height
+/// (the next chunk, checking its first block, finds it `Diverged`); its
+/// first block is the caller's to check.
+struct Chunk {
+    from: usize,
+    live: bool,
+    keep_from: Height,
+    budget: Option<Duration>,
+    check: bool,
+}
+
+/// Candidate spends' map, and the accounts it holds outputs of.
+type Spends = Option<(SpendMap, BTreeSet<AccountId>)>;
+
+/// Writes one chunk of `batch` (see [`Chunk`]) in `w`'s transaction, and
+/// says the index of the block after the last one written. Only
+/// accounts still where the batch left them are written: where it was
+/// planned from, or this chunk's first height if an earlier chunk moved
+/// them there. One rescanned, rewound by a reorg or hidden meanwhile is
+/// left for the next batch, which starts from where it stands now.
+/// `spends` carries the candidate spends' map from chunk to chunk: what
+/// earlier chunks added to it they also wrote, and an account no longer
+/// written is skipped in it.
+fn write_chunk(
+    w: &ScanWriter,
+    accounts: &[Account],
+    batch: &Batch,
+    start: Height,
+    scanned: &mut Scanned,
+    chunk: &Chunk,
+    spends: &mut Spends,
+) -> Result<usize> {
+    let began = Instant::now();
+    let first = height_at(start, chunk.from)?;
     // Only these accounts are written to, from here on.
     let mut accounts_now: Vec<&Account> = Vec::with_capacity(accounts.len());
     for account in accounts {
-        if w.standing(account.id)? == Some((account.scan_height, Status::Active)) {
+        let expected = account.scan_height.max(first);
+        if w.standing(account.id)? == Some((expected, Status::Active)) {
             accounts_now.push(account);
         }
     }
-    let accounts = accounts_now;
-    let by_id: HashMap<AccountId, &Account> = accounts.iter().map(|a| (a.id, *a)).collect();
-    let mut spends = SpendMap::of(w, accounts.iter().copied())?;
-    let mut per_block = scanned.per_block.into_iter();
-    for (i, block) in batch.blocks.iter().enumerate() {
+    let by_id: HashMap<AccountId, &Account> = accounts_now.iter().map(|a| (a.id, *a)).collect();
+    if spends
+        .as_ref()
+        .is_none_or(|(_, of)| by_id.keys().any(|id| !of.contains(id)))
+    {
+        *spends = Some((
+            SpendMap::of(w, accounts_now.iter().copied())?,
+            by_id.keys().copied().collect(),
+        ));
+    }
+    let (spends, _) = spends.as_mut().expect("just made");
+    let mut next = chunk.from;
+    for (i, block) in batch.blocks.iter().enumerate().skip(chunk.from) {
         let height = height_at(start, i)?;
+        let hash = BlockHash(block.block.hash());
+        if chunk.check && i > chunk.from && w.block_hash(height)?.is_some_and(|kept| kept != hash) {
+            break;
+        }
         let raw = batch.raw.get(i).and_then(Option::as_ref);
-        for (id, outputs) in per_block.next().unwrap_or_default() {
+        let found = scanned.per_block.get_mut(i).map(std::mem::take).unwrap_or_default();
+        for (id, outputs) in found {
             let Some(account) = by_id.get(&id).copied() else {
                 continue;
             };
             let at = Place { block, raw, height };
-            record_received(w, account, outputs, &at, &mut spends)?;
+            record_received(w, account, outputs, &at, spends)?;
         }
-        record_spends(w, &by_id, block, height, &spends)?;
-        if live {
-            w.set_block(height, &BlockHash(block.block.hash()), KEEP_HASHES)?;
+        record_spends(w, &by_id, block, height, spends)?;
+        if chunk.live {
+            w.set_block(height, &hash, KEEP_HASHES)?;
+        } else if height >= chunk.keep_from {
+            w.keep_hash(height, &hash)?;
+        }
+        next = i + 1;
+        if chunk.budget.is_some_and(|b| began.elapsed() >= b) {
+            break;
         }
     }
-    let next = height_at(start, batch.blocks.len())?;
-    for account in accounts {
-        if account.scan_height < next {
-            w.set_scan_height(account.id, next)?;
+    let end = height_at(start, next)?;
+    for account in accounts_now {
+        if account.scan_height.max(first) < end {
+            w.set_scan_height(account.id, end)?;
         }
     }
-    Ok(())
+    Ok(next)
 }
 
 /// A block being written: the block, its bytes as the node sent them (if it
@@ -2956,6 +3059,172 @@ mod tests {
         assert_eq!(
             scan(&mut slot, &accounts, &batch(3..4), &window(103, now)),
             Outcome::Written
+        );
+    }
+
+    /// A batch is written in chunks, each its own transaction, and the
+    /// writer is taken in turn: a client's write that asked for the writer
+    /// while the batch waited for it goes after the batch's first chunk,
+    /// not after the whole batch; the batch then goes on to its end.
+    #[test]
+    fn a_client_write_goes_between_the_chunks_of_a_batch() {
+        use crate::testkit::{self, Wallet};
+        let db = Arc::new(Db::scratch());
+        let account = Wallet::new(12).add(&db, 100);
+        let mut previous = [0; 32];
+        let mut first = 0;
+        let mut made = vec![];
+        for n in 100..104 {
+            let m = testkit::block(n, previous, testkit::dull_miner(n), vec![], first, 0);
+            previous = m.block.block.hash();
+            first = m.next;
+            made.push(m);
+        }
+        let batch = Batch {
+            first_indexes: made.iter().map(|m| m.first_indexes.clone()).collect(),
+            raw: made.iter().map(|m| m.raw.clone()).collect(),
+            blocks: made.into_iter().map(|m| m.block).collect(),
+        };
+        let accounts = vec![again(&db, &account)];
+        let (mut slot, arena) = (None, Arena::new());
+        db.read(|c| Ring::get(&mut slot, c, &accounts, crate::testkit::LOOKAHEAD, &arena).map(|_| ()))
+            .unwrap();
+        let scanned = scan_blocks(
+            slot.as_mut().unwrap(),
+            crate::testkit::LOOKAHEAD,
+            &accounts,
+            &batch,
+            Height::new(100),
+            None,
+        )
+        .unwrap();
+        let at = Window {
+            start: Height::new(100),
+            live: true,
+            generation: db.reorg_generation().unwrap(),
+            keep_from: Height::ZERO,
+        };
+        let wait_for = |queued: u64| {
+            let until = Instant::now() + Duration::from_secs(5);
+            while db.writes_queued() != queued {
+                assert!(
+                    Instant::now() < until,
+                    "{} writes queued, not {queued}",
+                    db.writes_queued()
+                );
+                std::thread::yield_now();
+            }
+        };
+        let scan_height = |tx: &rusqlite::Transaction| -> crate::error::Result<Height> {
+            Ok(
+                tx.query_row("SELECT scan_height FROM accounts WHERE id = ?1", [account.id], |r| {
+                    r.get(0)
+                })?,
+            )
+        };
+        std::thread::scope(|s| {
+            // Something else holds the writer as the batch comes to write.
+            let (go, go_rx) = std::sync::mpsc::channel::<()>();
+            let db_ref: &Db = &db;
+            let holder = s.spawn(move || {
+                db_ref
+                    .write(|_| {
+                        go_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap()
+            });
+            wait_for(1);
+            let batch = s.spawn(|| write_in_chunks(&db, &accounts, &batch, scanned, &at, Duration::ZERO).unwrap());
+            wait_for(2);
+            let client = s.spawn(|| {
+                let seen = db.write(|tx| scan_height(tx)).unwrap();
+                let made = Wallet::new(13).add(&db, 0);
+                (seen, made)
+            });
+            wait_for(3);
+            go.send(()).unwrap();
+            holder.join().unwrap();
+            let (seen, made) = client.join().unwrap();
+            assert_eq!(
+                seen,
+                Height::new(101),
+                "the client wrote after one block of the batch, not four"
+            );
+            assert_eq!(batch.join().unwrap(), Outcome::Written);
+            assert_eq!(made.scan_height, Height::ZERO);
+        });
+        assert_eq!(
+            db.account(&account.address).unwrap().unwrap().scan_height,
+            Height::new(104)
+        );
+        assert_eq!(
+            db.block_hash(Height::new(103)).unwrap(),
+            Some(BlockHash(batch.blocks[3].block.hash()))
+        );
+    }
+
+    /// A reorg unwound between two chunks of a batch stops it there: the
+    /// chunks written stay (and are the reorg's to unwind), the rest is
+    /// `Stale`.
+    #[test]
+    fn a_reorg_between_chunks_stops_the_batch() {
+        use crate::testkit::{self, Wallet};
+        let db = Arc::new(Db::in_memory());
+        let account = Wallet::new(14).add(&db, 100);
+        let made: Vec<_> = (100..103)
+            .map(|n| testkit::block(n, [0; 32], testkit::dull_miner(n), vec![], 0, 0))
+            .collect();
+        let batch = Batch {
+            first_indexes: made.iter().map(|m| m.first_indexes.clone()).collect(),
+            raw: made.iter().map(|m| m.raw.clone()).collect(),
+            blocks: made.into_iter().map(|m| m.block).collect(),
+        };
+        let accounts = vec![again(&db, &account)];
+        let generation = db.reorg_generation().unwrap();
+        // The first chunk is written; the generation then moves on.
+        let scanned = Scanned {
+            per_block: vec![vec![], vec![], vec![]],
+        };
+        let at = Window {
+            start: Height::new(100),
+            live: false,
+            generation,
+            keep_from: Height::MAX,
+        };
+        let mut spends = None;
+        let chunk = Chunk {
+            from: 0,
+            live: false,
+            keep_from: Height::MAX,
+            budget: Some(Duration::ZERO),
+            check: true,
+        };
+        let mut s2 = Scanned {
+            per_block: vec![vec![], vec![], vec![]],
+        };
+        let next = db
+            .write(|tx| {
+                write_chunk(
+                    &ScanWriter::new(tx),
+                    &accounts,
+                    &batch,
+                    Height::new(100),
+                    &mut s2,
+                    &chunk,
+                    &mut spends,
+                )
+            })
+            .unwrap();
+        assert_eq!(next, 1);
+        db.rewind(Height::new(1_000)).unwrap();
+        assert_eq!(
+            write_in_chunks(&db, &accounts, &batch, scanned, &at, Duration::ZERO).unwrap(),
+            Outcome::Stale
+        );
+        assert_eq!(
+            db.account(&account.address).unwrap().unwrap().scan_height,
+            Height::new(101)
         );
     }
 

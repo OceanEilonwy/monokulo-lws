@@ -93,7 +93,10 @@ malformed JSON; spoof `X-Forwarded-For`.
   login's access time is written with whichever write holds the writer
   rather than waiting for it. What still waits for the writer are the
   rare, rate-limited writes a client asks for (a new account, a request,
-  subaddresses, an import), and they wait on a blocking thread.
+  subaddresses, an import), on a blocking thread, and for at most about
+  50 ms: the scanner commits a batch in chunks of that long, and the
+  writer is taken in turn, so a waiting write goes before the scanner's
+  next chunk (`scanner::tests::a_client_write_goes_between_the_chunks_of_a_batch`).
   (`db::tests::a_read_goes_on_while_a_write_is_held`,
   `db::tests::async_reads_never_wait_on_the_writer`)
 - *Pick their own client address.* `X-Forwarded-For` (or the header named

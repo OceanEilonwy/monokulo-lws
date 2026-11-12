@@ -259,6 +259,10 @@ pub struct NewOutput {
 
 pub struct Db {
     writer: Mutex<Connection>,
+    /// Whose turn it is at the writer: writes take it first come, first
+    /// served (`Turns`), so a client's write waiting behind the scanner
+    /// goes before the scanner's next chunk of blocks.
+    turns: Turns,
     /// Read-only connections; empty for an in-memory database, whose reads
     /// then go through the writer.
     readers: Mutex<Vec<Connection>>,
@@ -311,6 +315,59 @@ impl Drop for Reader<'_> {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A ticket queue in front of the writer. `std::sync::Mutex` makes no
+/// promise of order: the scanner, unlocking after one chunk of a batch and
+/// locking again for the next, can take the writer back before a waiting
+/// client's write wakes, again and again. With turns, every write waits
+/// only for those that asked before it.
+#[derive(Default)]
+struct Turns {
+    /// (the next ticket to hand out, the ticket being served).
+    state: Mutex<(u64, u64)>,
+    changed: Condvar,
+}
+
+/// A turn at the writer, held while writing; the next ticket's when dropped.
+struct Turn<'a>(&'a Turns);
+
+impl Turns {
+    /// Waits for a turn, behind every write that asked before.
+    fn take(&self) -> Turn<'_> {
+        let mut state = lock(&self.state);
+        let ticket = state.0;
+        state.0 = state.0.wrapping_add(1);
+        while state.1 != ticket {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        Turn(self)
+    }
+
+    /// A turn now, if nobody holds or waits for one.
+    fn try_take(&self) -> Option<Turn<'_>> {
+        let mut state = lock(&self.state);
+        if state.0 != state.1 {
+            return None;
+        }
+        state.0 = state.0.wrapping_add(1);
+        Some(Turn(self))
+    }
+
+    /// Writes holding or waiting for a turn.
+    #[cfg(test)]
+    fn queued(&self) -> u64 {
+        let state = lock(&self.state);
+        state.0.wrapping_sub(state.1)
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.0.state);
+        state.1 = state.1.wrapping_add(1);
+        self.0.changed.notify_all();
+    }
 }
 
 /// A view key column, read straight from SQLite's buffer into the key's own
@@ -450,6 +507,7 @@ impl Db {
     fn with(writer: Connection, readers: Vec<Connection>) -> Db {
         Db {
             writer: Mutex::new(writer),
+            turns: Turns::default(),
             reader_count: readers.len(),
             readers: Mutex::new(readers),
             reader_free: Condvar::new(),
@@ -488,15 +546,23 @@ impl Db {
         Db::with(conn, vec![])
     }
 
+    /// Writes holding or waiting for the writer.
+    #[cfg(test)]
+    pub fn writes_queued(&self) -> u64 {
+        self.turns.queued()
+    }
+
     /// How many read-only connections the database has (0: reads go
     /// through the writer).
     pub fn readers(&self) -> usize {
         self.reader_count
     }
 
-    /// Run `f` inside one write transaction, on the one writer. Access
-    /// times left by `touch` are written in it too.
+    /// Run `f` inside one write transaction, on the one writer, once every
+    /// write asked for before it is done (`Turns`). Access times left by
+    /// `touch` are written in it too.
     pub fn write<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
+        let _turn = self.turns.take();
         let mut conn = lock(&self.writer);
         let tx = conn.transaction()?;
         let out = f(&tx)?;
@@ -627,24 +693,16 @@ impl Db {
             let at = touched.entry(id).or_insert(0);
             *at = (*at).max(now());
         }
-        match self.writer.try_lock() {
-            Ok(mut conn) => {
-                let tx = conn.transaction()?;
-                self.flush_touched(&tx)?;
-                tx.commit()?;
-                Ok(())
-            }
-            Err(std::sync::TryLockError::Poisoned(e)) => {
-                let mut conn = e.into_inner();
-                let tx = conn.transaction()?;
-                self.flush_touched(&tx)?;
-                tx.commit()?;
-                Ok(())
-            }
-            // Held: whoever holds it writes the access time before committing,
-            // or the next writer does.
-            Err(std::sync::TryLockError::WouldBlock) => Ok(()),
-        }
+        // Held or waited for: whoever holds it writes the access time
+        // before committing, or the next writer does.
+        let Some(_turn) = self.turns.try_take() else {
+            return Ok(());
+        };
+        let mut conn = lock(&self.writer);
+        let tx = conn.transaction()?;
+        self.flush_touched(&tx)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Scan these accounts again from `height`: their rows from there on go.

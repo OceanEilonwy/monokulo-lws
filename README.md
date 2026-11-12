@@ -276,9 +276,12 @@ cost about sixteen times the storage of proving receives.
   resumes by itself. Reorgs that keep ending at the same fork with nothing
   scanned between (a node whose blocks and headers disagree) are retried
   after a wait, from a second doubling to a minute, logged at warn.
-- One SQLite transaction per batch: outputs, spends, block hashes and scan
-  heights land together or not at all, so a kill mid-batch leaves every
-  account at a height it really scanned to. A batch writes only for the
+- A batch is written in chunks of about 50 ms, each one SQLite transaction
+  with its own reorg checks: a chunk's outputs, spends, block hashes and
+  scan heights land together or not at all, so a kill mid-batch leaves
+  every account at a height it really scanned to, and a client's write
+  waits for the writer at most about a chunk (writes take it in turn,
+  first come, first served). A batch writes only for the
   accounts still where it was planned from: one rescanned (admin `rescan`,
   `/import_wallet_request`), rewound by a reorg or hidden while its blocks
   were fetched is left for the next batch, so no block is lost or written

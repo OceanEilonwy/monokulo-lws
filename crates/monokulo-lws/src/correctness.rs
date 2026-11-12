@@ -1212,3 +1212,270 @@ async fn a_database_from_before_proofs_serves_old_rows_without_one() {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
 }
+
+/// Measures how long the scanner's write transaction holds the writer, on
+/// the fixture's mainnet-shaped blocks: `accounts` accounts with
+/// `owned` outputs each already, `paid` planted payments a block to
+/// accounts picked at random, and `decoys` ring members a block that are
+/// accounts' outputs (candidate spends to write); each overridden by
+/// `LWS_ACCOUNTS`, `LWS_OWNED`, `LWS_PAID`, `LWS_DECOYS`. Writes each batch
+/// in one transaction, or with `LWS_CHUNKED=1` as the scanner does (in
+/// chunks of `LWS_BUDGET_MS`, by default `WRITE_BUDGET`), while a client
+/// writes all along, and prints how long the writing took and the longest
+/// the client waited. Run by hand, with the fixture's absolute path:
+/// `LWS_FIXTURE=... cargo test --release -p monokulo-lws measure_write_hold -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_write_hold() {
+    use crate::db::{NewOutput, NewTx};
+    use crate::scanner::{scan_blocks, write_scanned};
+    use crate::types::{GlobalIndex, OutIndex, PublicKey, SubaddressIndex};
+    use monero_wallet::transaction::Input;
+    let Some(path) = std::env::var("LWS_FIXTURE").ok().map(std::path::PathBuf::from) else {
+        eprintln!("set LWS_FIXTURE");
+        return;
+    };
+    let (blocks, firsts, _) = crate::scanner::fixture_blocks(&path).unwrap();
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut rand = move |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    let env = |name: &str, default: usize| std::env::var(name).map_or(default, |v| v.parse().unwrap());
+    let (owned, paid, decoys) = (env("LWS_OWNED", 20), env("LWS_PAID", 10), env("LWS_DECOYS", 30));
+    let accounts_n = env("LWS_ACCOUNTS", 1_000);
+    let wallets: Vec<Wallet> = (0..accounts_n).map(|i| Wallet::new(10_000 + i as u64)).collect();
+    for (size, live) in [(100usize, true), (100, false), (1_000, false), (1_000, true)] {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/measure-{}-{size}.sqlite", std::process::id()));
+        let db = Db::open(&file).unwrap();
+        let start = 3_797_000u64;
+        let accounts: Vec<Account> = wallets.iter().map(|w| w.add(&db, start)).collect();
+        // What the accounts held before: `owned` outputs each, below the batch.
+        let mut global = 10_000_000u64;
+        let mut owned_at = vec![];
+        db.write(|tx| {
+            let w = ScanWriter::new(tx);
+            for (i, a) in accounts.iter().enumerate() {
+                for o in 0..owned {
+                    let mut hash = [0u8; 32];
+                    hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    hash[8..16].copy_from_slice(&(o as u64).to_le_bytes());
+                    let height = Height::new(start - 1 - o as u64);
+                    let tx_id = w.tx_row(
+                        a.id,
+                        &NewTx {
+                            hash: TxHash(hash),
+                            prefix_hash: [0; 32],
+                            height,
+                            timestamp: 0,
+                            unlock_time: 0,
+                            coinbase: false,
+                            mixin: 15,
+                            fee: lws_api::Amount(0),
+                            payment_id: None,
+                            tx_pub_key: PublicKey([0; 32]),
+                        },
+                    )?;
+                    w.add_output(
+                        a.id,
+                        tx_id,
+                        &NewOutput {
+                            out_index: OutIndex::new(0),
+                            global_index: GlobalIndex::new(global),
+                            amount: lws_api::Amount(1_000),
+                            public_key: PublicKey(hash),
+                            tx_pub_key: PublicKey([0; 32]),
+                            mask: Some([1; 32]),
+                            height,
+                            subaddress: SubaddressIndex::default(),
+                            commitment: None,
+                        },
+                    )?;
+                    owned_at.push(global);
+                    global += 1;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        // The batch, payments and decoys planted.
+        let mut made_blocks = vec![];
+        let mut flagged = vec![];
+        let mut planted = 0;
+        let mut key_image = 0u64;
+        for (b, (mut block, first_indexes)) in blocks
+            .iter()
+            .cloned()
+            .zip(firsts.iter().cloned())
+            .take(size)
+            .enumerate()
+        {
+            let n = block.transactions.len();
+            for _ in 0..paid.min(n) {
+                let t = 1 + rand(n);
+                let who = rand(accounts_n);
+                let tx = &block.transactions[t - 1];
+                let prefix = tx.prefix().clone();
+                let Ok(extra) = Extra::read(&mut prefix.extra.as_slice()) else {
+                    continue;
+                };
+                let Some(keys) = extra.keys() else { continue };
+                let key: curve25519_dalek::EdwardsPoint = keys.0[0].into();
+                let Some(at) = prefix.outputs.iter().position(|o| o.key != CompressedPoint::IDENTITY) else {
+                    continue;
+                };
+                let pay = wallets[who].pay(&key, 0, 0, at as u64, 5_000);
+                let mut outputs = prefix.outputs.clone();
+                outputs[at] = pay.output.clone();
+                let strangers: Vec<Out> = (0..outputs.len()).map(|i| stranger(i as u64 + 1)).collect();
+                let mut commitments: Vec<CompressedPoint> =
+                    strangers.iter().map(|s| CompressedPoint::from(s.commitment)).collect();
+                let mut encrypted: Vec<EncryptedAmount> = strangers.iter().map(|s| s.encrypted.clone()).collect();
+                commitments[at] = CompressedPoint::from(pay.commitment);
+                encrypted[at] = pay.encrypted.clone();
+                block.transactions[t - 1] = Transaction::V2 {
+                    prefix: monero_wallet::transaction::TransactionPrefix { outputs, ..prefix },
+                    proofs: Some(PrunedRctProofs {
+                        rct_type: RctType::ClsagBulletproofPlus,
+                        base: RctBase {
+                            fee: 1,
+                            pseudo_outs: vec![],
+                            encrypted_amounts: encrypted,
+                            commitments,
+                        },
+                    }),
+                };
+                planted += 1;
+                flagged.push((b, t, who));
+            }
+            // Each transaction spends one input of a 16-member ring; `decoys`
+            // members a block are accounts' outputs.
+            let mut ours = decoys;
+            for tx in block.transactions.iter_mut() {
+                let Transaction::V2 { prefix, .. } = tx else { continue };
+                let mut members: Vec<u64> = (0..16).map(|m| 1_000 + m * 7_919 + rand(7_000) as u64).collect();
+                for _ in 0..2 {
+                    if ours > 0 {
+                        members.pop();
+                        members.insert(0, owned_at[rand(owned_at.len())]);
+                        ours -= 1;
+                    }
+                }
+                members.sort_unstable();
+                members.dedup();
+                let mut last = 0;
+                let key_offsets = members
+                    .iter()
+                    .map(|m| {
+                        let o = m - last;
+                        last = *m;
+                        o
+                    })
+                    .collect();
+                key_image += 1;
+                let mut image = [0u8; 32];
+                image[..8].copy_from_slice(&key_image.to_le_bytes());
+                prefix.inputs = vec![Input::ToKey {
+                    amount: None,
+                    key_offsets,
+                    key_image: CompressedPoint::from(image),
+                }];
+            }
+            made_blocks.push(Made {
+                block,
+                first_indexes,
+                next: 0,
+                raw: None,
+            });
+        }
+        let batch = Batch {
+            first_indexes: made_blocks.iter().map(|m| m.first_indexes.clone()).collect(),
+            raw: made_blocks.iter().map(|m| m.raw.clone()).collect(),
+            blocks: made_blocks.into_iter().map(|m| m.block).collect(),
+        };
+        let mut slot = None;
+        let arena = monokulo_8ar::Arena::new();
+        db.read(|c| Ring::get(&mut slot, c, &accounts, LOOKAHEAD, &arena).map(|_| ()))
+            .unwrap();
+        let ring = slot.as_mut().unwrap();
+        // Each planted payment is a hit for the account paid, as the
+        // prefilter would flag it.
+        let ids = ring.keyring_ids();
+        let flagged: Vec<monokulo_8ar::Hit> = flagged
+            .into_iter()
+            .map(|(b, t, who)| monokulo_8ar::Hit {
+                account: ids[who],
+                block: b,
+                tx: t,
+            })
+            .collect();
+        let scan = std::time::Instant::now();
+        let scanned = scan_blocks(ring, LOOKAHEAD, &accounts, &batch, Height::new(start), Some(&flagged)).unwrap();
+        let scan = scan.elapsed();
+        let hold = std::time::Instant::now();
+        // A client writing all along: the longest it waited for the writer.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut longest = std::time::Duration::ZERO;
+        std::thread::scope(|sc| {
+            let client = sc.spawn(|| {
+                let mut longest = std::time::Duration::ZERO;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) && std::env::var("LWS_NOCLIENT").is_err() {
+                    let t = std::time::Instant::now();
+                    db.write(|_| Ok(())).unwrap();
+                    longest = longest.max(t.elapsed());
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                longest
+            });
+            if std::env::var("LWS_CHUNKED").is_ok_and(|v| v == "1") {
+                let budget = std::env::var("LWS_BUDGET_MS").map_or(crate::scanner::WRITE_BUDGET, |v| {
+                    std::time::Duration::from_millis(v.parse().unwrap())
+                });
+                // The fixture's blocks don't chain (each one's previous is
+                // zeros), so the live lane's checks would stop at the
+                // first chunk: written as a lane's.
+                let at = crate::scanner::Window {
+                    start: Height::new(start),
+                    live: false,
+                    generation: db.reorg_generation().unwrap(),
+                    keep_from: Height::MAX,
+                };
+                crate::scanner::write_in_chunks(&db, &accounts, &batch, scanned, &at, budget).unwrap();
+            } else {
+                db.write(|tx| {
+                    write_scanned(
+                        &ScanWriter::new(tx),
+                        &accounts,
+                        &batch,
+                        Height::new(start),
+                        scanned,
+                        live,
+                    )
+                })
+                .unwrap();
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            longest = client.join().unwrap();
+        });
+        let hold = hold.elapsed();
+        let outputs: usize = accounts.iter().map(|a| db.outputs(a.id).unwrap().len()).sum();
+        let spends: usize = accounts.iter().map(|a| db.spends(a.id).unwrap().len()).sum();
+        println!(
+            "{size:>5} blocks ({}), {accounts_n} accounts with {owned} outputs: {planted} planted, \
+             {} outputs and {spends} candidate spends after; scan {:.0} ms, written in {:.1} ms, \
+             a client waited at most {:.1} ms",
+            if live { "live" } else { "lane" },
+            outputs,
+            scan.as_secs_f64() * 1e3,
+            hold.as_secs_f64() * 1e3,
+            longest.as_secs_f64() * 1e3,
+        );
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
+        }
+    }
+}

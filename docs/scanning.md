@@ -234,10 +234,17 @@ the monero-oxide fan-out) stays Fob's.
   from the transaction's RingCT base (`outPk`; `G + amount·H` for a miner
   output) and stored with it, as is the fee. A batch is scanned first (the
   prefilter, then monero-oxide on what it flags), with no hold on the
-  database's writer, and then written in one SQLite transaction that holds
-  only the checks (no reorg unwound since the fetch, the blocks follow the
-  hashes kept) and the inserts. It writes only for the accounts still at
-  the height it was planned from, so an admin `rescan`, an import, a reorg's rewind or a
+  database's writer, and then written in chunks: each chunk is one SQLite
+  transaction of as many blocks as fit in 50 ms (one at least), holding
+  only that chunk's checks (no reorg unwound since the fetch, its blocks
+  follow the hashes kept) and inserts, and moving its accounts' scan
+  heights to its end. The writer is taken first come, first served, so a
+  client's write (a new account, a request, subaddresses, an import, a
+  rescan) waits at most about one chunk, not a batch: a catch-up batch of
+  1,000 busy blocks for 1,000 accounts held the writer for about 1.7 s in
+  one transaction on a Ryzen 5950X, which a router would make well over
+  ten (`correctness::measure_write_hold`). It writes only for the accounts still at
+  the height it was planned from (or where its earlier chunks left them), so an admin `rescan`, an import, a reorg's rewind or a
   status change made while the batch was being fetched is never undone by
   it. The pool's scan finds candidate spends as well as outputs (one map of
   the live accounts' outputs), is redone whenever the live lane's accounts
