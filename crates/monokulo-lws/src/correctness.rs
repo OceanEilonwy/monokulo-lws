@@ -638,7 +638,7 @@ async fn the_pool_is_served_once_and_gives_way_to_the_mined_transaction() {
             let sw = ScanWriter::new(tx);
             let ring = Ring::get(
                 &mut slot,
-                &sw,
+                tx,
                 std::slice::from_ref(&account),
                 LOOKAHEAD,
                 &monokulo_8ar::Arena::new(),
@@ -775,7 +775,7 @@ fn a_batch_cut_short_leaves_nothing_behind() {
         let sw = ScanWriter::new(tx);
         let ring = Ring::get(
             &mut slot,
-            &sw,
+            tx,
             std::slice::from_ref(&account),
             LOOKAHEAD,
             &monokulo_8ar::Arena::new(),

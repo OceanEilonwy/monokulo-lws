@@ -371,7 +371,7 @@ pub fn write(db: &Db, accounts: &[Account], blocks: Vec<Made>, start: u64, live:
     let mut slot = None;
     db.write(|tx| {
         let w = ScanWriter::new(tx);
-        let ring = Ring::get(&mut slot, &w, accounts, LOOKAHEAD, &monokulo_8ar::Arena::new())?;
+        let ring = Ring::get(&mut slot, tx, accounts, LOOKAHEAD, &monokulo_8ar::Arena::new())?;
         let hits = hits.map(|f| f(ring, &batch));
         record_batch(&w, ring, LOOKAHEAD, accounts, &batch, start, hits.as_deref(), live)
     })

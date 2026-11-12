@@ -1618,10 +1618,6 @@ impl<'a> ScanWriter<'a> {
         Ok(())
     }
 
-    pub fn subaddrs(&self, account: i64) -> Result<Vec<lws_api::SubaddrRanges>> {
-        subaddrs_in(self.tx, account)
-    }
-
     /// Owned outputs by global index, for matching rings against.
     pub fn owned_indexes(&self, account: i64) -> Result<HashMap<u64, OutputRow>> {
         Ok(outputs_in(self.tx, account)?

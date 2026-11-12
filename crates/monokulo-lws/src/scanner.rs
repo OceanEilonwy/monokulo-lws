@@ -241,7 +241,7 @@ impl Ring {
     /// The ring in `slot` if it's for `accounts`, else a new one there.
     pub(crate) fn get<'a>(
         slot: &'a mut Option<Ring>,
-        w: &ScanWriter,
+        c: &rusqlite::Connection,
         accounts: &[Account],
         lookahead: u32,
         arena: &Arena,
@@ -250,7 +250,7 @@ impl Ring {
         sorted.sort_by_key(|a| a.id);
         let with_ranges = sorted
             .into_iter()
-            .map(|a| Ok((a, w.subaddrs(a.id)?)))
+            .map(|a| Ok((a, crate::db::subaddrs_in(c, a.id)?)))
             .collect::<Result<Vec<_>>>()?;
         let same = slot.as_ref().is_some_and(|r| {
             r.key.len() == with_ranges.len()
@@ -766,12 +766,16 @@ impl Scanner {
     }
 
     /// Scans `batch` (from `at.start`) for `accounts`, each only in the
-    /// blocks at or above its scan height, writing outputs, spends, scan
+    /// blocks at or above its scan height, then writes outputs, spends, scan
     /// heights and block hashes (the live lane's all, a catch-up lane's
-    /// from `at.keep_from` on), in one transaction. Nothing is written if a
-    /// reorg was unwound since `at.generation` was read (`Stale`), or if
-    /// the blocks don't follow, or aren't, the ones whose hashes are kept
-    /// (`Diverged`).
+    /// from `at.keep_from` on), in one transaction. The scanning (the
+    /// prefilter, then monero-oxide on what it flags) is done first, with
+    /// no lock on the writer; the write transaction holds only the checks
+    /// and the inserts. Nothing is written if a reorg was unwound since
+    /// `at.generation` was read (`Stale`), or if the blocks don't follow,
+    /// or aren't, the ones whose hashes are kept (`Diverged`): both are
+    /// checked inside the write transaction, so they hold for what is
+    /// written.
     fn scan_batch(
         &self,
         slot: &mut Option<Ring>,
@@ -780,13 +784,13 @@ impl Scanner {
         batch: &Batch,
         at: &Window,
     ) -> Result<Outcome> {
-        let ring = self
-            .db
-            .write(|tx| Ring::get(slot, &ScanWriter::new(tx), accounts, self.config.lookahead, arena).map(|_| ()));
-        ring?;
+        let lookahead = self.config.lookahead;
+        self.db
+            .read(|c| Ring::get(slot, c, accounts, lookahead, arena).map(|_| ()))?;
         let ring = slot.as_mut().expect("just made");
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         let hits = ring.keyring.flag_many(&batch.blocks, threads, 0);
+        let scanned = scan_blocks(ring, lookahead, accounts, batch, at.start, hits.as_deref())?;
         self.db.write(|tx| {
             let w = ScanWriter::new(tx);
             if w.reorg_generation()? != at.generation {
@@ -795,16 +799,7 @@ impl Scanner {
             if !follows_kept(&w, batch, at.start)? {
                 return Ok(Outcome::Diverged);
             }
-            record_batch(
-                &w,
-                ring,
-                self.config.lookahead,
-                accounts,
-                batch,
-                at.start,
-                hits.as_deref(),
-                at.live,
-            )?;
+            write_scanned(&w, accounts, batch, at.start, scanned, at.live)?;
             if !at.live {
                 for (i, block) in batch.blocks.iter().enumerate() {
                     let height = at.start + i as u64;
@@ -990,13 +985,23 @@ impl Scanner {
     fn scan_pool_txs(&self, accounts: &[Account], block: &ScannableBlock) -> Result<PoolFound> {
         let now = crate::db::now();
         let mut slot = self.live_ring.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let lookahead = self.config.lookahead;
         let result = tokio::task::block_in_place(|| {
+            self.db
+                .read(|c| Ring::get(&mut slot, c, accounts, lookahead, &self.arenas[0]).map(|_| ()))?;
+            let ring = slot.as_mut().expect("just made");
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let hits = ring.keyring.flag_many(std::slice::from_ref(block), threads, 0);
             self.db.write(|tx| {
-                let w = ScanWriter::new(tx);
-                let ring = Ring::get(&mut slot, &w, accounts, self.config.lookahead, &self.arenas[0])?;
-                let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-                let hits = ring.keyring.flag_many(std::slice::from_ref(block), threads, 0);
-                scan_pool_block(&w, ring, self.config.lookahead, accounts, block, hits.as_deref(), now)
+                scan_pool_block(
+                    &ScanWriter::new(tx),
+                    ring,
+                    lookahead,
+                    accounts,
+                    block,
+                    hits.as_deref(),
+                    now,
+                )
             })
         });
         *self.live_ring.lock().unwrap_or_else(|e| e.into_inner()) = slot;
@@ -1015,10 +1020,7 @@ impl Scanner {
     pub fn as_if_live(&self, accounts: &[Account]) {
         let mut slot = self.live_ring.lock().unwrap();
         self.db
-            .write(|tx| {
-                let w = ScanWriter::new(tx);
-                Ring::get(&mut slot, &w, accounts, self.config.lookahead, &self.arenas[0]).map(|_| ())
-            })
+            .read(|c| Ring::get(&mut slot, c, accounts, self.config.lookahead, &self.arenas[0]).map(|_| ()))
             .unwrap();
         let mut ids: Vec<i64> = accounts.iter().map(|a| a.id).collect();
         ids.sort_unstable();
@@ -1225,11 +1227,9 @@ enum LaneStep {
     Done,
 }
 
-/// Writes what `batch` holds for `accounts`: with `hits`, each hit's
-/// transaction scanned for its account alone in a stand-in block (or the
-/// whole block, for a block the prefilter can't vouch for); without, every
-/// block for every account. Then candidate spends, scan heights and, for the
-/// live lane, block hashes.
+/// Writes what `batch` holds for `accounts`: [`scan_blocks`], then
+/// [`write_scanned`], in `w`'s transaction. The scanner itself scans before
+/// it opens the write transaction (`Scanner::scan_batch`).
 #[allow(clippy::too_many_arguments)]
 pub fn record_batch(
     w: &ScanWriter,
@@ -1241,27 +1241,41 @@ pub fn record_batch(
     hits: Option<&[Hit]>,
     live: bool,
 ) -> Result<()> {
-    // Only accounts still where the batch was planned from: one rescanned,
-    // rewound by a reorg or hidden while the blocks were fetched is left for
-    // the next batch, which starts from where it stands now.
-    let mut current = Vec::with_capacity(accounts.len());
-    for account in accounts {
-        if w.standing(account.id)? == Some((account.scan_height, Status::Active)) {
-            current.push(account.clone());
-        }
-    }
-    let accounts = current.as_slice();
+    let scanned = scan_blocks(ring, lookahead, accounts, batch, start, hits)?;
+    write_scanned(w, accounts, batch, start, scanned, live)
+}
+
+/// What [`scan_blocks`] found, before anything is written: per block, the
+/// outputs each account received, in the order they were found.
+pub struct Scanned {
+    per_block: Vec<Vec<(i64, Vec<WalletOutput>)>>,
+}
+
+/// Scans `batch` (from `start`) for `accounts`, touching no database: with
+/// `hits`, each hit's transaction for its account alone in a stand-in block
+/// (or the whole block, for a block the prefilter can't vouch for);
+/// without, every block for every account. Each account only from its scan
+/// height. This is the batch's CPU work, done outside the write
+/// transaction so the writer is held only for the inserts.
+pub fn scan_blocks(
+    ring: &mut Ring,
+    lookahead: u32,
+    accounts: &[Account],
+    batch: &Batch,
+    start: u64,
+    hits: Option<&[Hit]>,
+) -> Result<Scanned> {
     let by_id: HashMap<i64, &Account> = accounts.iter().map(|a| (a.id, a)).collect();
-    let mut spends = SpendMap::of(w, accounts)?;
     let mut by_block: Vec<Vec<Hit>> = vec![vec![]; batch.blocks.len()];
     for hit in hits.unwrap_or_default() {
         if let Some(list) = by_block.get_mut(hit.block) {
             list.push(*hit);
         }
     }
+    let mut per_block = Vec::with_capacity(batch.blocks.len());
     for (i, block) in batch.blocks.iter().enumerate() {
         let height = start + i as u64;
-        let raw = batch.raw.get(i).and_then(Option::as_ref);
+        let mut found = vec![];
         if hits.is_some() {
             let mut list = std::mem::take(&mut by_block[i]);
             // Transactions in block order, as the first output with a key counts;
@@ -1288,16 +1302,53 @@ pub fn record_batch(
                     stand_in(block, &batch.first_indexes[i], hit.tx)
                 };
                 let Some(target) = target else { continue };
-                let at = Place { block, raw, height };
-                scan_for(w, ring, lookahead, account, target, &at, &mut spends)?;
+                found.push((account.id, scan_one(ring, lookahead, account, target)?));
             }
         } else {
             for account in accounts {
                 if account.scan_height <= height {
-                    let at = Place { block, raw, height };
-                    scan_for(w, ring, lookahead, account, block.clone(), &at, &mut spends)?;
+                    found.push((account.id, scan_one(ring, lookahead, account, block.clone())?));
                 }
             }
+        }
+        per_block.push(found);
+    }
+    Ok(Scanned { per_block })
+}
+
+/// Writes what [`scan_blocks`] found in `batch` (from `start`) for
+/// `accounts`, then candidate spends, scan heights and, for the live lane,
+/// block hashes. Only accounts still where the batch was planned from are
+/// written: one rescanned, rewound by a reorg or hidden while the blocks
+/// were fetched or scanned is left for the next batch, which starts from
+/// where it stands now.
+pub fn write_scanned(
+    w: &ScanWriter,
+    accounts: &[Account],
+    batch: &Batch,
+    start: u64,
+    scanned: Scanned,
+    live: bool,
+) -> Result<()> {
+    let mut current = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        if w.standing(account.id)? == Some((account.scan_height, Status::Active)) {
+            current.push(account.clone());
+        }
+    }
+    let accounts = current.as_slice();
+    let by_id: HashMap<i64, &Account> = accounts.iter().map(|a| (a.id, a)).collect();
+    let mut spends = SpendMap::of(w, accounts)?;
+    let mut per_block = scanned.per_block.into_iter();
+    for (i, block) in batch.blocks.iter().enumerate() {
+        let height = start + i as u64;
+        let raw = batch.raw.get(i).and_then(Option::as_ref);
+        for (id, outputs) in per_block.next().unwrap_or_default() {
+            let Some(account) = by_id.get(&id).copied() else {
+                continue;
+            };
+            let at = Place { block, raw, height };
+            record_received(w, account, outputs, &at, &mut spends)?;
         }
         record_spends(w, &by_id, block, height, &spends)?;
         if live {
@@ -1321,23 +1372,13 @@ struct Place<'a> {
     height: u64,
 }
 
-/// `target` (`at.block`, or a stand-in for part of it) scanned for `account`,
-/// and what it receives written.
-fn scan_for(
-    w: &ScanWriter,
-    ring: &mut Ring,
-    lookahead: u32,
-    account: &Account,
-    target: ScannableBlock,
-    at: &Place,
-    spends: &mut SpendMap,
-) -> Result<()> {
-    let outputs = ring
+/// What `account` receives in `target` (a block, or a stand-in for part of it).
+fn scan_one(ring: &mut Ring, lookahead: u32, account: &Account, target: ScannableBlock) -> Result<Vec<WalletOutput>> {
+    Ok(ring
         .scanner(account, lookahead)?
         .scan(target)
         .map_err(|e| Error::Internal(format!("scan: {e}")))?
-        .ignore_additional_timelock();
-    record_received(w, account, outputs, at, spends)
+        .ignore_additional_timelock())
 }
 
 /// Keeps what a proof of transaction `tx_hash` in `at` needs, once the
@@ -2020,7 +2061,7 @@ pub fn replay(fixture: &std::path::Path, counts: &[usize], lookahead: u32, step:
         let arena = Arena::new();
         let mut slot = None;
         let built = Instant::now();
-        db.write(|tx| Ring::get(&mut slot, &ScanWriter::new(tx), &accounts, lookahead, &arena).map(|_| ()))?;
+        db.write(|tx| Ring::get(&mut slot, tx, &accounts, lookahead, &arena).map(|_| ()))?;
         let built = built.elapsed().as_secs_f64();
         let ring = slot.as_mut().expect("just made");
         let started = Instant::now();
@@ -2332,7 +2373,7 @@ mod tests {
         let mut slot = None;
         db.write(|tx| {
             let w = ScanWriter::new(tx);
-            let ring = Ring::get(&mut slot, &w, &accounts, 1, &Arena::new())?;
+            let ring = Ring::get(&mut slot, tx, &accounts, 1, &Arena::new())?;
             let hits = hits.map(|f| f(ring));
             record_batch(&w, ring, 1, &accounts, &batch, 100, hits.as_deref(), true)
         })
@@ -2389,6 +2430,54 @@ mod tests {
         check_recorded(&db, &a, &b);
     }
 
+    /// The batch is scanned with no hold on the writer (here another
+    /// thread holds it throughout), and the write that follows still writes
+    /// only the accounts standing where the batch was planned: B, rescanned
+    /// between the scan and the write, gets nothing from it.
+    #[test]
+    fn a_batch_is_scanned_off_the_writer_and_rechecked_when_written() {
+        let keys = keys();
+        let db = Arc::new(Db::scratch());
+        let (a, b) = (account(&db, &keys, "A", 100), account(&db, &keys, "B", 100));
+        let (pays, firsts_pays) = block(&keys, 100, false, None);
+        let (spends, firsts_spends) = block(&keys, 101, false, Some(vec![1000, 6]));
+        let batch = Batch {
+            blocks: vec![pays, spends],
+            first_indexes: vec![firsts_pays, firsts_spends],
+            raw: vec![],
+        };
+        let accounts = vec![a.clone(), b.clone()];
+        let mut slot = None;
+        db.read(|c| Ring::get(&mut slot, c, &accounts, 1, &Arena::new()).map(|_| ()))
+            .unwrap();
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                db.write(|_| {
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap()
+            })
+        };
+        held.recv().unwrap();
+        let scanned = scan_blocks(slot.as_mut().unwrap(), 1, &accounts, &batch, 100, None).unwrap();
+        go.send(()).unwrap();
+        writer.join().unwrap();
+
+        db.rescan(&["B".to_string()], 50).unwrap();
+        db.write(|tx| write_scanned(&ScanWriter::new(tx), &accounts, &batch, 100, scanned, true))
+            .unwrap();
+        assert_eq!(db.outputs(a.id).unwrap().len(), 1);
+        assert_eq!(db.spends(a.id).unwrap().len(), 1);
+        assert_eq!(db.account("A").unwrap().unwrap().scan_height, 102);
+        assert!(db.outputs(b.id).unwrap().is_empty(), "rescanned meanwhile");
+        assert_eq!(db.account("B").unwrap().unwrap().scan_height, 50);
+    }
+
     #[test]
     fn no_hits_no_outputs_but_scan_heights_move_on() {
         let (db, a, _) = record(Some(&|_: &Ring| vec![]));
@@ -2442,7 +2531,7 @@ mod tests {
         let (spends, _) = block(&keys, 101, false, Some(vec![1000, 6]));
         let accounts = vec![a, b];
         let mut slot = None;
-        db.write(|tx| Ring::get(&mut slot, &ScanWriter::new(tx), &accounts, 1, &Arena::new()).map(|_| ()))
+        db.write(|tx| Ring::get(&mut slot, tx, &accounts, 1, &Arena::new()).map(|_| ()))
             .unwrap();
         let ring = slot.as_mut().unwrap();
         let hits = ring.keyring.flag_many(&[pays, spends], 4, 0).expect("the GPU filtered");

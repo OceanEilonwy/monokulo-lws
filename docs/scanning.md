@@ -232,9 +232,12 @@ the monero-oxide fan-out) stays Fob's.
   per transaction and account, and an account whose block is read whole is
   not also scanned per transaction. Each found output's commitment is taken
   from the transaction's RingCT base (`outPk`; `G + amount·H` for a miner
-  output) and stored with it, as is the fee. A batch is one SQLite
-  transaction and writes only for the accounts still at the height it was
-  planned from, so an admin `rescan`, an import, a reorg's rewind or a
+  output) and stored with it, as is the fee. A batch is scanned first (the
+  prefilter, then monero-oxide on what it flags), with no hold on the
+  database's writer, and then written in one SQLite transaction that holds
+  only the checks (no reorg unwound since the fetch, the blocks follow the
+  hashes kept) and the inserts. It writes only for the accounts still at
+  the height it was planned from, so an admin `rescan`, an import, a reorg's rewind or a
   status change made while the batch was being fetched is never undone by
   it. The pool's scan finds candidate spends as well as outputs (one map of
   the live accounts' outputs), is redone whenever the live lane's accounts
