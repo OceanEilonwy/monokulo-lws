@@ -1,0 +1,46 @@
+api_version = 1
+id = "mk-lws"
+version = "@VERSION@"
+# bin/monokulo-lws is a small launcher that puts the database in the data directory and runs
+# libexec/monokulo-lws serve under the same name.
+exec = [
+    "bin/monokulo-lws",
+    "--daemon=$(mk-lws.daemon_url)",
+    # Every request carries a view key, so the wallet API is reached only through the appliance's
+    # proxy, over TLS, and the client's address comes from its X-Forwarded-For.
+    "--listen", "127.0.0.1:8443",
+    "--trusted-proxies", "127.0.0.1",
+    # Refuse to start against a node on another network.
+    "--network", "main",
+    "--create=$(mk-lws.create)",
+    "--import=$(mk-lws.import)",
+]
+needs = ["monero-daemon"]
+settings = "settings.lua"
+# A stop mid-batch leaves every wallet at a height it really scanned to.
+stop_timeout_secs = 30
+# Not /daemon_status, which answers 503 while the node is unreachable: that is the node's
+# trouble, and restarting the server would not mend it.
+health = { tcp = { port = 8443 } }
+
+[storage]
+# Every registered wallet's private view key, its outputs and transactions, in one SQLite file.
+encrypted = true
+size_mib = 2048
+
+[[web]]
+name = "wallet-api"
+upstream = "127.0.0.1:8443"
+suggested_subdomain = "lws"
+# The REST API uses no absolute links, so it answers on any address.
+multi_address = true
+
+[[panels]]
+id = "scan"
+title = "Light wallet server"
+script = "panels/scan.lua"
+refresh_secs = 15
+min_size = [2, 1]
+max_size = [4, 2]
+default_size = [2, 2]
+source = { http = { url = "http://127.0.0.1:8443/daemon_status" } }

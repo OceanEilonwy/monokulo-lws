@@ -1,0 +1,116 @@
+# Template file for 'mk-lws'
+#
+# monokulo-lws, a Monero light wallet server. A feed app, not a base system package: everything
+# lands in /opt/nodo/apps/mk-lws. The id cannot carry the monokulo- prefix, which the feed gate keeps
+# for the appliance's own packages.
+#
+# Upstream builds on stable Rust; this uses the nightly packages/monokulo pins, so the toolchain
+# distfiles and their checksums are shared. Cargo.lock pins every crate, the one git dependency
+# (monokulo-8ar) by its full commit, and the build runs with --locked.
+# The recipe lives in this repository's nodo/ and is released from its version tags:
+# monokulo-nodo's app-release workflow sets version= from the tag (v1.2.0 is 1.2.0), _commit= to
+# the tag's commit and the first checksum to that commit's GitHub tarball, then builds, checks
+# and attaches the packages to the tag's release. See nodo/README.md.
+#
+pkgname=mk-lws
+version=0.1.0pre20261112
+revision=1
+_commit=bb3683dc69b401712e6bab9d1ad47af3f2e31eb8
+_nightly=2026-11-07
+archs="aarch64 x86_64"
+hostmakedepends="gcc make pkg-config clang xz"
+short_desc="Monero light wallet server (monokulo-lws)"
+maintainer="monokulo-nodo <noreply@localhost>"
+# Nothing is installed under /usr/share/licenses because a feed package may only write inside its
+# own directory.
+license="GPL-3.0-only"
+homepage="https://github.com/OceanEilonwy/monokulo-lws"
+
+_dist=https://static.rust-lang.org/dist/${_nightly}
+case "$XBPS_MACHINE" in
+	x86_64)
+		_host=x86_64-unknown-linux-gnu
+		_rustc_sum=3640f7f7bf840e0125771d0618744929809240cd2b8e6cbc98f848efcf288337
+		_cargo_sum=ba7ae2159e90b2128418b91fb93a26bb76ffe72311d8c7255095458e2549b3e9
+		_std_sum=7b85b56d7169c076fa1e31de5a4e3052ff8400d887dd80f47aa69579e15c85f8
+		;;
+	aarch64)
+		_host=aarch64-unknown-linux-gnu
+		_rustc_sum=e748c5afe5c74476ef74aeac07df4b9a0e72d8eb97a9861d308268669ec3e1ff
+		_cargo_sum=73a59e3749c61ae0936d89774b8c11e883c1ff5195b196c6e5eecf29b44a9fb9
+		_std_sum=d0e22de77a8447490c359e7d6398feb21d4b5988c4c469c1b802d809f2d40610
+		;;
+	*) broken="no pinned toolchain for build machine $XBPS_MACHINE" ;;
+esac
+
+distfiles="https://github.com/OceanEilonwy/monokulo-lws/archive/${_commit}.tar.gz
+ ${_dist}/rustc-nightly-${_host}.tar.xz
+ ${_dist}/cargo-nightly-${_host}.tar.xz
+ ${_dist}/rust-std-nightly-${_host}.tar.xz"
+checksum="1e9b505909b871c061795294c34563a8232295b306d4e2ce6308bfcec10cafd2
+ ${_rustc_sum}
+ ${_cargo_sum}
+ ${_std_sum}"
+
+if [ "$CROSS_BUILD" ] && [ "$XBPS_TARGET_MACHINE" = aarch64 ]; then
+	distfiles+=" ${_dist}/rust-std-nightly-aarch64-unknown-linux-gnu.tar.xz"
+	checksum+=" d0e22de77a8447490c359e7d6398feb21d4b5988c4c469c1b802d809f2d40610"
+elif [ "$CROSS_BUILD" ] && [ "$XBPS_TARGET_MACHINE" = x86_64 ]; then
+	distfiles+=" ${_dist}/rust-std-nightly-x86_64-unknown-linux-gnu.tar.xz"
+	checksum+=" 7b85b56d7169c076fa1e31de5a4e3052ff8400d887dd80f47aa69579e15c85f8"
+fi
+
+build_wrksrc="monokulo-lws-${_commit}"
+_app=opt/nodo/apps/mk-lws
+
+post_extract() {
+	local d
+	mkdir -p "${wrksrc}/toolchain"
+	for d in "${wrksrc}"/rustc-nightly-* "${wrksrc}"/cargo-nightly-* "${wrksrc}"/rust-std-nightly-*; do
+		[ -d "$d" ] || continue
+		"$d"/install.sh --prefix="${wrksrc}/toolchain" --disable-ldconfig >/dev/null
+	done
+}
+
+_toolchain_env() {
+	_tc="${wrksrc}/toolchain"
+	export PATH="${_tc}/bin:${PATH}"
+	export RUSTC="${_tc}/bin/rustc"
+	export CARGO="${_tc}/bin/cargo"
+	export CARGO_HOME="${XBPS_HOSTDIR}/feed-cargo"
+	export CARGO_BUILD_JOBS="${XBPS_MAKEJOBS}"
+	# Read by option_env! for /get_version's last_git_commit_hash.
+	export MONOKULO_LWS_COMMIT="${_commit}"
+	export HOST_CC=gcc HOST_CXX=g++
+	local t="${RUST_TARGET^^}" b="${RUST_BUILD^^}"
+	t="${t//-/_}"
+	b="${b//-/_}"
+	if [ "$CROSS_BUILD" ]; then
+		unset RUSTFLAGS
+		export "CARGO_TARGET_${b}_LINKER=gcc"
+		export PKG_CONFIG_ALLOW_CROSS=1
+	fi
+	export "CARGO_TARGET_${t}_LINKER=${CC}"
+}
+
+do_configure() {
+	_toolchain_env
+	"${_tc}/bin/rustc" -vV
+}
+
+do_build() {
+	_toolchain_env
+	"${CARGO}" build --release --locked --target "${RUST_TARGET}" -p monokulo-lws --bin monokulo-lws
+}
+
+do_install() {
+	vmkdir ${_app}/bin 755
+	vmkdir ${_app}/libexec 755
+	vmkdir ${_app}/panels 755
+	install -m 755 target/${RUST_TARGET}/release/monokulo-lws "${DESTDIR}/${_app}/libexec/monokulo-lws"
+	install -m 755 "${FILESDIR}/monokulo-lws" "${DESTDIR}/${_app}/bin/monokulo-lws"
+	install -m 644 "${FILESDIR}/manifest.toml" "${DESTDIR}/${_app}/manifest.toml"
+	sed -i "s/@VERSION@/${version}/" "${DESTDIR}/${_app}/manifest.toml"
+	install -m 644 "${FILESDIR}/settings.lua" "${DESTDIR}/${_app}/settings.lua"
+	install -m 644 "${FILESDIR}/panels/scan.lua" "${DESTDIR}/${_app}/panels/scan.lua"
+}
