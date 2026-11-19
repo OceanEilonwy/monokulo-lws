@@ -16,7 +16,7 @@
 <p align="center">
   <a href="https://github.com/OceanEilonwy/monokulo-lws/actions/workflows/ci.yml"><img src="https://github.com/OceanEilonwy/monokulo-lws/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://github.com/OceanEilonwy/monokulo-lws/actions/workflows/openwrt.yml"><img src="https://github.com/OceanEilonwy/monokulo-lws/actions/workflows/openwrt.yml/badge.svg?branch=main" alt="OpenWrt package"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-informational" alt="GPL-3.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-informational" alt="AGPL-3.0-or-later"></a>
 </p>
 
 <p align="center">
@@ -156,4 +156,5 @@ The OpenWrt package builds with `scripts/build-openwrt.sh` and is checked in the
 - [docs/scanning.md](docs/scanning.md): what scanning costs, on the GPU and off it.
 - [docs/brand/](docs/brand/): the mark, a lantern whose glass is a rose window cut from Monokulo's lens.
 
-Licence: GPL-3.0-only, as Fob and Monokular.
+Licence: AGPL-3.0-or-later. Fob and Monokular, which it builds on, are GPL-3.0, which section 13
+of both licences allows to be combined.
