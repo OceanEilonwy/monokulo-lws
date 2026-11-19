@@ -1,0 +1,15 @@
+#!/bin/sh
+# Puts monokulo-lws's database in the data directory, which the sandbox mounts as $HOME, and
+# becomes `monokulo-lws serve` with the options the manifest gives. A manifest's arguments cannot
+# name the data directory, which lies outside the package's own directories.
+#
+# This script keeps the name of the binary it starts, so `pkill -x monokulo-lws` matches whichever
+# of the two is running.
+set -eu
+[ -n "${HOME:-}" ] && [ -d "$HOME" ] || {
+	echo "lws launcher: HOME is not the data directory" >&2
+	exit 1
+}
+bin=$(cd "$(dirname "$0")/../libexec" && pwd)/monokulo-lws
+cd "$HOME"
+exec "$bin" serve --db "$HOME/lws.sqlite" "$@"
